@@ -1,0 +1,30 @@
+{
+  "peer": {
+    "host": "peerjs.92k.de",
+    "port": 443,
+    "secure": true,
+    "path": "/",
+    "config": { "iceServers": [{"urls":"stun:stun.l.google.com:19302"}] },
+    "debug": 1
+  },
+  "mqtt": {
+    "broker": "broker.emqx.io",
+    "port": 8084,
+    "path": "/mqtt",
+    "proxy_host": "1od.dpdns.org",
+    "topic": "p1-chat/lobby/heartbeat-v3"
+  },
+  "hub": {
+    "prefix": "p1-hub-v3-",
+    "count": 5,
+    "max_peers_normal": 30,
+    "max_peers_hub": 80
+  },
+  "params": {
+    "ttl": 16,
+    "gossip_size": 20,
+    "loop_interval": 1000,
+    "conn_timeout": 5000,
+    "ping_timeout": 6000
+  }
+}

@@ -1,0 +1,115 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1, viewport-fit=cover, user-scalable=no" />
+  <meta name="theme-color" content="#0e0f13" />
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="apple-mobile-web-app-title" content="P1">
+  <link rel="apple-touch-icon" href="./icon-192.png">
+  <link rel="manifest" href="manifest.json">
+  
+  <title>P1 - 分布式聊天 (Refactored)</title>
+  <link rel="stylesheet" href="style.css">
+  
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/paho-mqtt/1.0.1/mqttws31.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/peerjs@1.5.0/dist/peerjs.min.js"></script>
+</head>
+<body>
+
+<div class="app-shell">
+  <aside class="sidebar" id="sidebar">
+    <div class="my-card">
+      <div class="my-info">
+        <div class="avatar" id="myAvatar">我</div>
+        <div style="flex:1;min-width:0">
+          <div class="my-name" id="myNick">-</div>
+          <div class="status-row">
+            <div class="dot" id="statusDot"></div>
+            <span id="statusText">离线</span>
+          </div>
+        </div>
+        <div class="btn-icon" id="btnSettings">⚙️</div>
+      </div>
+      <div class="status-row" style="justify-content:space-between">
+        <span>ID: <span id="myId">-</span></span>
+        <span id="onlineCount">0</span>
+      </div>
+    </div>
+    <div class="contact-list" id="contactList"></div>
+  </aside>
+
+  <main class="chat-area">
+    <header class="chat-header">
+      <div style="display:flex;align-items:center">
+        <div class="btn-icon mobile-back" id="btnBack">←</div>
+        <div>
+          <span class="ch-title" id="chatTitle">即时通讯</span>
+          <span class="ch-status" id="chatStatus"></span>
+        </div>
+      </div>
+      <div style="display:flex;align-items:center;gap:5px">
+      <div class="btn-icon" id="btnInstall" style="display:grid;color:#0f0;">📲</div>
+      <div class="btn-icon" id="btnToggleLog">📟</div>
+    </div>
+    </header>
+
+    <div class="msg-list" id="msgList">
+      <!-- 启动提示 -->
+      <div style="text-align:center;color:#666;margin-top:50px;" id="boot-msg">
+        正在启动系统...<br>
+        <small>如果长时间无反应，请尝试刷新或清除缓存</small>
+      </div>
+    </div>
+
+    <section class="send-box">
+      <div class="btn-icon" id="btnFile">📎</div>
+      <div class="input-wrap">
+        <div id="editor" contenteditable="true"></div>
+      </div>
+      <button class="send-btn" id="btnSend">➤</button>
+      <input type="file" id="fileInput" style="display:none">
+    </section>
+    
+    <div class="mini-log" id="miniLog">
+      <div class="log-bar">
+        <button class="log-btn" id="btnDlLog">📥 下载日志</button>
+      </div>
+      <div class="log-content" id="logContent"></div>
+    </div>
+  </main>
+</div>
+
+<div id="settings-panel">
+  <div class="settings-box">
+    <h3 style="margin-top:0">设置</h3>
+    <input class="st-input" id="iptNick" placeholder="我的昵称">
+    <input class="st-input" id="iptPeer" placeholder="添加节点 ID (可选)">
+    <button class="st-btn" id="btnSave">保存</button>
+    <button class="st-btn" id="btnCloseSettings" style="margin-top:10px;background:transparent;color:#666">关闭</button>
+  </div>
+</div>
+
+<div id="debug-console" style="display:none"></div>
+
+<!-- 关键修改：增加版本号参数，强制不缓存 loader.js -->
+<script type="module" src="./loader.js?v=1764873034"></script>
+<script>
+  if('serviceWorker' in navigator) {
+    // 每次加载页面都尝试更新 SW
+    navigator.serviceWorker.register('./sw.js?t=1764873034').then(reg => {
+      reg.update();
+    });
+  }
+  
+  // 移除启动提示（当 JS 成功运行后会被覆盖，这里只是防止 JS 挂了用户不知道）
+  window.addEventListener('load', () => {
+    setTimeout(() => {
+       const boot = document.getElementById('boot-msg');
+       if(boot && window.state) boot.style.display = 'none';
+    }, 2000);
+  });
+</script>
+</body>
+</html>
