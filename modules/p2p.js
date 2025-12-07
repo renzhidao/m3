@@ -1,10 +1,9 @@
 import { MSG_TYPE, NET_PARAMS } from './constants.js';
 
 export function init() {
-  console.log('📦 加载模块: P2P (GC Master v4)');
+  console.log('📦 加载模块: P2P (GC Master v4.1)');
   const CFG = window.config;
-  // 硬上限：浏览器极限 434，留足余量设为 350
-  const HARD_LIMIT = 350;
+  const HARD_LIMIT = 350; // 连接数硬上限
 
   window.p2p = {
     _searchLogShown: false,
@@ -25,44 +24,33 @@ export function init() {
       }
     },
 
-    // === 核心：强力资源释放 ===
     _hardClose(conn) {
       if (!conn) return;
-      // 1. PeerJS 层关闭
       try { conn.close(); } catch(e){}
-      
-      // 2. 浏览器底层关闭 (关键!)
       try { 
         if (conn.peerConnection) {
             conn.peerConnection.oniceconnectionstatechange = null;
             conn.peerConnection.close(); 
         }
       } catch(e){}
-      
-      // 3. 断开引用
       conn.peerConnection = null;
     },
 
-    // === 核心：空间腾挪 ===
     _ensureQuota() {
       const ids = Object.keys(window.state.conns);
       if (ids.length < HARD_LIMIT) return true;
 
-      // 找出最旧的连接（非 Hub 优先）
-      // 这里的策略是：优先踢掉没有 open 的，其次踢掉最旧的
       let targetId = null;
       let oldest = Infinity;
 
-      // 1. 先找没连上的
       for (const id of ids) {
           const c = window.state.conns[id];
           if (!c.open) { targetId = id; break; }
       }
 
-      // 2. 如果都连上了，踢最旧的（LRU）
       if (!targetId) {
           for (const id of ids) {
-              if (id.startsWith(NET_PARAMS.HUB_PREFIX)) continue; // 保护 Hub
+              if (id.startsWith(NET_PARAMS.HUB_PREFIX)) continue;
               const c = window.state.conns[id];
               if (c.created < oldest) {
                   oldest = c.created;
@@ -72,13 +60,11 @@ export function init() {
       }
 
       if (targetId) {
-          // window.util.log(`🧹 [GC] 达到上限${HARD_LIMIT}，剔除: ${targetId.slice(0,8)}`);
           this._hardClose(window.state.conns[targetId]);
           delete window.state.conns[targetId];
           return true;
       }
-      
-      return false; // 没东西可踢（可能全是 Hub？）
+      return false;
     },
 
     _startHealthCheck() {
@@ -99,10 +85,8 @@ export function init() {
     },
 
     start() {
-      // window.util.log('▶ [P2P] start() 进入');
       this._safeCall(() => {
         if (window.state.peer && !window.state.peer.destroyed) return;
-        
         if (typeof Peer === 'undefined') {
           setTimeout(() => this.start(), 200);
           return;
@@ -122,7 +106,6 @@ export function init() {
         });
 
         p.on('connection', conn => {
-          // window.util.log(`⚡ [P2P] 收到连接: ${conn.peer.slice(0,8)}`);
           this.setupConn(conn);
         });
 
@@ -156,7 +139,6 @@ export function init() {
         try { window.state.peer.destroy(); } catch(e) {}
         window.state.peer = null;
       }
-      // 彻底清理所有连接
       Object.values(window.state.conns).forEach(c => this._hardClose(c));
       window.state.conns = {};
       this._connecting.clear();
@@ -173,13 +155,11 @@ export function init() {
       setTimeout(() => this._connecting.delete(id), 8000);
 
       this._safeCall(() => {
-        // 1. 如果已有旧对象，先杀掉
         if (window.state.conns[id]) {
             this._hardClose(window.state.conns[id]);
             delete window.state.conns[id];
         }
 
-        // 2. 检查总量，腾位置
         this._ensureQuota();
 
         try {
@@ -201,24 +181,12 @@ export function init() {
 
     setupConn(conn) {
       const pid = conn.peer || conn._targetId || 'unknown';
-      
-      // 接受连接时也要检查配额
       if (!this._ensureQuota()) {
           conn.on('open', () => conn.close());
           return;
       }
 
-      if (conn.peerConnection) {
-        conn.peerConnection.oniceconnectionstatechange = () => {
-          const s = conn.peerConnection.iceConnectionState;
-          if (s === 'failed' || s === 'disconnected') {
-             // window.util.log(`🧊 [ICE] ${pid.slice(0,8)}: ${s}`);
-          }
-        };
-      }
-
       conn.on('open', () => {
-        // window.util.log(`✅ [Conn] ${pid.slice(0,8)} 已打开`);
         this._connecting.delete(pid);
         conn.lastPong = Date.now();
         conn.created = Date.now();
@@ -241,9 +209,8 @@ export function init() {
       conn.on('data', d => this._safeCall(() => this.handleData(d, conn), 'handleData'));
       
       const onGone = () => {
-        // window.util.log(`🔌 [Conn] ${pid.slice(0,8)} 断开`);
         this._connecting.delete(pid);
-        this._hardClose(conn); // 确保断开时彻底清理
+        this._hardClose(conn);
         delete window.state.conns[pid];
         if (window.ui) { window.ui.renderList(); window.ui.updateSelf(); }
       };
@@ -259,7 +226,6 @@ export function init() {
       
       if (d.t === MSG_TYPE.HELLO) {
         conn.label = d.n;
-        // window.util.log(`👋 [Data] HELLO from ${d.n}`);
         if (window.protocol) window.protocol.processIncoming({ senderId: d.id, n: d.n });
         return;
       }
@@ -301,19 +267,16 @@ export function init() {
       Object.keys(window.state.conns).forEach(pid => {
         const c = window.state.conns[pid];
         if (!c.open && now - (c.created || 0) > NET_PARAMS.CONN_TIMEOUT) {
-          // window.util.log(`🧹 [维护] 清理超时: ${pid.slice(0,8)}`);
           this._hardClose(c);
           delete window.state.conns[pid];
         }
         else if (c.open && c.lastPong && (now - c.lastPong > NET_PARAMS.PING_TIMEOUT)) {
           if (!pid.startsWith(NET_PARAMS.HUB_PREFIX)) {
-            // window.util.log(`🧹 [维护] 清理死链: ${pid.slice(0,8)}`);
             this._hardClose(c);
             delete window.state.conns[pid];
           }
         }
       });
-      // 心跳
       const all = Object.keys(window.state.conns);
       if (all.length > 0) {
         const pkt = { t: MSG_TYPE.PEER_EX, list: all.slice(0, NET_PARAMS.GOSSIP_SIZE) };
