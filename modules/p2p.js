@@ -190,7 +190,7 @@ export function init() {
       this._connecting.add(id);
       setTimeout(() => this._connecting.delete(id), 8000);
 
-      window.util.log(`🔗 [connectTo] 发起连接: ${id.slice(0,8)}`);
+      // window.util.log(`🔗 [connectTo] 发起连接: ${id.slice(0,8)}`);
       
       this._safeCall(() => {
         const conn = window.state.peer.connect(id, { reliable: true });
@@ -204,7 +204,7 @@ export function init() {
     // ========== 配置连接 ==========
     setupConn(conn) {
       const pid = conn.peer || conn._targetId || 'unknown';
-      window.util.log(`🔧 [setupConn] 配置连接: ${pid.slice(0,8)}`);
+      // window.util.log(`🔧 [setupConn] 配置连接: ${pid.slice(0,8)}`);
       
       const max = window.state.isHub ? NET_PARAMS.MAX_PEERS_HUB : NET_PARAMS.MAX_PEERS_NORMAL;
       if (Object.keys(window.state.conns).length >= max) {
@@ -299,14 +299,17 @@ export function init() {
       }
 
       if (d.t === MSG_TYPE.PEER_EX && Array.isArray(d.list)) {
-        window.util.log(`📋 [Data] PEER_EX 收到 ${d.list.length} 个节点`);
+        // 降噪：仅在发现新节点时打印
+        let newFound = 0;
         d.list.forEach(id => {
           if (id && id !== window.state.myId && !window.state.conns[id]) {
             if (Object.keys(window.state.conns).length < NET_PARAMS.MAX_PEERS_NORMAL) {
               this.connectTo(id);
+              newFound++;
             }
           }
         });
+        if (newFound > 0) window.util.log(`📋 [Gossip] 发现 ${newFound} 个新节点`);
         return;
       }
       
