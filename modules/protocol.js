@@ -33,6 +33,7 @@ export function init() {
         pkt.fileName = fileInfo.name;
         pkt.fileSize = fileInfo.size;
         pkt.fileType = fileInfo.type;
+        window.util.log(`📤 发送文件: ${fileInfo.name} (${(fileInfo.size/1024).toFixed(1)}KB)`);
       }
 
       // 本地处理
@@ -45,6 +46,7 @@ export function init() {
 
     // 处理接收到的数据包
     async processIncoming(pkt, fromPeerId) {
+      // window.util.log(`📩 收到消息: ${pkt.kind}`); // 过于频繁暂不开启，仅开启文件日志
       if (!pkt || !pkt.id) return;
 
       // 1. 去重：如果处理过该消息，直接忽略

@@ -7,6 +7,7 @@ export function init() {
   window.p2p = {
     _connecting: new Set(),
     _healthTimer: null,
+    _lastReconnect: 0,
 
     _checkPeer(caller) {
       const p = window.state.peer;
@@ -69,6 +70,22 @@ export function init() {
       return false;
     },
 
+    
+    _reconnect(p) {
+        if (!p || p.destroyed) return;
+        const now = Date.now();
+        if (now - this._lastReconnect < 2000) return; // 防刷屏
+        this._lastReconnect = now;
+        
+        try {
+            p.reconnect();
+        } catch(e) {
+            // 如果重连炸了，直接重启
+            this.stop();
+            setTimeout(() => this.start(), 1000);
+        }
+    },
+
     start() {
       this._safeCall(() => {
         if (window.state.peer && !window.state.peer.destroyed) return;
@@ -77,6 +94,18 @@ export function init() {
         window.util.log(`🚀 [P2P] 启动: ${window.state.myId}`);
         const p = new Peer(window.state.myId, CFG.peer);
         
+        
+        p.on('disconnected', () => {
+             window.util.log('🔌 与信令服务器断开，尝试重连...');
+             this._reconnect(p);
+        });
+
+        p.on('close', () => {
+             window.util.log('☠️ Peer 销毁，准备重启...');
+             this.stop();
+             setTimeout(() => this.start(), 1000);
+        });
+
         p.on('open', id => {
           window.util.log(`✅ [P2P] 就绪: ${id}`);
           window.state.myId = id;
@@ -88,10 +117,9 @@ export function init() {
           this._healthTimer = setInterval(() => this.maintenance(), 5000);
         });
 
-        p.on('connection', conn => this.setupConn(conn));
+        p.on('connection', conn => { window.util.log(`🔗 收到连接请求: ${conn.peer.slice(0,6)}..`); this.setupConn(conn); });
         
         p.on('error', e => {
-          // 遇到节点不存在，立即清理，不要犹豫
           if (e.type === 'peer-unavailable') {
               const deadId = e.message.replace('Could not connect to peer ', '');
               if (deadId && window.state.conns[deadId]) {
@@ -99,6 +127,10 @@ export function init() {
                   delete window.state.conns[deadId];
               }
           } 
+          else if (e.type === 'disconnected' || e.type === 'network' || e.type === 'server-error' || e.type === 'socket-error') {
+             window.util.log(`⚠️ 网络波动 (${e.type})，尝试恢复...`);
+             this._reconnect(p);
+          }
           else if (e.message && e.message.includes('Cannot create so many')) {
              window.util.log('🚨 资源耗尽，重启...');
              this.stop();
@@ -106,7 +138,7 @@ export function init() {
           } else {
              window.util.log(`❌ [P2P] ${e.type}`);
           }
-        });
+});
       }, 'start');
     },
 
@@ -165,6 +197,7 @@ export function init() {
         conn.lastPong = Date.now();
         conn.created = Date.now();
         window.state.conns[pid] = conn;
+        window.util.log(`✅ 连接建立: ${pid.slice(0,6)}..`);
         
         // 简单直接的握手
         const list = Object.keys(window.state.conns);
@@ -187,6 +220,7 @@ export function init() {
       const onGone = () => {
         this._connecting.delete(pid);
         this._hardClose(conn);
+        window.util.log(`🔌 连接断开: ${pid.slice(0,6)}..`);
         delete window.state.conns[pid];
         if (window.ui) { window.ui.renderList(); window.ui.updateSelf(); }
       };
@@ -202,6 +236,7 @@ export function init() {
       
       if (d.t === MSG_TYPE.HELLO) {
         conn.label = d.n;
+        window.util.log(`👋 收到Hello: ${d.n}`);
         if (window.protocol) window.protocol.processIncoming({ senderId: d.id, n: d.n });
         return;
       }
@@ -245,11 +280,13 @@ export function init() {
         const c = window.state.conns[pid];
         if (!c.open && now - (c.created || 0) > NET_PARAMS.CONN_TIMEOUT) {
           this._hardClose(c);
-          delete window.state.conns[pid];
+          window.util.log(`🔌 连接断开: ${pid.slice(0,6)}..`);
+        delete window.state.conns[pid];
         } else if (c.open && c.lastPong && (now - c.lastPong > NET_PARAMS.PING_TIMEOUT)) {
           if (!pid.startsWith(NET_PARAMS.HUB_PREFIX)) {
             this._hardClose(c);
-            delete window.state.conns[pid];
+            window.util.log(`🔌 连接断开: ${pid.slice(0,6)}..`);
+        delete window.state.conns[pid];
           }
         }
       });
