@@ -2,11 +2,11 @@
 import { MSG_TYPE, NET_PARAMS, CHAT } from './constants.js';
 
 /**
- * Smart Core v13 - Android Fix & Instant UI
+ * Smart Core v15 - Truth Log & Click-Close
  */
 
 export function init() {
-  console.log('📦 加载模块: Smart Core v13 (Android Fix)');
+  console.log('📦 加载模块: Smart Core v15 (Log)');
   
   const req = indexedDB.open('P1_FILE_DB', 1);
   req.onupgradeneeded = e => {
@@ -28,16 +28,13 @@ export function init() {
 function applyHooks() {
   if (!window.protocol || !window.ui) { setTimeout(applyHooks, 500); return; }
 
-  // 1. 路由：全放行
   window.protocol.flood = function(pkt, excludePeerId) {
     let all = Object.values(window.state.conns).filter(c => c.open && c.peer !== excludePeerId);
     all.forEach(c => c.send(pkt));
   };
 
-  // 2. 发送拦截 (支持立即上屏)
   const originalSendMsg = window.protocol.sendMsg;
   window.protocol.sendMsg = async function(txt, kind, fileInfo) {
-    // 只有用户主动发送的大文件/图片才走分块
     if (!window.state.isUserAction && !fileInfo) { originalSendMsg.apply(this, arguments); return; }
     if (kind === CHAT.KIND_IMAGE && txt.length < 400000) { originalSendMsg.apply(this, arguments); return; }
 
@@ -45,14 +42,13 @@ function applyHooks() {
       const fileId = window.util.uuid();
       const now = window.util.now();
       
-      // === 立即上屏 (占位状态) ===
       const metaMsg = {
         t: 'SMART_META',
         id: window.util.uuid(),
         fileId: fileId,
         fileName: fileInfo ? fileInfo.name : `File_${Date.now()}`,
         fileType: fileInfo ? fileInfo.type : 'application/octet-stream',
-        fileSize: 0, // 暂时未知，读取完更新
+        fileSize: 0, 
         totalChunks: 0,
         ts: now,
         senderId: window.state.myId,
@@ -60,53 +56,36 @@ function applyHooks() {
         ttl: 16
       };
       
-      // 先显示一个“正在处理”的消息
       const uiMsg = { id: metaMsg.id, senderId: metaMsg.senderId, n: metaMsg.n, ts: metaMsg.ts, kind: 'SMART_FILE_UI', meta: metaMsg, isProcessing: true };
       window.ui.appendMsg(uiMsg);
 
-      // 异步处理大文件
       setTimeout(async () => {
           try {
               const rawData = base64ToArrayBuffer(txt);
               const chunks = sliceData(rawData, 16 * 1024);
-              
               metaMsg.fileSize = rawData.byteLength;
               metaMsg.totalChunks = chunks.length;
 
               if (kind === CHAT.KIND_IMAGE) {
                   try {
-                     // 生成缩略图
                      const preview = await makePreview(txt, 600, 0.6);
                      metaMsg.preview = preview;
                   } catch(e) {}
               }
               
               await saveChunks(fileId, chunks, metaMsg);
-              
-              // 存完后，广播出去，并更新本地UI
               window.db.addPending(metaMsg);
               window.protocol.flood(metaMsg); 
               
-              // 刷新 UI (移除处理中状态)
-              const card = document.getElementById('card-' + metaMsg.id);
-              if (card) {
-                  // 简单粗暴：移除旧的，重新渲染一条新的（实际使用中 updateSelf 会刷新，或者用户刷新页面也会正常）
-                  // 这里为了体验，我们手动 update 一下 UI 元素
-                  // 但最简单的是直接让用户知道“发送成功”
-                  const statusDiv = document.getElementById('status-' + metaMsg.id);
-                  if (statusDiv) statusDiv.innerText = '✅ 已就绪';
-              }
-          } catch(e) {
-              window.util.log('处理文件失败: ' + e.message);
-          }
+              const statusDiv = document.getElementById('status-' + metaMsg.id);
+              if (statusDiv) statusDiv.innerText = '✅ 已就绪';
+          } catch(e) {}
       }, 50);
-      
       return;
     }
     originalSendMsg.apply(this, arguments);
   };
 
-  // 3. 接收拦截
   const originalProcess = window.protocol.processIncoming;
   window.protocol.processIncoming = function(pkt, fromPeerId) {
     if (pkt.senderId === window.state.myId && pkt.t === 'SMART_META') return;
@@ -118,13 +97,19 @@ function applyHooks() {
       window.protocol.flood(pkt, fromPeerId);
       return;
     }
+    
+    if (pkt.t === 'SMART_WAKE') {
+       handleWakeSignal(pkt, fromPeerId);
+       window.protocol.flood(pkt, fromPeerId);
+       return;
+    }
+
     if (pkt.t === 'SMART_REQ') { handleChunkRequest(pkt, fromPeerId); return; }
     if (pkt.t === 'SMART_DATA') { handleChunkData(pkt); return; }
     
     originalProcess.apply(this, arguments);
   };
 
-  // 4. UI 渲染
   const originalAppend = window.ui.appendMsg;
   window.ui.appendMsg = function(m) {
     if (m.kind === 'SMART_FILE_UI') {
@@ -138,7 +123,6 @@ function applyHooks() {
       
       let inner = '';
       if (isImg && m.meta.preview) {
-         // 图片卡片
          inner = `
            <div class="smart-card" id="card-${domId}" style="position:relative;min-width:150px">
              <img src="${m.meta.preview}" style="display:block;max-width:100%;max-height:200px;object-fit:contain;border-radius:8px;${isMe?'':'filter:brightness(0.7)'}">
@@ -155,7 +139,6 @@ function applyHooks() {
              </div>
            </div>`;
       } else {
-         // 文件卡片
          inner = `
            <div class="smart-card" id="card-${domId}" style="padding:10px;min-width:200px">
              <div style="font-weight:bold;color:#4ea8ff">📄 ${window.util.escape(m.meta.fileName)}</div>
@@ -192,60 +175,74 @@ function applyHooks() {
   };
 }
 
-// ---------------------------------------------------------
-// 业务逻辑
-// ---------------------------------------------------------
-
 const transfers = {};
 
 async function openFileViewer(fileId) {
     const url = await assembleFile(fileId);
     if (!url) { alert('文件尚未就绪'); return; }
     
-    // === 修复：调用 UI 的预览/下载，而不是 window.open ===
     const meta = await getMeta(fileId);
     if (meta && meta.fileType && meta.fileType.startsWith('image/')) {
-        if(window.ui && window.ui.previewImage) {
-            window.ui.previewImage(url);
-        } else {
-            window.open(url); // Fallback
-        }
+        if(window.ui && window.ui.previewImage) window.ui.previewImage(url);
+        else window.open(url);
     } else {
-        if(window.ui && window.ui.downloadBlob) {
-            window.ui.downloadBlob(url, meta ? meta.fileName : 'file.dat');
-        } else {
-            window.open(url);
-        }
+        if(window.ui && window.ui.downloadBlob) window.ui.downloadBlob(url, meta ? meta.fileName : 'file.dat');
+        else window.open(url);
     }
 }
 
 async function startDownload(fileId, domId) {
-  // 1. 检查本地
   const url = await assembleFile(fileId);
   if (url) {
       finishDownload(fileId, domId, url);
-      openFileViewer(fileId); // 直接尝试打开
+      openFileViewer(fileId);
       return;
   }
 
   const meta = await getMeta(fileId);
   if (!meta) { alert('元数据丢失'); return; }
 
-  // 2. UI
   const progWrap = document.getElementById('prog-wrap-' + domId);
   if (progWrap) progWrap.style.display = 'block';
   
   const btn = document.getElementById('btn-' + domId);
-  if (btn) btn.innerText = '📡...';
+  if (btn) btn.innerText = '...';
   
   if (!transfers[fileId]) transfers[fileId] = { 
       meta: meta, 
       chunks: new Array(meta.totalChunks).fill(null), 
       needed: meta.totalChunks, 
-      domId: domId 
+      domId: domId,
+      _logShown: false
   };
   
-  window.util.log('🚀 开始下载，连接数: ' + Object.keys(window.state.conns).length);
+  // === 真相日志 ===
+  const senderId = meta.senderId;
+  const conn = window.state.conns[senderId];
+  window.util.log('🚀 发起下载请求...');
+  window.util.log(`👤 目标发送者: ${window.util.escape(meta.n)} (${senderId.slice(0,6)})`);
+  
+  if (conn) {
+      if (conn.open) {
+          window.util.log(`🟢 P2P通道: 已连接 (RTT: ${Date.now() - (conn.lastPong||0)}ms)`);
+      } else {
+          window.util.log(`🟡 P2P通道: 存在但未Open (正在尝试重连)`);
+          conn.close(); // 强制重置死连接
+          if(window.p2p) window.p2p.connectTo(senderId);
+      }
+  } else {
+      window.util.log(`🔴 P2P通道: 未连接 (尝试发起连接...)`);
+      if(window.p2p) window.p2p.connectTo(senderId);
+  }
+
+  window.protocol.flood({
+      t: 'SMART_WAKE',
+      id: window.util.uuid(),
+      fileId: fileId,
+      requester: window.state.myId,
+      ttl: 8
+  });
+
   downloadLoop(fileId);
 }
 
@@ -253,53 +250,65 @@ function downloadLoop(fileId) {
   const task = transfers[fileId];
   if (!task || task.needed <= 0) return;
 
-  // 更新进度条
   const pct = Math.floor(((task.chunks.length - task.needed) / task.chunks.length) * 100);
   const bar = document.getElementById('prog-' + task.domId);
   const btn = document.getElementById('btn-' + task.domId);
   if(bar) bar.style.width = pct + '%';
   if(btn) btn.innerText = `${pct}%`;
 
-  // 向所有连接请求
   const allConns = Object.values(window.state.conns).filter(c => c.open);
-  
+  const senderId = task.meta.senderId;
+  allConns.sort((a, b) => {
+      if (a.peer === senderId) return -1;
+      if (b.peer === senderId) return 1;
+      return 0;
+  });
+
   if (allConns.length === 0) {
-      if (btn) btn.innerText = '❌ 无连接';
+      if (btn) btn.innerText = '⏳ 寻路中';
       setTimeout(() => downloadLoop(fileId), 2000);
       return;
+  }
+  
+  if (Math.random() < 0.1) {
+       window.protocol.flood({
+          t: 'SMART_WAKE',
+          id: window.util.uuid(),
+          fileId: fileId,
+          requester: window.state.myId,
+          ttl: 4
+      });
   }
 
   let reqCount = 0;
   for (let i = 0; i < task.chunks.length; i++) {
-    if (!task.chunks[i] && reqCount < 8) { // 并发增加到8
+    if (!task.chunks[i] && reqCount < 8) { 
        const target = allConns[reqCount % allConns.length];
-       if (reqCount === 0) window.util.log(`请求块 #${i} -> ${target.peer.slice(0,5)}`);
-       target.send({ 
-           t: 'SMART_REQ', 
-           fileId: fileId, 
-           chunkIdx: i
-       });
-       reqCount++;
+       if (target && target.open) {
+           target.send({ t: 'SMART_REQ', fileId: fileId, chunkIdx: i });
+           reqCount++;
+       }
     }
   }
   
   setTimeout(() => downloadLoop(fileId), 500);
 }
 
-// 收到请求
+async function handleWakeSignal(pkt, fromPeerId) {
+    if (pkt.requester === window.state.myId) return;
+    const chunks = await getChunk(pkt.fileId, 0); 
+    if (chunks) {
+        if (window.p2p && !window.state.conns[pkt.requester]) {
+            window.p2p.connectTo(pkt.requester);
+        }
+    }
+}
+
 async function handleChunkRequest(pkt, fromPeerId) {
   const chunk = await getChunk(pkt.fileId, pkt.chunkIdx);
   const conn = window.state.conns[fromPeerId];
-  
-  if (chunk) {
-      if (conn && conn.open) {
-          conn.send({ 
-              t: 'SMART_DATA', 
-              fileId: pkt.fileId, 
-              chunkIdx: pkt.chunkIdx, 
-              data: chunk.data
-          });
-      }
+  if (chunk && conn && conn.open) {
+      conn.send({ t: 'SMART_DATA', fileId: pkt.fileId, chunkIdx: pkt.chunkIdx, data: chunk.data });
   }
 }
 
@@ -322,8 +331,6 @@ function finishDownload(fileId, domId, url) {
   const card = document.getElementById('card-' + domId);
   const prog = document.getElementById('prog-wrap-' + domId);
   
-  // === 修复：不自动 window.open，而是改变按钮状态 ===
-  
   if (card) {
       const img = card.querySelector('img');
       const overlay = card.querySelector('.overlay');
@@ -332,8 +339,6 @@ function finishDownload(fileId, domId, url) {
           img.style.filter = 'none';
       }
       if (overlay) overlay.style.display = 'none';
-      
-      // 绑定新的打开事件
       card.onclick = () => openFileViewer(fileId);
   } 
   else if (btn) {
@@ -345,7 +350,6 @@ function finishDownload(fileId, domId, url) {
   window.util.log('✅ 下载完成');
 }
 
-// Utils (保持不变)
 async function assembleFile(fileId) {
     const meta = await getMeta(fileId);
     if (!meta) return null;
