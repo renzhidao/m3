@@ -8,20 +8,6 @@ export function init() {
     init() {
        this.updateSelf();
        this.renderList();
-       this.renderVersion();
-    },
-
-    
-    renderVersion() {
-        if (document.getElementById('p1-version')) return;
-        const bar = document.getElementById('sidebar');
-        if (bar) {
-            const v = document.createElement('div');
-            v.id = 'p1-version';
-            v.style.cssText = 'padding:10px;text-align:center;font-size:10px;color:#444;border-top:1px solid #1a1a1a;margin-top:auto;';
-            v.innerHTML = 'P1 ' + (window.APP_VERSION || 'Loading...');
-            bar.appendChild(v);
-        }
     },
 
     updateSelf() {
@@ -32,13 +18,6 @@ export function init() {
       const elCount = document.getElementById('onlineCount');
 
       if (elId) elId.innerText = window.state.myId.slice(0, 6);
-      if (document.getElementById('myAvatar')) {
-          let hash = 0;
-          const str = window.state.myId;
-          for (let i = 0; i < str.length; i++) hash = str.charCodeAt(i) + ((hash << 5) - hash);
-          const c = (hash & 0x00FFFFFF).toString(16).toUpperCase();
-          document.getElementById('myAvatar').style.background = '#' + '00000'.substring(0, 6 - c.length) + c;
-      }
       if (elNick) elNick.innerText = window.state.myName;
       
       if (elSt) {
@@ -95,18 +74,7 @@ export function init() {
         const isOnline = window.state.conns[id] && window.state.conns[id].open;
         const unread = window.state.unread[id] || 0;
         const safeName = window.util.escape(v.n || id.slice(0, 6));
-        
-        let bg = UI_CONFIG.COLOR_OFFLINE;
-        if (isOnline) {
-             bg = UI_CONFIG.COLOR_ONLINE;
-        } else {
-             // 简单的字符串转颜色 hash
-             let hash = 0;
-             for (let i = 0; i < id.length; i++) hash = id.charCodeAt(i) + ((hash << 5) - hash);
-             const c = (hash & 0x00FFFFFF).toString(16).toUpperCase();
-             bg = '#' + '00000'.substring(0, 6 - c.length) + c;
-        }
-
+        const bg = isOnline ? UI_CONFIG.COLOR_ONLINE : window.util.colorHash(id);
 
         html += `
           <div class="contact-item ${window.state.activeChat === id ? 'active' : ''}" 

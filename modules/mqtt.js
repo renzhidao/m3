@@ -1,23 +1,24 @@
 import { MSG_TYPE, NET_PARAMS, UI_CONFIG } from './constants.js';
 
 export function init() {
-  console.log('📦 加载模块: MQTT (Fixed v3)');
+  console.log('📦 加载模块: MQTT (Anti-Bounce v2)');
 
   const CFG = window.config;
 
   window.mqtt = {
     client: null,
-    _isConnecting: false,
     failCount: 0,
     _pulseTimer: null,
+    _isConnecting: false, // 🔒 防并发锁
 
     start() {
       if (this.client && this.client.isConnected()) return;
-      if (this._isConnecting) return;
+      if (this._isConnecting) return; // 🔒 锁生效
       this._isConnecting = true;
 
       if (typeof Paho === 'undefined') {
         window.util.log('❌ MQTT库未加载');
+        this._isConnecting = false; // 解锁
         setTimeout(() => this.start(), 3000);
         return;
       }
@@ -70,12 +71,13 @@ export function init() {
             this.client = null;
             window.state.mqttClient = null;
         }
+        this._isConnecting = false; // 确保解锁
         window.state.mqttStatus = '暂停';
         if(window.ui) window.ui.updateSelf();
     },
 
     onConnect(isProxy) {
-      this._isConnecting = false;
+      this._isConnecting = false; // 🔒 解锁
       window.state.mqttStatus = '在线';
       this.failCount = 0;
       window.util.log(`✅ MQTT连通!`);
@@ -96,7 +98,7 @@ export function init() {
     },
 
     onFail(ctx) {
-      this._isConnecting = false;
+      this._isConnecting = false; // 🔒 解锁
       window.state.mqttStatus = '失败';
       this.failCount++;
       window.util.log(`❌ MQTT失败: ${ctx.errorMessage}`);
@@ -106,6 +108,7 @@ export function init() {
     },
 
     onLost(res) {
+      this._isConnecting = false; // 🔒 解锁
       if (res.errorCode === 0) return;
 
       window.state.mqttStatus = '断开';
@@ -138,7 +141,7 @@ export function init() {
     },
 
     sendPresence() {
-      // === 关键修复：后台时不发送心跳，静默保活 ===
+      // === 后台静默 ===
       if (document.hidden) return;
 
       if (!this.client || !this.client.isConnected()) return;

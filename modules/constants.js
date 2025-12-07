@@ -3,8 +3,7 @@
  * 目的：将所有硬编码的变量集中管理，方便后续修改
  */
 
-export const APP_VERSION = '1.0.29-UtilsFull';
-window.APP_VERSION = APP_VERSION; // 当前版本号
+export const APP_VERSION = '1.0.30-Ultra-350'; // m1改版
 
 // 1. 网络消息协议类型
 export const MSG_TYPE = {
@@ -21,11 +20,11 @@ export const MSG_TYPE = {
 // 2. 网络参数配置
 export const NET_PARAMS = {
   GOSSIP_SIZE: 20,          
-  MAX_PEERS_NORMAL: 30,     
-  MAX_PEERS_HUB: 80,        
-  CONN_TIMEOUT: 5000,       
-  PING_TIMEOUT: 6000,       
-  LOOP_INTERVAL: 1000,      
+  MAX_PEERS_NORMAL: 350,    // 扩容至350
+  MAX_PEERS_HUB: 500,       // 网关扩容至500
+  CONN_TIMEOUT: 5000,       // 5秒连不上就杀
+  PING_TIMEOUT: 8000,       // 8秒没心跳就杀
+  LOOP_INTERVAL: 1000,      // 保持1秒轮询
   RETRY_DELAY: 3000,        
   HUB_PREFIX: 'p1-hub-v3-', 
   HUB_COUNT: 5              

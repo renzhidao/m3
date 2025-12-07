@@ -55,12 +55,6 @@ export function init() {
       // 1. 去重：如果处理过该消息，直接忽略
       if (window.state.seenMsgs.has(pkt.id)) return;
       window.state.seenMsgs.add(pkt.id);
-      
-      // [自动清理] 限制内存中保留的ID数量，防止内存泄露
-      if (window.state.seenMsgs.size > 2000) {
-        const it = window.state.seenMsgs.values();
-        for (let i=0; i<500; i++) window.state.seenMsgs.delete(it.next().value);
-      }
 
       // 2. 更新逻辑时钟
       pkt.ts = pkt.ts || (window.state.latestTs + 1);

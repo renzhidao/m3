@@ -1,37 +1,26 @@
 import { MSG_TYPE, NET_PARAMS } from './constants.js';
 
 export function init() {
-  console.log('📦 加载模块: P2P (Leak Guard v7)');
+  console.log('📦 加载模块: P2P (Ultra v350)');
   const CFG = window.config;
-  const QUOTA_LIMIT = 3; 
 
   window.p2p = {
-    _connecting: new Set(),
-    _healthTimer: null,
+    _searchLogShown: false,
+    _waitLogShown: false,
+    _connecting: new Set(), // 连接锁
 
-    _checkPeer(caller) {
-      const p = window.state.peer;
-      return (p && !p.destroyed);
-    },
-
-    _safeCall(fn, caller) {
-      try { return fn(); } catch (e) {
-        window.util.log(`❌ [${caller}] 异常: ${e.message}`);
-      }
-    },
-
-    // === 深度清理 ===
+    // === 暴力回收核心 ===
     _hardClose(conn) {
       if (!conn) return;
       const p = window.state.peer;
       
-      // 0. 移除所有事件监听，防止闭包泄露
+      // 1. 移除所有监听
       try { conn.removeAllListeners(); } catch(e){}
 
-      // 1. 关闭连接
+      // 2. 关闭连接
       try { conn.close(); } catch(e){}
       
-      // 2. 关闭底层 PeerConnection
+      // 3. 杀底层 PeerConnection (防崩溃关键)
       try { 
         if (conn.peerConnection) {
             conn.peerConnection.onicecandidate = null;
@@ -41,7 +30,7 @@ export function init() {
         }
       } catch(e){}
       
-      // 3. 从 PeerJS 内部缓存中移除
+      // 4. 从 PeerJS 内部缓存中挖除
       if (p && p._connections && conn.peer) {
           const list = p._connections.get(conn.peer);
           if (list) {
@@ -54,162 +43,164 @@ export function init() {
       conn.peerConnection = null;
     },
 
-    _ensureQuota() {
-      const ids = Object.keys(window.state.conns);
-      if (ids.length < QUOTA_LIMIT) return true;
-
-      let targetId = null;
-      // 1. 先踢没连上的
-      for (const id of ids) { if (!window.state.conns[id].open) { targetId = id; break; } }
-      
-      // 2. 再踢压测产生的
-      if (!targetId) {
-          for (const id of ids) { if (id.startsWith('cycle_')) { targetId = id; break; } }
-      }
-
-      // 3. 踢最旧的
-      if (!targetId) targetId = ids[0];
-
-      if (targetId) {
-          this._hardClose(window.state.conns[targetId]);
-          delete window.state.conns[targetId];
-          return true;
-      }
-      return false;
-    },
-
-    _startHealthCheck() {
-      if (this._healthTimer) clearInterval(this._healthTimer);
-      this._healthTimer = setInterval(() => {
-        if (document.hidden) return;
-        const count = Object.keys(window.state.conns||{}).length;
-        // 只有连接数异常多时才打印
-        if (count > QUOTA_LIMIT) window.util.log(`💓 [健康] Conns: ${count}/${QUOTA_LIMIT}`);
-      }, 10000);
-    },
-
     start() {
-      this._safeCall(() => {
-        if (window.state.peer && !window.state.peer.destroyed) return;
-        if (typeof Peer === 'undefined') { setTimeout(() => this.start(), 200); return; }
+      if (window.state.peer && !window.state.peer.destroyed) return;
 
-        window.util.log(`🚀 [P2P] 创建Peer: ${window.state.myId}`);
+      if (typeof Peer === 'undefined') {
+          if (!this._waitLogShown) {
+              window.util.log('[P2P] ⏳ Peer库未就绪，开始等待...');
+              this._waitLogShown = true;
+          }
+          setTimeout(() => this.start(), 200);
+          return;
+      }
+
+      window.util.log(`[P2P] 🚀 正在启动 (上限350)... ID: ${window.state.myId}`);
+      
+      try {
         const p = new Peer(window.state.myId, CFG.peer);
-        
+
         p.on('open', id => {
-          window.util.log(`✅ [P2P] Peer.open: ${id}`);
           window.state.myId = id;
           window.state.peer = p;
+          this._searchLogShown = false;
+          window.util.log(`✅ 就绪: ${id.slice(0, 6)}`);
+          
           if (window.ui) window.ui.updateSelf();
           this.patrolHubs();
-          this._startHealthCheck();
         });
 
         p.on('connection', conn => this.setupConn(conn));
-        
+
         p.on('error', e => {
+          // 遇到错误，直接尝试杀连接，防止残留
           if (e.type === 'peer-unavailable') {
-              // 自动清理连不上的悬挂连接
               const deadId = e.message.replace('Could not connect to peer ', '');
               if (deadId && window.state.conns[deadId]) {
                   this._hardClose(window.state.conns[deadId]);
                   delete window.state.conns[deadId];
               }
-              // 不再弹窗刷屏
-              // window.util.log(`❌ 节点不可达: ${deadId}`); 
-          } 
-          else if (e.message && e.message.includes('Cannot create so many')) {
-             window.util.log('🚨 [系统] 资源耗尽，重启 Peer...');
-             this.stop();
-             setTimeout(() => this.start(), 1000);
-          } else {
-             window.util.log(`❌ [P2P] Error: ${e.type}`);
+              return;
+          }
+
+          if (e.type === 'unavailable-id') {
+             window.util.log('⚠️ ID冲突，正在自动更换...');
+             const newId = 'u_' + Math.random().toString(36).substr(2, 9);
+             localStorage.setItem('p1_my_id', newId);
+             window.state.myId = newId;
+             location.reload(); 
+             return;
+          }
+
+          if (e.type === 'disconnected') {
+             if (!this._searchLogShown) {
+               window.util.log('📡 正在重连 P2P 网络...');
+               this._searchLogShown = true;
+             }
+             p.reconnect();
+             return;
+          }
+
+          if (['network', 'server-error', 'socket-error', 'socket-closed'].includes(e.type)) {
+             setTimeout(() => this.start(), 5000);
           }
         });
-      }, 'start');
+      } catch (err) {
+        window.util.log('❌ P2P 初始化崩溃: ' + err.message);
+      }
     },
 
     stop() {
-      if (this._healthTimer) clearInterval(this._healthTimer);
-      if (window.state.peer) { try { window.state.peer.destroy(); } catch(e) {} window.state.peer = null; }
-      Object.values(window.state.conns).forEach(c => this._hardClose(c));
-      window.state.conns = {};
-      this._connecting.clear();
+        if (window.state.peer) {
+            window.util.log('🛑 [系统] 暂停 P2P 服务');
+            try { window.state.peer.destroy(); } catch(e){}
+            window.state.peer = null;
+        }
+        // 暴力全杀
+        Object.values(window.state.conns).forEach(c => this._hardClose(c));
+        window.state.conns = {};
+        this._connecting.clear(); 
+        if (window.ui) window.ui.updateSelf();
     },
 
     connectTo(id) {
       if (!id || id === window.state.myId) return;
-      if (!this._checkPeer('connectTo')) return;
+      if (!window.state.peer || window.state.peer.destroyed) return;
+      
       if (window.state.conns[id] && window.state.conns[id].open) return;
       if (this._connecting.has(id)) return;
 
       this._connecting.add(id);
-      setTimeout(() => {
-        this._connecting.delete(id);
-        // [超时清理] 如果5秒还没连上，直接杀掉，不留活口
-        const c = window.state.conns[id];
-        if (c && !c.open) {
-            // window.util.log(`⏱️ 连接超时: ${id}`);
-            this._hardClose(c);
-            delete window.state.conns[id];
-            if (window.ui) window.ui.renderList();
-        }
-      }, 5000);
 
-      this._safeCall(() => {
+      // 5秒超时杀无赦
+      setTimeout(() => {
+          this._connecting.delete(id);
+          const c = window.state.conns[id];
+          if (c && !c.open) {
+              this._hardClose(c);
+              delete window.state.conns[id];
+              // window.util.log(`⏱️ 连接超时: ${id}`);
+          }
+      }, NET_PARAMS.CONN_TIMEOUT);
+
+      try {
+        // 先清理旧尸体
         if (window.state.conns[id]) {
             this._hardClose(window.state.conns[id]);
             delete window.state.conns[id];
         }
 
-        this._ensureQuota(); // 腾位置
-
-        try {
-            const conn = window.state.peer.connect(id, { reliable: true });
-            conn.created = Date.now();
-            conn._targetId = id;
-            window.state.conns[id] = conn;
-            this.setupConn(conn);
-        } catch(err) {
-            this._connecting.delete(id);
-            if (err.message && err.message.includes('Cannot create so many')) {
-                window.util.log('🚨 [系统] 资源耗尽(Connect)，重启...');
-                this.stop();
-                setTimeout(() => this.start(), 1000);
-            }
-        }
-      }, 'connectTo');
+        const conn = window.state.peer.connect(id, { reliable: true });
+        conn.created = window.util.now();
+        conn._targetId = id; // 标记ID以便清理
+        window.state.conns[id] = conn; 
+        this.setupConn(conn);
+      } catch (e) { 
+          this._connecting.delete(id);
+      }
     },
 
     setupConn(conn) {
       const pid = conn.peer || conn._targetId || 'unknown';
-      if (!this._ensureQuota()) { conn.close(); return; }
+      const max = window.state.isHub ? NET_PARAMS.MAX_PEERS_HUB : NET_PARAMS.MAX_PEERS_NORMAL;
+      
+      // 超限熔断：如果是主动连接且满员，拒绝 (被动连接通常放行，或者在maintenance清理)
+      if (Object.keys(window.state.conns).length >= max + 50) { // 留50个缓冲区
+        conn.close();
+        return;
+      }
 
       conn.on('open', () => {
         this._connecting.delete(pid);
+
         conn.lastPong = Date.now();
         conn.created = Date.now();
         window.state.conns[pid] = conn;
         
-        this._safeCall(() => {
-          const list = Object.keys(window.state.conns);
-          list.push(window.state.myId);
-          conn.send({ t: MSG_TYPE.HELLO, n: window.state.myName, id: window.state.myId });
-          setTimeout(() => { if (conn.open) conn.send({ t: MSG_TYPE.PEER_EX, list: list }); }, 100);
-          window.db.getRecent(1, 'all').then(m => {
+        window.util.log(`✅ [P2P] 连接: ${pid.slice(0, 6)}`);
+        
+        const list = Object.keys(window.state.conns);
+        list.push(window.state.myId);
+        conn.send({ t: MSG_TYPE.HELLO, n: window.state.myName, id: window.state.myId });
+        
+        setTimeout(() => { if (conn.open) conn.send({ t: MSG_TYPE.PEER_EX, list: list }); }, 100);
+        
+        window.db.getRecent(1, 'all').then(m => {
             const lastTs = (m && m.length) ? m[0].ts : 0;
-            setTimeout(() => { if(conn.open) conn.send({t: MSG_TYPE.ASK_PUB, ts: lastTs}); }, 500);
-          });
-        }, 'conn.open');
+            setTimeout(() => {
+                if(conn.open) conn.send({t: MSG_TYPE.ASK_PUB, ts: lastTs});
+            }, 500);
+        });
+
         if (window.protocol) window.protocol.retryPending();
         if (window.ui) { window.ui.renderList(); window.ui.updateSelf(); }
       });
 
-      conn.on('data', d => this._safeCall(() => this.handleData(d, conn), 'handleData'));
+      conn.on('data', d => this.handleData(d, conn));
       
       const onGone = () => {
         this._connecting.delete(pid);
-        this._hardClose(conn);
+        this._hardClose(conn); // 暴力清理
         delete window.state.conns[pid];
         if (window.ui) { window.ui.renderList(); window.ui.updateSelf(); }
       };
@@ -220,62 +211,88 @@ export function init() {
     handleData(d, conn) {
       conn.lastPong = Date.now();
       if (!d || !d.t) return;
-      if (d.t === MSG_TYPE.PING) { if (conn.open) conn.send({ t: MSG_TYPE.PONG }); return; }
+
+      if (d.t === MSG_TYPE.PING) { conn.send({ t: MSG_TYPE.PONG }); return; }
       if (d.t === MSG_TYPE.PONG) return;
+      
       if (d.t === MSG_TYPE.HELLO) {
-        conn.label = d.n;
+        conn.label = d.n; 
         if (window.protocol) window.protocol.processIncoming({ senderId: d.id, n: d.n });
         return;
       }
+
       if (d.t === MSG_TYPE.PEER_EX && Array.isArray(d.list)) {
         d.list.forEach(id => {
-          if (id && id !== window.state.myId && !window.state.conns[id]) {
-            if (Object.keys(window.state.conns).length < NET_PARAMS.MAX_PEERS_NORMAL) this.connectTo(id);
-          }
+           if (id && id !== window.state.myId && !window.state.conns[id]) {
+             if (Object.keys(window.state.conns).length < NET_PARAMS.MAX_PEERS_NORMAL) {
+               this.connectTo(id);
+             }
+           }
         });
         return;
       }
+      
       if (d.t === MSG_TYPE.ASK_PUB) {
-        window.db.getPublicAfter(d.ts || 0).then(list => { if (list.length > 0 && conn.open) conn.send({t: MSG_TYPE.REP_PUB, list: list}); });
-        return;
+         window.db.getPublicAfter(d.ts || 0).then(list => {
+             if (list.length > 0) conn.send({t: MSG_TYPE.REP_PUB, list: list});
+         });
+         return;
       }
       if (d.t === MSG_TYPE.REP_PUB && Array.isArray(d.list)) {
-        d.list.forEach(m => { if (window.protocol) window.protocol.processIncoming(m); });
-        return;
+          d.list.forEach(m => {
+              if (window.protocol) window.protocol.processIncoming(m);
+          });
+          return;
       }
-      if (d.t === MSG_TYPE.MSG && window.protocol) window.protocol.processIncoming(d, conn.peer);
+
+      if (d.t === MSG_TYPE.MSG) {
+        if (window.protocol) window.protocol.processIncoming(d, conn.peer);
+      }
     },
 
     patrolHubs() {
-      if (!this._checkPeer('patrolHubs')) return;
+      if (!window.state.peer || window.state.peer.destroyed) return;
       for (let i = 0; i < NET_PARAMS.HUB_COUNT; i++) {
         const targetId = NET_PARAMS.HUB_PREFIX + i;
-        if (!window.state.conns[targetId] || !window.state.conns[targetId].open) this.connectTo(targetId);
+        if (!window.state.conns[targetId] || !window.state.conns[targetId].open) {
+          this.connectTo(targetId);
+        }
       }
     },
 
     maintenance() {
-      if (!this._checkPeer('maintenance')) return;
+      if (!window.state.peer || window.state.peer.destroyed) return;
+
       const now = Date.now();
       Object.keys(window.state.conns).forEach(pid => {
         const c = window.state.conns[pid];
+        // 1. 还没连上且超时 -> 杀
         if (!c.open && now - (c.created || 0) > NET_PARAMS.CONN_TIMEOUT) {
-          this._hardClose(c);
-          delete window.state.conns[pid];
-        } else if (c.open && c.lastPong && (now - c.lastPong > NET_PARAMS.PING_TIMEOUT)) {
-          if (!pid.startsWith(NET_PARAMS.HUB_PREFIX)) {
-            this._hardClose(c);
-            delete window.state.conns[pid];
-          }
+           this._hardClose(c);
+           delete window.state.conns[pid];
+           return;
+        }
+        // 2. 连上了但心跳超时 -> 杀 (除了 Hub)
+        if (c.open && c.lastPong && (now - c.lastPong > NET_PARAMS.PING_TIMEOUT)) {
+           if (!pid.startsWith(NET_PARAMS.HUB_PREFIX)) {
+               this._hardClose(c);
+               delete window.state.conns[pid];
+               return;
+           }
         }
       });
+
       const all = Object.keys(window.state.conns);
       if (all.length > 0) {
-        const pkt = { t: MSG_TYPE.PEER_EX, list: all.slice(0, NET_PARAMS.GOSSIP_SIZE) };
-        Object.values(window.state.conns).forEach(c => {
-          if (c.open) this._safeCall(() => { c.send({ t: MSG_TYPE.PING }); c.send(pkt); }, 'maintenance.send');
-        });
+         const pkt = { t: MSG_TYPE.PEER_EX, list: all.slice(0, NET_PARAMS.GOSSIP_SIZE) };
+         Object.values(window.state.conns).forEach(c => {
+             if (c.open) {
+                 c.send({ t: MSG_TYPE.PING }); 
+                 c.send(pkt);
+             }
+         });
       }
+      
       if (window.ui) { window.ui.renderList(); window.ui.updateSelf(); }
     }
   };
