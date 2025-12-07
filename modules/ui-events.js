@@ -23,6 +23,7 @@ export function init() {
     },
 
     bindClicks() {
+      // 定义辅助函数 bind
       const bind = (id, fn) => { const el = document.getElementById(id); if (el) el.onclick = fn; };
 
       // 发送按钮
@@ -106,7 +107,7 @@ export function init() {
             // 处理通用文件
             window.util.log('准备发送文件: ' + file.name + ' (' + (file.size/1024).toFixed(1) + 'KB)');
             
-            }
+            // [已移除 5MB 限制]
             
             const reader = new FileReader();
             reader.readAsDataURL(file);
