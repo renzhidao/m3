@@ -16,6 +16,7 @@ export function init() {
 
       this.loadHistory(20);
 
+      // 启动时并发：P2P 和 MQTT 同时开始连接，不互相等待
       if (window.p2p) window.p2p.start();
       if (window.mqtt) window.mqtt.start();
 
@@ -36,35 +37,43 @@ export function init() {
     bindLifecycle() {
         document.addEventListener('visibilitychange', () => {
             if (document.hidden) {
-                // === 切后台：只暂停逻辑循环，保持连接（利用系统宽容期） ===
-                window.util.log('🌙 应用切入后台 (静默模式)...');
-                
+                // === 切后台：只暂停定时器，网络连接交给系统调度 ===
+                window.util.log('🌙 应用切入后台...');
                 if (this.loopTimer) {
                     clearInterval(this.loopTimer);
                     this.loopTimer = null;
                 }
                 
             } else {
-                // === 切前台：恢复逻辑，检查连接 ===
-                window.util.log('☀️ 应用切回前台...');
+                // === 切前台：立即并发执行所有恢复逻辑，不要等定时器！ ===
+                window.util.log('☀️ 应用切回前台 (并发重连)...');
                 
+                // 1. 恢复定时器
                 if (!this.loopTimer) {
                     this.loopTimer = setInterval(() => this.loop(), NET_PARAMS.LOOP_INTERVAL);
                 }
                 
-                // 检查 P2P 是否存活，只有死了才重启
+                // 2. 激进并发：P2P 检查
                 if (window.p2p) {
                     if (!window.state.peer || window.state.peer.destroyed || window.state.peer.disconnected) {
-                        window.util.log('🔧 P2P 连接已失效，正在恢复...');
+                        window.util.log('🔧 P2P 失效，立即重启');
                         window.p2p.start();
+                    } else {
+                        // 即使 Peer 活着，也立刻清理死连接并重新巡逻，不等 loop
+                        window.p2p.maintenance();
+                        window.p2p.patrolHubs();
                     }
                 }
                 
-                // 检查 MQTT
+                // 3. 激进并发：MQTT 检查
                 if (window.mqtt) {
                      if (!window.mqtt.client || !window.mqtt.client.isConnected()) {
-                         window.util.log('🔧 MQTT 连接已断开，正在重连...');
+                         window.util.log('🔧 MQTT 断开，立即重连');
+                         // 这里内部逻辑依然是先直连失败再切代理，保持顺序，但触发时机提前了
                          window.mqtt.start();
+                     } else {
+                         // 即使连着，也发个心跳刷存在感
+                         window.mqtt.sendPresence();
                      }
                 }
                 

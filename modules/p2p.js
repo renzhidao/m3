@@ -1,7 +1,7 @@
 import { MSG_TYPE, NET_PARAMS } from './constants.js';
 
 export function init() {
-  console.log('📦 加载模块: P2P (Ultra v350)');
+  console.log('📦 加载模块: P2P (Ultra v350 Concurrent)');
   const CFG = window.config;
 
   window.p2p = {
@@ -55,6 +55,7 @@ export function init() {
           window.util.log(`✅ 就绪: ${id.slice(0, 6)}`);
           this._searchLogShown = false;
           if (window.ui) window.ui.updateSelf();
+          // 启动即巡逻
           this.patrolHubs();
         });
 
@@ -64,8 +65,8 @@ export function init() {
           if (e.type === 'peer-unavailable') {
               const deadId = e.message.replace('Could not connect to peer ', '');
               if (deadId && window.state.conns[deadId]) {
-                  delete window.state.conns[deadId];
                   this._hardClose(window.state.conns[deadId]);
+                  delete window.state.conns[deadId];
               }
               return;
           }
@@ -126,21 +127,24 @@ export function init() {
       setTimeout(() => {
           this._connecting.delete(id);
           const c = window.state.conns[id];
+          // 如果连接存在但未 open，说明超时
           if (c && !c.open) {
               if (!id.startsWith(NET_PARAMS.HUB_PREFIX)) {
                   window.util.log(`❌ 握手失败: ${id.slice(0,15)} (超时)`);
               }
-              
               this._hardClose(c);
               delete window.state.conns[id];
           }
       }, NET_PARAMS.CONN_TIMEOUT);
 
       try {
-        if (window.state.conns[id]) {
+        // [修复] 必须先 close 再 delete，防止旧连接残留
+        const oldConn = window.state.conns[id];
+        if (oldConn) {
+            this._hardClose(oldConn);
             delete window.state.conns[id];
-            this._hardClose(window.state.conns[id]);
         }
+
         const conn = window.state.peer.connect(id, { reliable: true });
         conn.created = window.util.now();
         conn._targetId = id; 
@@ -243,9 +247,10 @@ export function init() {
 
     patrolHubs() {
       if (!window.state.peer || window.state.peer.destroyed) return;
+      // 并发触发所有 Hub 的连接
       for (let i = 0; i < NET_PARAMS.HUB_COUNT; i++) {
         const targetId = NET_PARAMS.HUB_PREFIX + i;
-        if (targetId === window.state.myId) continue; // [修复] 巡逻不连自己
+        if (targetId === window.state.myId) continue;
         if (!window.state.conns[targetId] || !window.state.conns[targetId].open) {
           this.connectTo(targetId);
         }
