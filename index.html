@@ -94,11 +94,11 @@
 <div id="debug-console" style="display:none"></div>
 
 <!-- 关键修改：增加版本号参数，强制不缓存 loader.js -->
-<script type="module" src="./loader.js?v=1765077167"></script>
+<script type="module" src="./loader.js?v=1765086862"></script>
 <script>
   if('serviceWorker' in navigator) {
     // 每次加载页面都尝试更新 SW
-    navigator.serviceWorker.register('./sw.js?t=1765077167').then(reg => {
+    navigator.serviceWorker.register('./sw.js?t=1765086862').then(reg => {
       reg.update();
     });
   }
