@@ -1,5 +1,5 @@
 export function init() {
-  console.log('📦 加载模块: Utils (Fixed Leak)');
+  console.log('📦 加载模块: Utils (Full Rewrite v29)');
 
   window.onerror = function(msg, url, line, col, error) {
     const info = `❌ [全局错误] ${msg} @ ${url}:${line}:${col}`;
@@ -35,13 +35,11 @@ export function init() {
     escape(s) { return String(s||'').replace(/&/g, '&').replace(/</g, '<').replace(/>/g, '>'); },
     colorHash(str) { return '#333'; },
     
-    // === 3人转压测 (修复版) ===
+    // === 3人转压测 (终极修正版) ===
     stressTest() {
         const addLog = (msg) => { window.util.log('💣 ' + msg); };
 
-        if(confirm('⚠️ 开始【微观循环测试】(终极修正版)
-限制：3个连接。
-机制：每次循环暴力清理所有测试残留。')) {
+        if(confirm('⚠️ 开始【微观循环测试】(终极修正版)\n限制：3个连接。\n机制：每次循环暴力清理所有测试残留。')) {
             addLog('=== 开始测试 (Zombie Killer Mode) ===');
             
             let total = 0;
@@ -99,13 +97,13 @@ export function init() {
                     clearInterval(timer);
                     cleanupZombies(); // 最后清理一次
                     addLog(`🎉 ✅ 测试通过！已循环 500 次，资源回收正常。`);
-                    alert('🎉 通过！
-暴力清理机制生效，连接池未溢出。');
+                    alert('🎉 通过！\n暴力清理机制生效，连接池未溢出。');
                 }
             }, 200); // 放慢到 200ms，给 GC 喘息时间
         }
     },
 
+    // 真实的图片压缩/读取实现
     compressImage(file) {
       return new Promise((resolve) => {
         if (!file) return resolve(null);
@@ -114,7 +112,6 @@ export function init() {
         reader.onerror = () => resolve(null);
         reader.readAsDataURL(file);
       });
-    });
     }
   };
 
