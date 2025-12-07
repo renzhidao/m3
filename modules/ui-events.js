@@ -1,7 +1,7 @@
 import { CHAT, UI_CONFIG } from './constants.js';
 
 export function init() {
-  console.log('📦 加载模块: UI Events (Fixed & Unlimited)');
+  console.log('📦 加载模块: UI Events (交互优化版)');
   
   window.uiEvents = {
     init() {
@@ -55,14 +55,12 @@ export function init() {
         const el = document.getElementById('logContent');
         if (!el) return;
         const text = (window.logSystem && window.logSystem.fullHistory) ? window.logSystem.fullHistory.join('\n') : 'Log Error';
-        const blob = new Blob([text], {type: 'text/plain'});
-        const url = URL.createObjectURL(blob);
-        const a = document.createElement('a');
-        a.href = url;
-        a.download = 'p1_log.txt';
-        document.body.appendChild(a);
-        a.click();
-        document.body.removeChild(a);
+        // 使用新修好的下载器
+        if (window.ui && window.ui.downloadBlob) {
+            window.ui.downloadBlob(btoa(unescape(encodeURIComponent(text))), 'p1_log.txt');
+        } else {
+            alert('下载模块未就绪');
+        }
       });
 
       // 设置面板
@@ -82,7 +80,7 @@ export function init() {
         document.getElementById('settings-panel').style.display = 'none';
       });
 
-      // === 关键修改：文件/图片上传逻辑 ===
+      // === 核心修复：文件/图片上传逻辑 (带进度提示) ===
       bind('btnFile', () => document.getElementById('fileInput').click());
       const fi = document.getElementById('fileInput');
       if (fi) {
@@ -90,37 +88,49 @@ export function init() {
           const file = e.target.files[0];
           if (!file) return;
 
-          // 策略：如果图片很大 (>500KB)，不压缩，直接发原图
-          // 如果图片很小，走压缩以节省空间
-          const isBigImage = file.type.startsWith('image/') && file.size > 500 * 1024;
-          
-          if (file.type.startsWith('image/') && !isBigImage) {
-            // 小图：走压缩 (秒传)
-            window.util.log('发送小图(压缩)...');
-            const b64 = await window.util.compressImage(file);
-            window.protocol.sendMsg(b64, CHAT.KIND_IMAGE);
-          } else {
-            // 大图 或 普通文件：读取原始数据 (Base64)
-            // 彻底移除了 5MB 限制
-            window.util.log(`读取原文件: ${file.name} (${(file.size/1024).toFixed(0)}KB)`);
-            
-            const reader = new FileReader();
-            reader.readAsDataURL(file);
-            reader.onload = () => {
-               const b64 = reader.result;
-               // 如果是图片，依然标记为 IMAGE，但内容是原图 Base64
-               // Smart Core 会识别它并生成高清预览
-               const type = file.type.startsWith('image/') ? CHAT.KIND_IMAGE : CHAT.KIND_FILE;
-               
-               window.protocol.sendMsg(b64, type, {
-                 name: file.name,
-                 size: file.size,
-                 type: file.type
-               });
-               window.util.log('📤 数据已提交');
-            };
-            reader.onerror = () => window.util.log('❌ 读取文件失败');
+          // 1. 立即给用户反馈
+          const editor = document.getElementById('editor');
+          const oldText = editor ? editor.innerText : '';
+          if (editor) editor.innerText = `⏳ 正在读取: ${file.name}...`;
+          window.util.log(`⏳ 开始处理文件: ${file.name} (${(file.size/1024).toFixed(0)}KB)`);
+
+          try {
+              const isBigImage = file.type.startsWith('image/') && file.size > 1024 * 1024; // 1MB以上算大图
+              
+              if (file.type.startsWith('image/') && !isBigImage) {
+                // 小图：压缩发送
+                window.util.log('图片压缩中...');
+                const b64 = await window.util.compressImage(file);
+                window.protocol.sendMsg(b64, CHAT.KIND_IMAGE);
+                if (editor) editor.innerText = ''; 
+              } else {
+                // 大图 或 普通文件
+                const reader = new FileReader();
+                reader.readAsDataURL(file);
+                
+                reader.onload = () => {
+                   const b64 = reader.result;
+                   const type = file.type.startsWith('image/') ? CHAT.KIND_IMAGE : CHAT.KIND_FILE;
+                   
+                   window.protocol.sendMsg(b64, type, {
+                     name: file.name,
+                     size: file.size,
+                     type: file.type
+                   });
+                   window.util.log('✅ 读取完成，发送中...');
+                   if (editor) editor.innerText = ''; // 清空提示
+                };
+                
+                reader.onerror = () => {
+                    window.util.log('❌ 读取文件失败');
+                    if (editor) editor.innerText = '❌ 读取失败';
+                };
+              }
+          } catch(err) {
+              window.util.log('❌ 处理错误: ' + err.message);
+              if (editor) editor.innerText = '';
           }
+          
           e.target.value = '';
         };
       }
