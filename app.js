@@ -4,8 +4,6 @@ export function init() {
   console.log(`🚀 启动主程序: App Core v${APP_VERSION}`);
 
   window.app = {
-    _lastPatrol: 0,
-
     async init() {
       window.util.log(`正在启动 P1 v${APP_VERSION}...`);
       
@@ -18,11 +16,10 @@ export function init() {
 
       this.loadHistory(20);
 
-      // 并发启动
+      // 启动时并发：P2P 和 MQTT 同时开始连接，不互相等待
       if (window.p2p) window.p2p.start();
       if (window.mqtt) window.mqtt.start();
 
-      // 启动主循环，不再被后台事件打断
       this.loopTimer = setInterval(() => this.loop(), NET_PARAMS.LOOP_INTERVAL);
       this.bindLifecycle();
 
@@ -40,65 +37,78 @@ export function init() {
     bindLifecycle() {
         document.addEventListener('visibilitychange', () => {
             if (document.hidden) {
-                // === 切后台：只记录日志，不清除定时器，进入“只听不连”模式 ===
-                // 这样可以利用浏览器宽限期继续收消息
-                window.util.log('🌙 切入后台 (被动接收模式)...');
-            } else {
-                // === 切前台：恢复主动并发 ===
-                window.util.log('☀️ 切回前台 (并发重连)...');
+                // === 切后台：只暂停定时器，网络连接交给系统调度 ===
+                window.util.log('🌙 应用切入后台...');
+                if (this.loopTimer) {
+                    clearInterval(this.loopTimer);
+                    this.loopTimer = null;
+                }
                 
-                // 防御性恢复：如果浏览器强行杀了定时器，这里救活它
+            } else {
+                // === 切前台：立即并发执行所有恢复逻辑，不要等定时器！ ===
+                window.util.log('☀️ 应用切回前台 (并发重连)...');
+                
+                // 1. 恢复定时器
                 if (!this.loopTimer) {
                     this.loopTimer = setInterval(() => this.loop(), NET_PARAMS.LOOP_INTERVAL);
                 }
                 
+                // 2. 激进并发：P2P 检查
                 if (window.p2p) {
                     if (!window.state.peer || window.state.peer.destroyed || window.state.peer.disconnected) {
-                        window.util.log('🔧 P2P 失效，重启中');
+                        window.util.log('🔧 P2P 失效，立即重启');
                         window.p2p.start();
                     } else {
-                        // 回前台立刻并发巡逻一次
+                        // 即使 Peer 活着，也立刻清理死连接并重新巡逻，不等 loop
                         window.p2p.maintenance();
                         window.p2p.patrolHubs();
-                        this._lastPatrol = Date.now();
                     }
                 }
                 
+                // 3. 激进并发：MQTT 检查
                 if (window.mqtt) {
                      if (!window.mqtt.client || !window.mqtt.client.isConnected()) {
+                         window.util.log('🔧 MQTT 断开，立即重连');
+                         // 这里内部逻辑依然是先直连失败再切代理，保持顺序，但触发时机提前了
                          window.mqtt.start();
                      } else {
+                         // 即使连着，也发个心跳刷存在感
                          window.mqtt.sendPresence();
                      }
                 }
+                
                 window.util.syncTime();
             }
         });
     },
 
     loop() {
-      // 这里的 loop 现在后台也会跑（直到浏览器挂起）
-      const isHidden = document.hidden;
-      const now = Date.now();
+      if (document.hidden) return;
       
-      // 1. 基础维护：必须跑，用于接收消息、维持心跳、回调数据
       if (window.p2p) window.p2p.maintenance();
       if (window.protocol) window.protocol.retryPending();
 
-      // 2. 关键防护：如果是后台，直接返回，绝不执行下面的主动连接逻辑
-      // 这就避免了后台积压请求导致的崩溃，同时上面的代码保证了能收消息
-      if (isHidden) return;
-
-      // 3. 主动巡逻：只有前台才做
-      if (now - this._lastPatrol > 5000) {
-          this._lastPatrol = now;
-          
-          if (!window.state.isHub && window.state.mqttStatus === '在线') {
-             if (window.p2p) window.p2p.patrolHubs();
-          } else if (!window.state.isHub && window.state.mqttStatus !== '在线') {
-             if (window.hub) window.hub.connectToAnyHub();
-          }
+      if (!window.state.isHub && window.state.mqttStatus === '在线') {
+         if (window.p2p) window.p2p.patrolHubs();
+      } else if (!window.state.isHub && window.state.mqttStatus !== '在线') {
+         if (window.hub) window.hub.connectToAnyHub();
       }
+    },
+
+    async loadHistory(limit) {
+      if (window.state.loading) return;
+      window.state.loading = true;
+      
+      const msgs = await window.db.getRecent(limit, window.state.activeChat, window.state.oldestTs);
+      
+      if (msgs && msgs.length > 0) {
+         window.state.oldestTs = msgs[0].ts;
+         msgs.forEach(m => {
+            window.state.seenMsgs.add(m.id);
+            if (window.ui) window.ui.appendMsg(m);
+         });
+      }
+      window.state.loading = false;
     }
   };
 
