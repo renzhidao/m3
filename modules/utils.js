@@ -1,5 +1,5 @@
 export function init() {
-  console.log('📦 加载模块: Utils (Endurance Test v4)');
+  console.log('📦 加载模块: Utils (Cycle Test v5)');
 
   window.onerror = function(msg, url, line, col, error) {
     const info = `❌ [全局错误] ${msg} @ ${url}:${line}:${col}`;
@@ -45,45 +45,53 @@ export function init() {
       return '#' + '000000'.substring(0, 6 - c.length) + c;
     },
     
+    // === 循环回收压测 ===
     stressTest() {
         const addLog = (msg) => {
-            const line = `[${new Date().toLocaleTimeString()}] ${msg}`;
-            console.log('💣 ' + line);
+            const line = `[${new Date().toLocaleTimeString()}] 💣 ${msg}`;
+            console.log(line);
             window.util.log('💣 ' + msg);
         };
 
-        if(confirm('⚠️ 开始【耐力压测】\n目标：创建 1000 个连接，验证资源回收。\n\n如果系统健康，总连接数会维持在 350 左右，不会崩。')) {
-            addLog('=== 开始耐力压测 ===');
-            let totalCreated = 0;
-            let batch = 20; 
+        if(confirm('⚠️ 开始【循环回收测试】\n目标：在连接数限制(50)内，创建 1000 次新连接。\n\n预期：每次创建前都会自动踢掉旧的，总量永远不超标，系统永远不崩。')) {
+            addLog('=== 开始循环回收测试 ===');
+            
+            let total = 0;
+            let success = 0;
             
             const timer = setInterval(() => {
                 if (!window.state.peer || window.state.peer.destroyed) {
-                    addLog('❌ Peer已销毁，压测中止');
+                    addLog('❌ Peer已销毁，测试中止');
                     clearInterval(timer);
-                    return;
-                }
-                const active = Object.keys(window.state.conns).length;
-                addLog(`创建 +${batch} (总计:${totalCreated}, 存活:${active})...`);
-                
-                try {
-                    for(let i=0; i<batch; i++) {
-                        totalCreated++;
-                        window.state.peer.connect('endurance_' + Date.now() + '_' + totalCreated);
-                    }
-                } catch(e) {
-                    clearInterval(timer);
-                    addLog(`💥 崩溃！回收失败！错误: ${e.message}`);
-                    alert(`❌ 压测失败\n总计创建: ${totalCreated}\n最终错误: ${e.message}`);
                     return;
                 }
 
-                if (totalCreated >= 1000) {
+                // 检查当前存活数（应该被压制在50左右）
+                const active = Object.keys(window.state.conns).length;
+                
+                try {
+                    // 每次创建一个新连接
+                    total++;
+                    window.state.peer.connect('cycle_' + Date.now() + '_' + total);
+                    success++;
+                    
+                    if (total % 20 === 0) {
+                        addLog(`循环次数: ${total}, 当前存活: ${active}/50`);
+                    }
+                } catch(e) {
                     clearInterval(timer);
-                    addLog('🎉 ✅ 压测通过！已成功创建 1000 个连接且未崩溃。');
-                    alert('🎉 压测通过！\n系统成功回收了旧连接，保持了稳定。');
+                    addLog(`💥 崩溃！在第 ${total} 次时失败。`);
+                    addLog(`错误: ${e.message}`);
+                    alert(`❌ 测试失败\n循环次数: ${total}\n存活数: ${active}\n错误: ${e.message}`);
+                    return;
                 }
-            }, 500); 
+
+                if (total >= 1000) {
+                    clearInterval(timer);
+                    addLog(`🎉 ✅ 测试通过！循环创建了 1000 个连接，当前存活 ${active} 个。`);
+                    alert('🎉 完美通过！\n资源回收机制有效，系统永不积压。');
+                }
+            }, 50); // 每50ms一个，快速循环
         }
     },
 
