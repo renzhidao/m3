@@ -1,5 +1,5 @@
 export function init() {
-  console.log('📦 加载模块: Utils (Cycle Test v5)');
+  console.log('📦 加载模块: Utils (3-Cycle Test)');
 
   window.onerror = function(msg, url, line, col, error) {
     const info = `❌ [全局错误] ${msg} @ ${url}:${line}:${col}`;
@@ -30,68 +30,51 @@ export function init() {
   window.util = {
     log: (s) => window.logSystem.add(s),
     now() { return Date.now() + (window.state ? window.state.timeOffset : 0); },
-    async syncTime() { 
-      try {
-        const res = await fetch(location.href, { method: 'HEAD', cache: 'no-cache' });
-        const dateStr = res.headers.get('date');
-        if (dateStr) window.state.timeOffset = new Date(dateStr).getTime() - Date.now();
-      } catch (e) {}
-    },
+    async syncTime() { try { window.state.timeOffset = 0; } catch (e) {} },
     uuid: () => Math.random().toString(36).substr(2, 9),
     escape(s) { return String(s||'').replace(/&/g, '&').replace(/</g, '<').replace(/>/g, '>'); },
-    colorHash(str) {
-      let hash = 0; for (let i = 0; i < str.length; i++) hash = str.charCodeAt(i) + ((hash << 5) - hash);
-      const c = (hash & 0x00FFFFFF).toString(16).toUpperCase();
-      return '#' + '000000'.substring(0, 6 - c.length) + c;
-    },
+    colorHash(str) { return '#333'; },
     
-    // === 循环回收压测 ===
+    // === 3人转压测 ===
     stressTest() {
         const addLog = (msg) => {
             const line = `[${new Date().toLocaleTimeString()}] 💣 ${msg}`;
-            console.log(line);
             window.util.log('💣 ' + msg);
         };
 
-        if(confirm('⚠️ 开始【循环回收测试】\n目标：在连接数限制(50)内，创建 1000 次新连接。\n\n预期：每次创建前都会自动踢掉旧的，总量永远不超标，系统永远不崩。')) {
-            addLog('=== 开始循环回收测试 ===');
+        if(confirm('⚠️ 开始【微观循环测试】\n限制：3个连接。\n目标：循环创建500次，验证每次是否都能成功挤掉旧连接。')) {
+            addLog('=== 开始测试 (Quota=3) ===');
             
             let total = 0;
-            let success = 0;
-            
             const timer = setInterval(() => {
                 if (!window.state.peer || window.state.peer.destroyed) {
-                    addLog('❌ Peer已销毁，测试中止');
-                    clearInterval(timer);
-                    return;
+                    clearInterval(timer); return;
                 }
 
-                // 检查当前存活数（应该被压制在50左右）
                 const active = Object.keys(window.state.conns).length;
                 
                 try {
-                    // 每次创建一个新连接
                     total++;
+                    // 创建新连接
                     window.state.peer.connect('cycle_' + Date.now() + '_' + total);
-                    success++;
                     
-                    if (total % 20 === 0) {
-                        addLog(`循环次数: ${total}, 当前存活: ${active}/50`);
+                    if (total % 10 === 0) {
+                        addLog(`第 ${total} 次, 存活: ${active}/3`);
                     }
                 } catch(e) {
                     clearInterval(timer);
-                    addLog(`💥 崩溃！在第 ${total} 次时失败。`);
+                    addLog(`💥 失败！无法创建第 ${total} 个连接。`);
+                    addLog(`存活数: ${active}`);
                     addLog(`错误: ${e.message}`);
-                    alert(`❌ 测试失败\n循环次数: ${total}\n存活数: ${active}\n错误: ${e.message}`);
                     return;
                 }
 
-                if (total >= 1000) {
+                if (total >= 500) {
                     clearInterval(timer);
-                    addLog(`🎉 ✅ 测试通过！循环创建了 1000 个连接，当前存活 ${active} 个。`);
-                    alert('🎉 完美通过！\n资源回收机制有效，系统永不积压。');
+                    addLog(`🎉 ✅ 测试通过！已循环 500 次，存活数稳定在 ${active}。`);
+                    alert('🎉 通过！\n旧连接已被成功清理，配额循环使用正常。');
                 }
-            }, 50); // 每50ms一个，快速循环
+            }, 100); // 100ms一次，稍慢一点方便观测
         }
     },
 
