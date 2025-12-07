@@ -3,7 +3,7 @@
  * 目的：将所有硬编码的变量集中管理，方便后续修改
  */
 
-export const APP_VERSION = '1.0.39-StopLoop';
+export const APP_VERSION = '1.0.40-SyntaxFixed';
 window.APP_VERSION = APP_VERSION; // 当前版本号
 
 // 1. 网络消息协议类型

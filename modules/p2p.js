@@ -1,14 +1,14 @@
 import { MSG_TYPE, NET_PARAMS } from './constants.js';
 
 export function init() {
-  console.log('📦 加载模块: P2P (NoTimeout v37)');
+  console.log('📦 加载模块: P2P (Fixed Syntax v40)');
   const CFG = window.config;
 
   window.p2p = {
     _connecting: new Set(),
-    _starting: false,
     _healthTimer: null,
     _lastReconnect: 0,
+    _starting: false, 
 
     _checkPeer(caller) {
       const p = window.state.peer;
@@ -21,7 +21,7 @@ export function init() {
       }
     },
 
-    // === 深度清理 (仅在断开后执行) ===
+    // === 深度清理 ===
     _hardClose(conn) {
       if (!conn) return;
       const p = window.state.peer;
@@ -63,22 +63,14 @@ export function init() {
       return false;
     },
 
-    
     start() {
-      if (this._starting) return; // 防止并发启动
+      if (this._starting) return;
       this._starting = true;
 
       this._safeCall(() => {
-        // 如果已经活着，就别折腾了
         if (window.state.peer && !window.state.peer.destroyed && !window.state.peer.disconnected) {
-            this._starting = false;
-            return;
-        }
-        
-        // 彻底清理旧的
-        if (window.state.peer) {
-            try { window.state.peer.destroy(); } catch(e){}
-            window.state.peer = null;
+             this._starting = false;
+             return;
         }
 
         if (typeof Peer === 'undefined') { 
@@ -91,7 +83,7 @@ export function init() {
         const p = new Peer(window.state.myId, CFG.peer);
         
         p.on('open', id => {
-          this._starting = false; // 解锁
+          this._starting = false;
           window.util.log(`✅ [P2P] 就绪: ${id}`);
           window.state.myId = id;
           window.state.peer = p;
@@ -120,7 +112,7 @@ export function init() {
         });
         
         p.on('error', e => {
-          this._starting = false; // 出错也解锁
+          this._starting = false;
           if (e.type === 'peer-unavailable') {
               const deadId = e.message.replace('Could not connect to peer ', '');
               if (deadId && window.state.conns[deadId]) {
@@ -135,18 +127,17 @@ export function init() {
              window.util.log('🚨 资源耗尽，重启...');
              this.stop();
              setTimeout(() => this.start(), 1000);
-          } else if (e.type === 'unavailable-id') {
-             // 关键：ID被占用（通常是死循环导致的），换个ID重试
-             window.util.log('⚠️ ID冲突，尝试重置ID...');
+          } 
+          else if (e.type === 'unavailable-id') {
+             window.util.log('⚠️ ID冲突，重置ID...');
              window.state.myId = 'u_' + Math.random().toString(36).substr(2, 9);
              this.stop();
-             setTimeout(() => this.start(), 500);
+             setTimeout(() => this.start(), 1000);
           } else {
              window.util.log(`❌ [P2P] ${e.type}`);
           }
         });
       }, 'start');
-    }, 'start');
     },
 
     _reconnect(p) {
@@ -172,8 +163,8 @@ export function init() {
 
       this._connecting.add(id);
       
-      // === 移除这里所有的 setTimeout 超时强杀 ===
-      // 让它一直连，直到成功或者报错 error
+      // 仅移除标记，绝不杀连接
+      setTimeout(() => { this._connecting.delete(id); }, 10000);
 
       this._safeCall(() => {
         if (window.state.conns[id]) {
@@ -225,7 +216,6 @@ export function init() {
       
       const onGone = () => {
         this._connecting.delete(pid);
-        // 只有真的断了才清理
         if (window.state.conns[pid]) {
              window.util.log(`🔌 连接断开: ${pid.slice(0,6)}..`);
              this._hardClose(conn);
@@ -287,16 +277,14 @@ export function init() {
       Object.keys(window.state.conns).forEach(pid => {
         const c = window.state.conns[pid];
         
-        // 握手超时放宽到 30秒
+        // 30s 握手超时
         if (!c.open && now - (c.created || 0) > 30000) {
-          // window.util.log(`💀 握手太久放弃: ${pid}`);
           this._hardClose(c);
           delete window.state.conns[pid];
         } 
-        // 心跳超时放宽到 60秒
+        // 60s 心跳超时
         else if (c.open && c.lastPong && (now - c.lastPong > 60000)) {
           if (!pid.startsWith(NET_PARAMS.HUB_PREFIX)) {
-            // window.util.log(`💔 心跳丢失: ${pid}`);
             this._hardClose(c);
             delete window.state.conns[pid];
           }
