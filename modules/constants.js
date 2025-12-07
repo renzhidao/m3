@@ -3,7 +3,7 @@
  * 目的：将所有硬编码的变量集中管理，方便后续修改
  */
 
-export const APP_VERSION = '1.0.33-Ultra-Fix-Net'; // m1 fix network
+export const APP_VERSION = '1.0.34-Smart-v2'; // m1 fix network
 
 // 1. 网络消息协议类型
 export const MSG_TYPE = {

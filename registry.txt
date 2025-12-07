@@ -2,6 +2,7 @@ constants
 utils
 state
 db
+smart-core
 protocol
 p2p
 mqtt
