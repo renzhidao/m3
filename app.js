@@ -2,7 +2,7 @@ import { NET_PARAMS, CHAT, APP_VERSION } from './modules/constants.js';
 
 export function init() {
   console.log(`🚀 启动主程序: App Core v${APP_VERSION}`);
-
+  
   window.app = {
     async init() {
       window.util.log(`正在启动 P1 v${APP_VERSION}...`);
@@ -13,7 +13,7 @@ export function init() {
       
       if (window.ui && window.ui.init) window.ui.init();
       if (window.uiEvents && window.uiEvents.init) window.uiEvents.init();
-
+      
       this.loadHistory(20);
 
       // 启动时并发：P2P 和 MQTT 同时开始连接，不互相等待
@@ -38,12 +38,11 @@ export function init() {
         document.addEventListener('visibilitychange', () => {
             if (document.hidden) {
                 // === 切后台：只暂停定时器，网络连接交给系统调度 ===
-                window.util.log('🌙 应用切入后台...');
+                window.util.log(' 应用切入后台...');
                 if (this.loopTimer) {
                     clearInterval(this.loopTimer);
                     this.loopTimer = null;
-                }
-                
+                }            
             } else {
                 // === 切前台：立即并发执行所有恢复逻辑，不要等定时器！ ===
                 window.util.log('☀️ 应用切回前台 (并发重连)...');
@@ -66,19 +65,16 @@ export function init() {
                 }
                 
                 // 3. 激进并发：MQTT 检查
-                if (window.mqtt) {
-                     if (!window.mqtt.client || !window.mqtt.client.isConnected()) {
+                if (window.mqtt) { 
+                     if (!window.state.mqttClient || !window.state.mqttClient.isConnected()) {
                          window.util.log('🔧 MQTT 断开，立即重连');
-                         // 这里内部逻辑依然是先直连失败再切代理，保持顺序，但触发时机提前了
                          window.mqtt.start();
                      } else {
-                         // 即使连着，也发个心跳刷存在感
                          window.mqtt.sendPresence();
                      }
-                }
-                
-                window.util.syncTime();
+                }            
             }
+            window.util.syncTime();
         });
     },
 
@@ -111,6 +107,6 @@ export function init() {
       window.state.loading = false;
     }
   };
-
+  
   window.app.init();
 }

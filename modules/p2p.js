@@ -14,14 +14,15 @@ export function init() {
       const p = window.state.peer;
       try { conn.removeAllListeners(); } catch(e){}
       try { conn.close(); } catch(e){}
-      try { 
-         if (conn.peerConnection) {
-            conn.peerConnection.onicecandidate = null;
+      try {
+          if (conn.peerConnection) {
             conn.peerConnection.onnegotiationneeded = null;
+            conn.peerConnection.onicecandidate = null;
             conn.peerConnection.ondatachannel = null;
             conn.peerConnection.close();
          }
       } catch(e){}
+      
       if (p && p._connections && conn.peer) {
           const list = p._connections.get(conn.peer);
           if (list) {
@@ -84,7 +85,7 @@ export function init() {
                this._searchLogShown = true;
              }
              p.reconnect();
-             return;
+             return;    
           }
           
           if (['network', 'server-error', 'socket-error', 'socket-closed'].includes(e.type)) {
@@ -92,7 +93,6 @@ export function init() {
           }
           window.util.log('❌ P2P 错误: ' + e.type);
         });
-
       } catch (err) {
         window.util.log('❌ P2P 初始化崩溃: ' + err.message);
       }
@@ -137,19 +137,19 @@ export function init() {
           }
       }, NET_PARAMS.CONN_TIMEOUT);
 
+      // [修复] 必须先 close 再 delete，防止旧连接残留
       try {
-        // [修复] 必须先 close 再 delete，防止旧连接残留
         const oldConn = window.state.conns[id];
         if (oldConn) {
             this._hardClose(oldConn);
             delete window.state.conns[id];
         }
-
+        
         const conn = window.state.peer.connect(id, { reliable: true });
         conn.created = window.util.now();
         conn._targetId = id; 
-        window.state.conns[id] = conn;
         this.setupConn(conn);
+        window.state.conns[id] = conn;
       } catch (e) {
            this._connecting.delete(id);
       }
@@ -158,10 +158,10 @@ export function init() {
     setupConn(conn) {
       const pid = conn.peer || conn._targetId || 'unknown';
       const max = window.state.isHub ? NET_PARAMS.MAX_PEERS_HUB : NET_PARAMS.MAX_PEERS_NORMAL;
-
-      if (Object.keys(window.state.conns).length >= max + 50) { 
-        conn.close();
-        return;
+      
+      if (Object.keys(window.state.conns).length >= max + 50) {
+         conn.close();
+         return;
       }
 
       conn.on('open', () => {
@@ -169,8 +169,8 @@ export function init() {
         conn.lastPong = Date.now();
         conn.created = Date.now();
         
-        window.state.conns[pid] = conn;
         window.util.log(`✅ [P2P] 连接: ${pid.slice(0, 15)}`);
+        window.state.conns[pid] = conn;
         
         const list = Object.keys(window.state.conns);
         list.push(window.state.myId);
@@ -210,7 +210,7 @@ export function init() {
       if (d.t === MSG_TYPE.PONG) return;
       
       if (d.t === MSG_TYPE.HELLO) {
-        conn.label = d.n; 
+        conn.label = d.n;
         if (window.protocol) window.protocol.processIncoming({ senderId: d.id, n: d.n });
         return;
       }
@@ -269,6 +269,7 @@ export function init() {
            return;
         }
         if (c.open && c.lastPong && (now - c.lastPong > NET_PARAMS.PING_TIMEOUT)) {
+           // 非 Hub 节点超时直接断开
            if (!pid.startsWith(NET_PARAMS.HUB_PREFIX)) {
                this._hardClose(c);
                delete window.state.conns[pid];
@@ -282,12 +283,11 @@ export function init() {
          const pkt = { t: MSG_TYPE.PEER_EX, list: all.slice(0, NET_PARAMS.GOSSIP_SIZE) };
          Object.values(window.state.conns).forEach(c => {
              if (c.open) {
-                 c.send({ t: MSG_TYPE.PING }); 
+                 c.send({ t: MSG_TYPE.PING });
                  c.send(pkt);
              }
          });
       }
-      if (window.ui) { window.ui.renderList(); window.ui.updateSelf(); }
     }
   };
 }

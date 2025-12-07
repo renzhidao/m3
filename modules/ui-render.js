@@ -2,12 +2,12 @@ import { CHAT, UI_CONFIG } from './constants.js';
 
 export function init() {
   console.log('📦 加载模块: UI Render');
-
   window.ui = window.ui || {};
+  
   const render = {
     init() {
-       this.updateSelf();
        this.renderList();
+       this.updateSelf();
     },
 
     updateSelf() {
@@ -48,11 +48,11 @@ export function init() {
       
       let html = `
         <div class="contact-item ${window.state.activeChat === CHAT.PUBLIC_ID ? 'active' : ''}" 
-             data-chat-id="${CHAT.PUBLIC_ID}" data-chat-name="${CHAT.PUBLIC_NAME}">
+              data-chat-id="${CHAT.PUBLIC_ID}" data-chat-name="${CHAT.PUBLIC_NAME}">
           <div class="avatar" style="background:${UI_CONFIG.COLOR_GROUP}">群</div>
           <div class="c-info">
             <div class="c-name">${CHAT.PUBLIC_NAME} 
-              ${pubUnread > 0 ? `<span class="unread-badge">${pubUnread}</span>` : ''}
+               ${pubUnread > 0 ? `<span class="unread-badge">${pubUnread}</span>` : ''}
             </div>
           </div>
         </div>`;
@@ -78,7 +78,7 @@ export function init() {
 
         html += `
           <div class="contact-item ${window.state.activeChat === id ? 'active' : ''}" 
-               data-chat-id="${id}" data-chat-name="${safeName}">
+                data-chat-id="${id}" data-chat-name="${safeName}">
             <div class="avatar" style="background:${bg}">${safeName[0]}</div>
             <div class="c-info">
               <div class="c-name">${safeName} ${unread > 0 ? `<span class="unread-badge">${unread}</span>` : ''}</div>
@@ -86,7 +86,7 @@ export function init() {
             </div>
           </div>`;
       });
-
+      
       list.innerHTML = html;
     },
 
@@ -102,14 +102,15 @@ export function init() {
 
       const isMe = m.senderId === window.state.myId;
       let content = '';
+      let style = '';
 
       // === 内容渲染逻辑 ===
       if (m.kind === CHAT.KIND_IMAGE) {
          // 图片
          content = `<img src="${m.txt}" class="chat-img" onclick="window.open(this.src)">`;
+         style = 'background:transparent;padding:0';
       } else if (m.kind === CHAT.KIND_FILE) {
-         // === 文件下载卡片 (新功能) ===
-         // m.txt 里存的是 Base64 数据
+         // === 文件下载卡片 ===
          const sizeStr = m.fileSize ? (m.fileSize / 1024).toFixed(1) + 'KB' : '未知大小';
          content = `
            <div class="file-card">
@@ -125,8 +126,6 @@ export function init() {
          // 纯文本
          content = window.util.escape(m.txt);
       }
-
-      const style = (m.kind === CHAT.KIND_IMAGE) ? 'background:transparent;padding:0' : '';
       
       const html = `
         <div class="msg-row ${isMe ? 'me' : 'other'}" id="msg-${m.id}">
@@ -141,11 +140,11 @@ export function init() {
       
       // 重新绑定长按事件 (为了新消息)
       if (window.uiEvents && window.uiEvents.bindMsgEvents) {
-         window.uiEvents.bindMsgEvents();
+          window.uiEvents.bindMsgEvents();
       }
     }
   };
-
+  
   // 合并到 window.ui
   Object.assign(window.ui, render);
 }

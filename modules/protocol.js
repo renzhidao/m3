@@ -2,7 +2,7 @@ import { MSG_TYPE, NET_PARAMS, CHAT } from './constants.js';
 
 export function init() {
   console.log('📦 加载模块: Protocol');
-
+  
   window.protocol = {
     // 生成并发送消息
     async sendMsg(txt, kind = CHAT.KIND_TEXT, fileInfo = null) {
@@ -63,10 +63,10 @@ export function init() {
       // 3. 更新联系人信息
       if (pkt.n && pkt.senderId) {
         window.state.contacts[pkt.senderId] = { 
-          id: pkt.senderId, 
-          n: pkt.n, 
-          t: window.util.now() 
-        };
+           id: pkt.senderId, 
+           n: pkt.n, 
+           t: window.util.now() 
+         };
         localStorage.setItem('p1_contacts', JSON.stringify(window.state.contacts));
       }
 
@@ -96,8 +96,8 @@ export function init() {
       }
     },
 
-    // 泛洪算法：向除来源外的所有邻居转发
     flood(pkt, excludePeerId) {
+      // 泛洪算法：向除来源外的所有邻居转发
       if (typeof pkt.ttl === 'number') {
         if (pkt.ttl <= 0) return; // TTL 耗尽，停止转发
         pkt = { ...pkt, ttl: pkt.ttl - 1 };
@@ -117,11 +117,11 @@ export function init() {
 
       for (const pkt of list) {
         let sent = false;
-
+        
         if (pkt.target === CHAT.PUBLIC_ID) {
           // 公共消息：直接泛洪
           this.flood(pkt, null);
-          sent = true; 
+          sent = true;
         } else {
           // 私聊消息：检查直连
           const conn = window.state.conns[pkt.target];
@@ -133,9 +133,9 @@ export function init() {
             if (window.p2p) window.p2p.connectTo(pkt.target);
           }
         }
-
+        
         if (sent) {
-          await window.db.removePending(pkt.id);
+            await window.db.removePending(pkt.id);
         }
       }
     }

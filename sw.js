@@ -1,5 +1,4 @@
-const CACHE_NAME = 'p1-v1765120497'; // 升级版本号
-
+const CACHE_NAME = 'p1-v1765126303'; // 升级版本号
 const CORE_ASSETS = [
   './',
   './index.html',
@@ -10,6 +9,7 @@ const CORE_ASSETS = [
 // 安装阶段：跳过等待，立即接管
 self.addEventListener('install', event => {
   self.skipWaiting(); // <-- 关键：强制新 SW 立即生效
+  
   event.waitUntil((async () => {
     const cache = await caches.open(CACHE_NAME);
     for (const url of CORE_ASSETS) {
@@ -27,7 +27,8 @@ self.addEventListener('activate', event => {
   event.waitUntil(
     caches.keys().then(keys => Promise.all(
       keys.map(k => k !== CACHE_NAME ? caches.delete(k) : Promise.resolve())
-    )).then(() => self.clients.claim()) // <-- 关键：立即控制当前页面，无需刷新两次
+    ))
+    .then(() => self.clients.claim()) // <-- 关键：立即控制当前页面，无需刷新两次
   );
 });
 

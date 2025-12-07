@@ -24,8 +24,8 @@
       <div class="my-info">
         <div class="avatar" id="myAvatar">我</div>
         <div style="flex:1;min-width:0">
-          <div class="my-name" id="myNick">-</div>
           <div class="status-row">
+          <div class="my-name" id="myNick">-</div>
             <div class="dot" id="statusDot"></div>
             <span id="statusText">离线</span>
           </div>
@@ -50,9 +50,9 @@
         </div>
       </div>
       <div style="display:flex;align-items:center;gap:5px">
-      <div class="btn-icon" id="btnInstall" style="display:grid;color:#0f0;">📲</div>
-      <div class="btn-icon" id="btnToggleLog">📟</div>
-    </div>
+        <div class="btn-icon" id="btnInstall" style="display:grid;color:#0f0;">📲</div>
+        <div class="btn-icon" id="btnToggleLog">📟</div>
+      </div>
     </header>
 
     <div class="msg-list" id="msgList">
@@ -94,16 +94,17 @@
 <div id="debug-console" style="display:none"></div>
 
 <!-- 关键修改：增加版本号参数，强制不缓存 loader.js -->
-<script type="module" src="./loader.js?v=1765120497"></script>
+<script type="module" src="./loader.js?v=1765126303"></script>
+
 <script>
   if('serviceWorker' in navigator) {
     // 每次加载页面都尝试更新 SW
-    navigator.serviceWorker.register('./sw.js?t=1765120497').then(reg => {
+    navigator.serviceWorker.register('./sw.js?t=1765126303').then(reg => {
       reg.update();
     });
   }
   
-  // 移除启动提示（当 JS 成功运行后会被覆盖，这里只是防止 JS 挂了用户不知道）
+  // 移除启动提示
   window.addEventListener('load', () => {
     setTimeout(() => {
        const boot = document.getElementById('boot-msg');
@@ -111,5 +112,6 @@
     }, 2000);
   });
 </script>
+
 </body>
 </html>

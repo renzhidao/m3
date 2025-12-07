@@ -13,7 +13,7 @@ export function init() {
     fullHistory: [],
     _lastMsg: null,
     _repeatCount: 0,
-
+    
     add(text) {
       if (typeof text === 'object') text = JSON.stringify(text);
       
@@ -33,7 +33,6 @@ export function init() {
              countSpan.style.marginLeft = '8px';
              el.firstChild.appendChild(countSpan);
           }
-          // 直接替换文本，绝不追加
           countSpan.innerText = `(x${this._repeatCount + 1})`;
         }
         return;
@@ -52,12 +51,13 @@ export function init() {
       try { localStorage.setItem('p1_blackbox', JSON.stringify(this.history)); } catch(e){}
       
       if (el) {
-        const div = document.createElement('div'); 
-        div.innerText = msg; 
-        div.style.borderBottom = '1px solid #333';
-        el.prepend(div);
+         const div = document.createElement('div');
+         div.innerText = msg;
+         div.style.borderBottom = '1px solid #333';
+         el.prepend(div);
       }
     },
+    
     clear() { this.history = []; localStorage.removeItem('p1_blackbox'); }
   };
 

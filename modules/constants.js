@@ -3,7 +3,7 @@
  * 目的：将所有硬编码的变量集中管理，方便后续修改
  */
 
-export const APP_VERSION = '1.0.30-Ultra-350'; // m1改版
+export const APP_VERSION = '1.0.31-Ultra-350'; // m1改版
 
 // 1. 网络消息协议类型
 export const MSG_TYPE = {

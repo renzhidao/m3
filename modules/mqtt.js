@@ -15,6 +15,7 @@ export function init() {
       if (this._isConnecting) return;
       
       this._isConnecting = true;
+      
       if (typeof Paho === 'undefined') {
         window.util.log('❌ MQTT库未加载');
         this._isConnecting = false;
@@ -39,8 +40,8 @@ export function init() {
       window.util.log(`连接MQTT: ${host}...`);
 
       try {
-          this.client = new Paho.MQTT.Client(host, port, path, cid);
           window.state.mqttClient = this.client;
+          this.client = new Paho.MQTT.Client(host, port, path, cid);
           
           this.client.onConnectionLost = (res) => this.onLost(res);
           this.client.onMessageArrived = (msg) => this.onMessage(msg);
@@ -75,8 +76,8 @@ export function init() {
 
     onConnect(isProxy) {
       this._isConnecting = false;
-      window.state.mqttStatus = '在线';
       this.failCount = 0;
+      window.state.mqttStatus = '在线';
       window.util.log(`✅ MQTT连通!`);
       if (window.ui) window.ui.updateSelf();
       
@@ -114,6 +115,7 @@ export function init() {
     onLost(res) {
       this._isConnecting = false;
       if (res.errorCode === 0) return;
+      
       window.state.mqttStatus = '断开';
       this.failCount++;
       if (window.ui) window.ui.updateSelf();
@@ -128,8 +130,8 @@ export function init() {
         
         if (d.type === MSG_TYPE.HUB_PULSE) {
           window.util.log(` 感知房主: ${d.id.slice(0,15)} (Hub:${d.hubIndex})`);
-          
           window.state.hubHeartbeats[d.hubIndex] = Date.now();
+          
           if (!window.state.conns[d.id] && Object.keys(window.state.conns).length < 5) {
             if (window.p2p) window.p2p.connectTo(d.id);
           }
@@ -163,7 +165,7 @@ export function init() {
           ts: window.util.now()
         });
       }
-      
+
       const msg = new Paho.MQTT.Message(payload);
       msg.destinationName = CFG.mqtt.topic;
       this.client.send(msg);

@@ -19,11 +19,12 @@ export function init() {
       }
 
       this._connectingHub = true;
-      // 随机选择一个房主槽位尝试连接
       const idx = Math.floor(Math.random() * NET_PARAMS.HUB_COUNT);
-      const targetId = NET_PARAMS.HUB_PREFIX + idx;
-
+      
+      // 随机选择一个房主槽位尝试连接
       window.util.log('🔍 寻找房主 #' + idx + '...');
+      const targetId = NET_PARAMS.HUB_PREFIX + idx;
+      
       if (window.p2p) window.p2p.connectTo(targetId);
 
       // 如果一段时间后既没连上该房主，自己也没变成房主，则尝试篡位
@@ -35,7 +36,7 @@ export function init() {
             window.util.log('✅ MQTT已恢复，取消建立据点');
             return;
         }
-
+        
         if (window.state.isHub) return;
         
         const conn = window.state.conns[targetId];
@@ -46,10 +47,9 @@ export function init() {
       }, 2500);
     },
 
-    // 成为房主 (通过创建第二个 Peer 实例，使用固定 ID)
     becomeHub(index) {
       if (window.state.hubPeer || window.state.isHub) return;
-
+      // 成为房主 (通过创建第二个 Peer 实例，使用固定 ID)
       const id = NET_PARAMS.HUB_PREFIX + index;
       const p = new Peer(id, window.config.peer);
 
@@ -106,7 +106,6 @@ export function init() {
     // 辞去房主 (新功能)
     resign() {
       if (!window.state.isHub || !window.state.hubPeer) return;
-
       window.util.log('👋 辞去房主身份，回归普通节点');
       
       // 销毁房主专用的 Peer 实例
@@ -117,7 +116,6 @@ export function init() {
       window.state.isHub = false;
       window.state.hubIndex = -1;
       window.state.hubStatus = null;
-
       if (window.ui) window.ui.updateSelf();
     }
   };

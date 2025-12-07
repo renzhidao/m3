@@ -6,7 +6,7 @@ function log(msg, type='ok') {
 }
 
 // 模块加载列表
-const FALLBACK_MODULES = ["constants", "utils", "state", "db", "protocol", "p2p", "mqtt", "hub", "ui-render", "ui-events"];
+const FALLBACK_MODULES = ["constants", "utils", "state", "db", "protocol", "p2p", "hub", "mqtt", "ui-render", "ui-events"];
 
 async function boot() {
     // 1. 加载配置
@@ -39,7 +39,6 @@ async function boot() {
     for (const mod of modules) {
         const path = `./modules/${mod}.js?t=` + Date.now();
         try {
-            // === 关键修复：获取模块对象并调用 init ===
             const m = await import(path);
             if (m.init) {
                 m.init();
@@ -49,7 +48,7 @@ async function boot() {
             }
         } catch(e) {
             console.error(`❌ Module failed: ${mod}`, e);
-            alert(`模块加载失败: ${mod}\n${e.message}`); // 弹窗提示以便手机端调试
+            alert(`模块加载失败: ${mod}\n${e.message}`);
         }
     }
     
@@ -68,10 +67,9 @@ async function boot() {
     }, 500);
 }
 
-// 全局错误捕获，防止白屏无反馈
+// 全局错误捕获
 window.onerror = function(msg, url, line) {
     console.error(`Global Error: ${msg} @ ${url}:${line}`);
-    // alert(`System Error: ${msg}`); // 可选：如果还不行就打开这个注释
 };
 
 boot();
