@@ -1,7 +1,7 @@
 import { MSG_TYPE, NET_PARAMS, UI_CONFIG } from './constants.js';
 
 export function init() {
-  console.log('📦 加载模块: MQTT (Anti-Bounce v2)');
+  console.log('📦 加载模块: MQTT (Proxy-Hub-Guard)');
 
   const CFG = window.config;
 
@@ -9,16 +9,16 @@ export function init() {
     client: null,
     failCount: 0,
     _pulseTimer: null,
-    _isConnecting: false, // 🔒 防并发锁
+    _isConnecting: false,
 
     start() {
       if (this.client && this.client.isConnected()) return;
-      if (this._isConnecting) return; // 🔒 锁生效
+      if (this._isConnecting) return;
       this._isConnecting = true;
 
       if (typeof Paho === 'undefined') {
         window.util.log('❌ MQTT库未加载');
-        this._isConnecting = false; // 解锁
+        this._isConnecting = false;
         setTimeout(() => this.start(), 3000);
         return;
       }
@@ -28,6 +28,7 @@ export function init() {
       let path = CFG.mqtt.path;
       let isProxy = false;
 
+      // 失败一次就切代理
       if (this.failCount > 0) {
         window.util.log(`️ MQTT直连失败，切换代理`);
         host = CFG.mqtt.proxy_host;
@@ -48,7 +49,7 @@ export function init() {
     
           const opts = {
             useSSL: true,
-            timeout: (this.failCount > 0 ? 10 : 5),
+            timeout: (this.failCount > 0 ? 10 : 5), // 代理模式给长一点超时
             onSuccess: () => this.onConnect(isProxy),
             onFailure: (ctx) => this.onFail(ctx)
           };
@@ -71,13 +72,13 @@ export function init() {
             this.client = null;
             window.state.mqttClient = null;
         }
-        this._isConnecting = false; // 确保解锁
+        this._isConnecting = false;
         window.state.mqttStatus = '暂停';
         if(window.ui) window.ui.updateSelf();
     },
 
     onConnect(isProxy) {
-      this._isConnecting = false; // 🔒 解锁
+      this._isConnecting = false;
       window.state.mqttStatus = '在线';
       this.failCount = 0;
       window.util.log(`✅ MQTT连通!`);
@@ -85,20 +86,37 @@ export function init() {
 
       this.client.subscribe(CFG.mqtt.topic);
       
-      if (window.state.isHub && !isProxy) {
-        window.util.log('⚡ 已恢复MQTT连接，正在辞去房主职务...');
-        if (window.hub) window.hub.resign();
+      // === 核心修改：代理保护逻辑 ===
+      if (window.state.isHub) {
+        if (!isProxy) {
+            // 只有【直连】恢复了，才辞职（回归平民）
+            window.util.log('⚡ 直连已恢复，辞去房主职务...');
+            if (window.hub) window.hub.resign();
+        } else {
+            // 如果是【代理】连上的，继续当房主！
+            window.util.log('🛡️ 代理连接成功，保持房主身份');
+            // 这里直接 return，不执行下面的 patrolHubs
+            // 启动心跳即可
+            this.startHeartbeat(isProxy);
+            return; 
+        }
       } else {
+        // 不是房主，正常去找别人
         if (window.p2p) window.p2p.patrolHubs();
       }
 
+      this.startHeartbeat(isProxy);
+    },
+
+    startHeartbeat(isProxy) {
       this.sendPresence();
       if (this._pulseTimer) clearInterval(this._pulseTimer);
+      // 代理模式心跳慢一点(10s)，直连快一点(4s)
       this._pulseTimer = setInterval(() => this.sendPresence(), isProxy ? 10000 : 4000);
     },
 
     onFail(ctx) {
-      this._isConnecting = false; // 🔒 解锁
+      this._isConnecting = false;
       window.state.mqttStatus = '失败';
       this.failCount++;
       window.util.log(`❌ MQTT失败: ${ctx.errorMessage}`);
@@ -108,7 +126,7 @@ export function init() {
     },
 
     onLost(res) {
-      this._isConnecting = false; // 🔒 解锁
+      this._isConnecting = false;
       if (res.errorCode === 0) return;
 
       window.state.mqttStatus = '断开';
@@ -141,7 +159,6 @@ export function init() {
     },
 
     sendPresence() {
-      // === 后台静默 ===
       if (document.hidden) return;
 
       if (!this.client || !this.client.isConnected()) return;
