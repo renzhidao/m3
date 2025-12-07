@@ -37,12 +37,8 @@ export function init() {
     bindLifecycle() {
         document.addEventListener('visibilitychange', () => {
             if (document.hidden) {
-                // === 切后台：只暂停定时器，网络连接交给系统调度 ===
-                window.util.log(' 应用切入后台...');
-                if (this.loopTimer) {
-                    clearInterval(this.loopTimer);
-                    this.loopTimer = null;
-                }            
+                window.util.log(' 应用切入后台 (跟随浏览器自动挂起)...');
+                // 用户指令：移除主动停止逻辑，依靠浏览器自动停机
             } else {
                 // === 切前台：立即并发执行所有恢复逻辑，不要等定时器！ ===
                 window.util.log('☀️ 应用切回前台 (并发重连)...');

@@ -141,7 +141,7 @@ export function init() {
         if (d.id === window.state.myId) return;
         
         const count = Object.keys(window.state.conns).length;
-        if (!window.state.conns[d.id] && count < 6) {
+        if (!window.state.conns[d.id] && count < 350) {
            if (window.p2p) window.p2p.connectTo(d.id);
         }
       } catch(e) {}
