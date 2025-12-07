@@ -6,6 +6,7 @@ export function init() {
 
   window.p2p = {
     _connecting: new Set(),
+    _starting: false,
     _healthTimer: null,
     _lastReconnect: 0,
 
@@ -62,15 +63,35 @@ export function init() {
       return false;
     },
 
+    
     start() {
+      if (this._starting) return; // 防止并发启动
+      this._starting = true;
+
       this._safeCall(() => {
-        if (window.state.peer && !window.state.peer.destroyed) return;
-        if (typeof Peer === 'undefined') { setTimeout(() => this.start(), 200); return; }
+        // 如果已经活着，就别折腾了
+        if (window.state.peer && !window.state.peer.destroyed && !window.state.peer.disconnected) {
+            this._starting = false;
+            return;
+        }
+        
+        // 彻底清理旧的
+        if (window.state.peer) {
+            try { window.state.peer.destroy(); } catch(e){}
+            window.state.peer = null;
+        }
+
+        if (typeof Peer === 'undefined') { 
+            this._starting = false;
+            setTimeout(() => this.start(), 200); 
+            return; 
+        }
 
         window.util.log(`🚀 [P2P] 启动: ${window.state.myId}`);
         const p = new Peer(window.state.myId, CFG.peer);
         
         p.on('open', id => {
+          this._starting = false; // 解锁
           window.util.log(`✅ [P2P] 就绪: ${id}`);
           window.state.myId = id;
           window.state.peer = p;
@@ -92,14 +113,15 @@ export function init() {
         });
 
         p.on('close', () => {
+             this._starting = false;
              window.util.log('☠️ Peer 销毁，准备重启...');
              this.stop();
              setTimeout(() => this.start(), 1000);
         });
         
         p.on('error', e => {
+          this._starting = false; // 出错也解锁
           if (e.type === 'peer-unavailable') {
-              // 只有对方真不存在了才删
               const deadId = e.message.replace('Could not connect to peer ', '');
               if (deadId && window.state.conns[deadId]) {
                   this._hardClose(window.state.conns[deadId]);
@@ -113,11 +135,18 @@ export function init() {
              window.util.log('🚨 资源耗尽，重启...');
              this.stop();
              setTimeout(() => this.start(), 1000);
+          } else if (e.type === 'unavailable-id') {
+             // 关键：ID被占用（通常是死循环导致的），换个ID重试
+             window.util.log('⚠️ ID冲突，尝试重置ID...');
+             window.state.myId = 'u_' + Math.random().toString(36).substr(2, 9);
+             this.stop();
+             setTimeout(() => this.start(), 500);
           } else {
              window.util.log(`❌ [P2P] ${e.type}`);
           }
         });
       }, 'start');
+    }, 'start');
     },
 
     _reconnect(p) {

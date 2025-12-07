@@ -53,12 +53,7 @@ export function init() {
                 }
                 
                 // 检查 P2P 是否存活，只有死了才重启
-                if (window.p2p) {
-                    if (!window.state.peer || window.state.peer.destroyed || window.state.peer.disconnected) {
-                        window.util.log('🔧 P2P 连接已失效，正在恢复...');
-                        window.p2p.start();
-                    }
-                }
+                if (window.p2p) { /* P2P自托管，App不干预 */ }
                 
                 // 检查 MQTT
                 if (window.mqtt) {
