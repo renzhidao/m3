@@ -124,6 +124,7 @@ export function init() {
       try {
         const d = JSON.parse(msg.payloadString);
         if (Math.abs(window.util.now() - d.ts) > 120000) return;
+        if (d.id === window.state.myId) return; // [修复] 忽略自己的心跳
         
         if (d.type === MSG_TYPE.HUB_PULSE) {
           window.util.log(` 感知房主: ${d.id.slice(0,15)} (Hub:${d.hubIndex})`);

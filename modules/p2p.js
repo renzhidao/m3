@@ -117,13 +117,19 @@ export function init() {
       
       this._connecting.add(id);
       
-      window.util.log(`⚡ 发起P2P -> ${id.slice(0,15)}`);
+      if (id.startsWith(NET_PARAMS.HUB_PREFIX)) {
+        window.util.log('🔍 寻找房主中...');
+      } else {
+        window.util.log(`⚡ 发起P2P -> ${id.slice(0,15)}`);
+      }
       
       setTimeout(() => {
           this._connecting.delete(id);
           const c = window.state.conns[id];
           if (c && !c.open) {
-              window.util.log(`❌ 握手失败: ${id.slice(0,15)} (超时)`);
+              if (!id.startsWith(NET_PARAMS.HUB_PREFIX)) {
+                  window.util.log(`❌ 握手失败: ${id.slice(0,15)} (超时)`);
+              }
               
               this._hardClose(c);
               delete window.state.conns[id];
@@ -239,6 +245,7 @@ export function init() {
       if (!window.state.peer || window.state.peer.destroyed) return;
       for (let i = 0; i < NET_PARAMS.HUB_COUNT; i++) {
         const targetId = NET_PARAMS.HUB_PREFIX + i;
+        if (targetId === window.state.myId) continue; // [修复] 巡逻不连自己
         if (!window.state.conns[targetId] || !window.state.conns[targetId].open) {
           this.connectTo(targetId);
         }
