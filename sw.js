@@ -1,4 +1,4 @@
-const CACHE_NAME = 'p1-v174-force-refresh'; // 升级版本号
+const CACHE_NAME = 'p1-v187-1765077167'; // 升级版本号
 
 const CORE_ASSETS = [
   './',
