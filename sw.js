@@ -1,4 +1,4 @@
-const CACHE_NAME = 'p1-v1765129873'; // 升级版本号
+const CACHE_NAME = 'p1-v1765130274'; // 升级版本号
 const CORE_ASSETS = [
   './',
   './index.html',
