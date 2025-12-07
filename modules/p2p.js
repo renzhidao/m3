@@ -117,13 +117,13 @@ export function init() {
       
       this._connecting.add(id);
       
-      window.util.log(`⚡ 发起P2P -> ${id.slice(0,6)}`);
+      window.util.log(`⚡ 发起P2P -> ${id.slice(0,15)}`);
       
       setTimeout(() => {
           this._connecting.delete(id);
           const c = window.state.conns[id];
           if (c && !c.open) {
-              window.util.log(`❌ 握手失败: ${id.slice(0,6)} (超时)`);
+              window.util.log(`❌ 握手失败: ${id.slice(0,15)} (超时)`);
               
               this._hardClose(c);
               delete window.state.conns[id];
@@ -160,7 +160,7 @@ export function init() {
         conn.created = Date.now();
         
         window.state.conns[pid] = conn;
-        window.util.log(`✅ [P2P] 连接: ${pid.slice(0, 6)}`);
+        window.util.log(`✅ [P2P] 连接: ${pid.slice(0, 15)}`);
         
         const list = Object.keys(window.state.conns);
         list.push(window.state.myId);

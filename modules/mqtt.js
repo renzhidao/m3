@@ -126,7 +126,7 @@ export function init() {
         if (Math.abs(window.util.now() - d.ts) > 120000) return;
         
         if (d.type === MSG_TYPE.HUB_PULSE) {
-          window.util.log(` 感知房主: ${d.id.slice(0,6)} (Hub:${d.hubIndex})`);
+          window.util.log(` 感知房主: ${d.id.slice(0,15)} (Hub:${d.hubIndex})`);
           
           window.state.hubHeartbeats[d.hubIndex] = Date.now();
           if (!window.state.conns[d.id] && Object.keys(window.state.conns).length < 5) {

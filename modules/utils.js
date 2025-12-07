@@ -1,5 +1,5 @@
 export function init() {
-  console.log('📦 加载模块: Utils (Log-Folder)');
+  console.log('📦 加载模块: Utils (Log-Folder-Fix)');
   
   window.onerror = function(msg, url, line, col, error) {
     const info = `❌ [全局错误] ${msg} @ ${url}:${line}:${col}`;
@@ -19,17 +19,22 @@ export function init() {
       
       const el = document.getElementById('logContent');
       
-      // === 实时折叠逻辑 ===
+      // === 实时折叠逻辑 (DOM 操作版) ===
       if (text === this._lastMsg) {
         this._repeatCount++;
         if (el && el.firstChild) {
-          const currentHTML = el.firstChild.innerHTML;
-          if (currentHTML.includes('<span class="log-count">')) {
-             const span = el.firstChild.querySelector('.log-count');
-             if(span) span.innerText = `(x${this._repeatCount + 1})`;
-          } else {
-             el.firstChild.innerHTML += ` <span class="log-count" style="color:#ff0">(x${this._repeatCount + 1})</span>`;
+          // 尝试查找现有的计数标签
+          let countSpan = el.firstChild.querySelector('.log-count');
+          if (!countSpan) {
+             // 没找到就创建一个新的
+             countSpan = document.createElement('span');
+             countSpan.className = 'log-count';
+             countSpan.style.color = '#ff0';
+             countSpan.style.marginLeft = '8px';
+             el.firstChild.appendChild(countSpan);
           }
+          // 直接替换文本，绝不追加
+          countSpan.innerText = `(x${this._repeatCount + 1})`;
         }
         return;
       }
