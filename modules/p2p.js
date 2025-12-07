@@ -3,7 +3,7 @@ import { MSG_TYPE, NET_PARAMS } from './constants.js';
 export function init() {
   console.log('📦 加载模块: P2P (Leak Guard v7)');
   const CFG = window.config;
-  const QUOTA_LIMIT = 3; 
+   
 
   window.p2p = {
     _connecting: new Set(),
@@ -55,6 +55,10 @@ export function init() {
     },
 
     _ensureQuota() {
+      const limit = window.state.isHub ? NET_PARAMS.MAX_PEERS_HUB : NET_PARAMS.MAX_PEERS_NORMAL;
+      const ids = Object.keys(window.state.conns);
+      if (ids.length < limit) return true;
+
       const ids = Object.keys(window.state.conns);
       if (ids.length < QUOTA_LIMIT) return true;
 
@@ -84,7 +88,8 @@ export function init() {
         if (document.hidden) return;
         const count = Object.keys(window.state.conns||{}).length;
         // 只有连接数异常多时才打印
-        if (count > QUOTA_LIMIT) window.util.log(`💓 [健康] Conns: ${count}/${QUOTA_LIMIT}`);
+        const limit = window.state.isHub ? NET_PARAMS.MAX_PEERS_HUB : NET_PARAMS.MAX_PEERS_NORMAL;
+        if (count > limit * 0.8) window.util.log(`💓 [350人团] Conns: ${count}/${limit}`);
       }, 10000);
     },
 
@@ -194,8 +199,15 @@ export function init() {
         this._safeCall(() => {
           const list = Object.keys(window.state.conns);
           list.push(window.state.myId);
+          
           conn.send({ t: MSG_TYPE.HELLO, n: window.state.myName, id: window.state.myId });
-          setTimeout(() => { if (conn.open) conn.send({ t: MSG_TYPE.PEER_EX, list: list }); }, 100);
+          const payload = { t: MSG_TYPE.PEER_EX, list: list };
+          conn.send(payload);
+          window.db.getRecent(1, 'all').then(m => {
+            const lastTs = (m && m.length) ? m[0].ts : 0;
+            if(conn.open) conn.send({t: MSG_TYPE.ASK_PUB, ts: lastTs});
+          });
+ }, 100);
           window.db.getRecent(1, 'all').then(m => {
             const lastTs = (m && m.length) ? m[0].ts : 0;
             setTimeout(() => { if(conn.open) conn.send({t: MSG_TYPE.ASK_PUB, ts: lastTs}); }, 500);

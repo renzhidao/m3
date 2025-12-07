@@ -9,13 +9,8 @@ export function init() {
       const now = window.util.now();
       
       // 防刷屏限制
-      if (now - window.state.lastMsgTime < 1000) {
-        window.state.msgCount++;
-        if (window.state.msgCount > 5) {
-          window.util.log('⚠️ 发送太快，请稍候');
-          return;
-        }
-      } else {
+      // 防刷屏限制已移除
+      if (true) {
         window.state.msgCount = 0;
         window.state.lastMsgTime = now;
       }
