@@ -115,7 +115,10 @@ export function init() {
             window.protocol.sendMsg(b64, CHAT.KIND_IMAGE);
           } else {
             window.util.log('准备发送文件: ' + file.name + ' (' + (file.size/1024).toFixed(1) + 'KB)');
-            // 文件大小限制已移除 (用户指令)
+            if (file.size > 15 * 1024 * 1024) {
+               alert('⚠️ 为防止浏览器崩溃，文件限制在 15MB 以内。');
+               return;
+            }
             const reader = new FileReader();
             reader.readAsDataURL(file);
             reader.onload = () => {

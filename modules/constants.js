@@ -3,7 +3,7 @@
  * 目的：将所有硬编码的变量集中管理，方便后续修改
  */
 
-export const APP_VERSION = '1.0.40-SyntaxFixed';
+export const APP_VERSION = '1.0.29-UtilsFull';
 window.APP_VERSION = APP_VERSION; // 当前版本号
 
 // 1. 网络消息协议类型
@@ -21,9 +21,9 @@ export const MSG_TYPE = {
 // 2. 网络参数配置
 export const NET_PARAMS = {
   GOSSIP_SIZE: 20,          
-  MAX_PEERS_NORMAL: 350,     
-  MAX_PEERS_HUB: 500,        
-  CONN_TIMEOUT: 3000,       
+  MAX_PEERS_NORMAL: 30,     
+  MAX_PEERS_HUB: 80,        
+  CONN_TIMEOUT: 5000,       
   PING_TIMEOUT: 6000,       
   LOOP_INTERVAL: 1000,      
   RETRY_DELAY: 3000,        
@@ -48,8 +48,8 @@ export const UI_CONFIG = {
   COLOR_GROUP: '#2a7cff',      
   MSG_LOAD_BATCH: 20,          
   LONG_PRESS_DURATION: 500,    
-  MAX_IMG_WIDTH: 9999,          
-  IMG_QUALITY: 1.0             
+  MAX_IMG_WIDTH: 800,          
+  IMG_QUALITY: 0.7             
 };
 
 // 5. 本地存储键名
