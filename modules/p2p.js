@@ -131,12 +131,14 @@ export function init() {
       if (this._connecting.has(id)) return;
 
       this._connecting.add(id);
+      window.util.log(`⚡ 发起P2P -> ${id.slice(0,6)}`);
 
       // 5秒超时杀无赦
       setTimeout(() => {
           this._connecting.delete(id);
           const c = window.state.conns[id];
           if (c && !c.open) {
+              window.util.log(`❌ 握手失败: ${id.slice(0,6)} (超时)`);
               this._hardClose(c);
               delete window.state.conns[id];
               // window.util.log(`⏱️ 连接超时: ${id}`);
