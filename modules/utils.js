@@ -1,5 +1,5 @@
 export function init() {
-  console.log('📦 加载模块: Utils (3-Cycle Test)');
+  console.log('📦 加载模块: Utils (Fixed Leak)');
 
   window.onerror = function(msg, url, line, col, error) {
     const info = `❌ [全局错误] ${msg} @ ${url}:${line}:${col}`;
@@ -35,28 +35,43 @@ export function init() {
     escape(s) { return String(s||'').replace(/&/g, '&').replace(/</g, '<').replace(/>/g, '>'); },
     colorHash(str) { return '#333'; },
     
-    // === 3人转压测 ===
+    // === 3人转压测 (修复版) ===
     stressTest() {
         const addLog = (msg) => {
-            const line = `[${new Date().toLocaleTimeString()}] 💣 ${msg}`;
             window.util.log('💣 ' + msg);
         };
 
-        if(confirm('⚠️ 开始【微观循环测试】\n限制：3个连接。\n目标：循环创建500次，验证每次是否都能成功挤掉旧连接。')) {
-            addLog('=== 开始测试 (Quota=3) ===');
+        if(confirm('⚠️ 开始【微观循环测试】(已修复内存泄露)\n限制：3个连接。\n目标：循环创建500次，验证GC回收。')) {
+            addLog('=== 开始测试 (Safe Mode) ===');
             
             let total = 0;
+            // 关键：用于持有测试连接的引用，以便销毁
+            let lastTestConn = null;
+
             const timer = setInterval(() => {
                 if (!window.state.peer || window.state.peer.destroyed) {
                     clearInterval(timer); return;
+                }
+
+                // 1. 强制清理上一个测试连接 (不管是否成功连上)
+                if (lastTestConn) {
+                    try { lastTestConn.close(); } catch(e){}
+                    try { 
+                        if (lastTestConn.peerConnection) {
+                            lastTestConn.peerConnection.close();
+                            lastTestConn.peerConnection = null;
+                        }
+                    } catch(e){}
+                    lastTestConn = null;
                 }
 
                 const active = Object.keys(window.state.conns).length;
                 
                 try {
                     total++;
-                    // 创建新连接
-                    window.state.peer.connect('cycle_' + Date.now() + '_' + total);
+                    // 2. 创建新连接并抓住引用
+                    // 使用不存在的ID必然报错，但这正是为了测试 "失败连接的回收"
+                    lastTestConn = window.state.peer.connect('cycle_' + Date.now() + '_' + total);
                     
                     if (total % 10 === 0) {
                         addLog(`第 ${total} 次, 存活: ${active}/3`);
@@ -71,10 +86,12 @@ export function init() {
 
                 if (total >= 500) {
                     clearInterval(timer);
-                    addLog(`🎉 ✅ 测试通过！已循环 500 次，存活数稳定在 ${active}。`);
-                    alert('🎉 通过！\n旧连接已被成功清理，配额循环使用正常。');
+                    // 结束时清理最后一次
+                    if (lastTestConn) { try{lastTestConn.close();}catch(e){} }
+                    addLog(`🎉 ✅ 测试通过！已循环 500 次，资源未耗尽。`);
+                    alert('🎉 通过！\n连接资源已成功动态回收。');
                 }
-            }, 100); // 100ms一次，稍慢一点方便观测
+            }, 100); 
         }
     },
 

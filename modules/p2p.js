@@ -1,9 +1,9 @@
 import { MSG_TYPE, NET_PARAMS } from './constants.js';
 
 export function init() {
-  console.log('📦 加载模块: P2P (Deep Clean v6)');
+  console.log('📦 加载模块: P2P (Leak Guard v7)');
   const CFG = window.config;
-  const QUOTA_LIMIT = 3; // 极低配额，强制频繁GC
+  const QUOTA_LIMIT = 3; 
 
   window.p2p = {
     _connecting: new Set(),
@@ -25,18 +25,23 @@ export function init() {
       if (!conn) return;
       const p = window.state.peer;
       
+      // 0. 移除所有事件监听，防止闭包泄露
+      try { conn.removeAllListeners(); } catch(e){}
+
       // 1. 关闭连接
       try { conn.close(); } catch(e){}
       
-      // 2. 关闭底层
+      // 2. 关闭底层 PeerConnection
       try { 
         if (conn.peerConnection) {
             conn.peerConnection.onicecandidate = null;
+            conn.peerConnection.onnegotiationneeded = null;
+            conn.peerConnection.ondatachannel = null;
             conn.peerConnection.close(); 
         }
       } catch(e){}
       
-      // 3. [关键] 从 PeerJS 内部缓存中移除
+      // 3. 从 PeerJS 内部缓存中移除
       if (p && p._connections && conn.peer) {
           const list = p._connections.get(conn.peer);
           if (list) {
@@ -78,7 +83,8 @@ export function init() {
       this._healthTimer = setInterval(() => {
         if (document.hidden) return;
         const count = Object.keys(window.state.conns||{}).length;
-        window.util.log(`💓 [健康] Conns: ${count}/${QUOTA_LIMIT}`);
+        // 只有连接数异常多时才打印
+        if (count > QUOTA_LIMIT) window.util.log(`💓 [健康] Conns: ${count}/${QUOTA_LIMIT}`);
       }, 10000);
     },
 
@@ -102,7 +108,17 @@ export function init() {
         p.on('connection', conn => this.setupConn(conn));
         
         p.on('error', e => {
-          if (e.message && e.message.includes('Cannot create so many')) {
+          if (e.type === 'peer-unavailable') {
+              // 自动清理连不上的悬挂连接
+              const deadId = e.message.replace('Could not connect to peer ', '');
+              if (deadId && window.state.conns[deadId]) {
+                  this._hardClose(window.state.conns[deadId]);
+                  delete window.state.conns[deadId];
+              }
+              // 不再弹窗刷屏
+              // window.util.log(`❌ 节点不可达: ${deadId}`); 
+          } 
+          else if (e.message && e.message.includes('Cannot create so many')) {
              window.util.log('🚨 [系统] 资源耗尽，重启 Peer...');
              this.stop();
              setTimeout(() => this.start(), 1000);
