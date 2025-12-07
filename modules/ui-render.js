@@ -1,8 +1,32 @@
 import { CHAT, UI_CONFIG } from './constants.js';
 
 export function init() {
-  console.log('📦 加载模块: UI Render');
+  console.log('📦 加载模块: UI Render (安卓修复版)');
   window.ui = window.ui || {};
+  
+  // 注入图片预览的样式
+  const style = document.createElement('style');
+  style.textContent = `
+    .img-preview-overlay {
+        position: fixed; top: 0; left: 0; width: 100%; height: 100%;
+        background: rgba(0,0,0,0.95); z-index: 9999;
+        display: flex; flex-direction: column; align-items: center; justify-content: center;
+        animation: fadeIn 0.2s ease;
+    }
+    .img-preview-content {
+        max-width: 100%; max-height: 80%;
+        object-fit: contain;
+    }
+    .preview-actions {
+        margin-top: 20px; display: flex; gap: 20px;
+    }
+    .preview-btn {
+        background: #333; color: white; border: 1px solid #555;
+        padding: 8px 20px; border-radius: 20px; font-size: 14px; cursor: pointer;
+    }
+    @keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
+  `;
+  document.head.appendChild(style);
   
   const render = {
     init() {
@@ -32,7 +56,6 @@ export function init() {
          elDot.className = window.state.mqttStatus === '在线' ? 'dot online' : 'dot';
       }
       
-      // 计算真实在线人数（不包括自己）
       if (elCount) {
          let count = 0;
          Object.values(window.state.conns).forEach(c => { if(c.open) count++; });
@@ -58,7 +81,6 @@ export function init() {
         </div>`;
 
       const map = new Map();
-      // 合并联系人列表和当前连接列表
       Object.values(window.state.contacts).forEach(c => map.set(c.id, c));
       Object.keys(window.state.conns).forEach(k => {
          if (k !== window.state.myId) {
@@ -68,7 +90,6 @@ export function init() {
       });
 
       map.forEach((v, id) => {
-        // 不显示房主节点
         if (!id || id === window.state.myId || id.startsWith(window.config.hub.prefix)) return;
         
         const isOnline = window.state.conns[id] && window.state.conns[id].open;
@@ -95,6 +116,69 @@ export function init() {
       if (box) box.innerHTML = '';
     },
 
+    // === 核心修复：Blob 下载器 (解决 about:blank) ===
+    downloadBlob(urlOrData, fileName) {
+        try {
+            window.util.log('⬇️ 准备下载: ' + fileName);
+            let url = urlOrData;
+            
+            // 如果传入的是 Base64 字符串，先转 Blob
+            if (typeof urlOrData === 'string' && urlOrData.startsWith('data:')) {
+                 // 简单的 fetch 转换
+                 fetch(urlOrData).then(res => res.blob()).then(blob => {
+                     const u = URL.createObjectURL(blob);
+                     this.downloadBlob(u, fileName);
+                 });
+                 return;
+            }
+
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = fileName;
+            document.body.appendChild(a);
+            a.click();
+            
+            setTimeout(() => {
+                document.body.removeChild(a);
+                // 如果是手动创建的 Blob URL，最好在合适时机释放，但为了稳妥先保留
+                window.util.log('✅ 已调起系统下载');
+            }, 500);
+        } catch(e) {
+            console.error(e);
+            window.util.log('❌ 下载失败: ' + e.message);
+        }
+    },
+
+    // === 核心修复：图片全屏查看器 ===
+    previewImage(src) {
+        const div = document.createElement('div');
+        div.className = 'img-preview-overlay';
+        div.innerHTML = `
+            <img src="${src}" class="img-preview-content">
+            <div class="preview-actions">
+                <button class="preview-btn" id="pv-close">关闭</button>
+                <button class="preview-btn" id="pv-save" style="background:#2a7cff;border-color:#2a7cff">保存原图</button>
+            </div>
+        `;
+        
+        // 点击背景关闭
+        div.onclick = (e) => {
+            if (e.target === div || e.target.id === 'pv-close') {
+                document.body.removeChild(div);
+            }
+        };
+
+        // 保存逻辑
+        const btnSave = div.querySelector('#pv-save');
+        btnSave.onclick = (e) => {
+            e.stopPropagation();
+            const ts = new Date().getTime();
+            this.downloadBlob(src, `p1_img_${ts}.jpg`);
+        };
+
+        document.body.appendChild(div);
+    },
+
     appendMsg(m) {
       const box = document.getElementById('msgList');
       if (!box || !m) return;
@@ -104,14 +188,13 @@ export function init() {
       let content = '';
       let style = '';
 
-      // === 内容渲染逻辑 ===
       if (m.kind === CHAT.KIND_IMAGE) {
-         // 图片
-         content = `<img src="${m.txt}" class="chat-img" onclick="window.open(this.src)">`;
+         // 使用透明占位，图片加载后再显示
+         content = `<img src="${m.txt}" class="chat-img" style="min-height:50px; background:#222;">`;
          style = 'background:transparent;padding:0';
+         
       } else if (m.kind === CHAT.KIND_FILE) {
-         // === 文件下载卡片 ===
-         const sizeStr = m.fileSize ? (m.fileSize / 1024).toFixed(1) + 'KB' : '未知大小';
+         const sizeStr = m.fileSize ? (m.fileSize / 1024).toFixed(1) + 'KB' : '未知';
          content = `
            <div class="file-card">
              <div class="file-icon">📄</div>
@@ -119,11 +202,10 @@ export function init() {
                <div class="file-name">${window.util.escape(m.fileName || '未命名文件')}</div>
                <div class="file-size">${sizeStr}</div>
              </div>
-             <a href="${m.txt}" download="${m.fileName || 'download'}" class="file-dl-btn">⬇</a>
+             <div class="file-dl-btn" style="cursor:pointer">⬇</div>
            </div>
          `;
       } else {
-         // 纯文本
          content = window.util.escape(m.txt);
       }
       
@@ -138,13 +220,26 @@ export function init() {
       box.insertAdjacentHTML('beforeend', html);
       box.scrollTop = box.scrollHeight;
       
-      // 重新绑定长按事件 (为了新消息)
+      // === 动态绑定事件 ===
+      const el = document.getElementById('msg-' + m.id);
+      
+      // 1. 图片点击 -> 全屏预览
+      if (m.kind === CHAT.KIND_IMAGE) {
+          const img = el.querySelector('img');
+          if (img) img.onclick = () => this.previewImage(m.txt);
+      }
+      
+      // 2. 文件点击 -> Blob下载
+      if (m.kind === CHAT.KIND_FILE) {
+          const btn = el.querySelector('.file-dl-btn');
+          if (btn) btn.onclick = () => this.downloadBlob(m.txt, m.fileName || 'file.dat');
+      }
+
       if (window.uiEvents && window.uiEvents.bindMsgEvents) {
           window.uiEvents.bindMsgEvents();
       }
     }
   };
   
-  // 合并到 window.ui
   Object.assign(window.ui, render);
 }

@@ -2,15 +2,11 @@
 import { MSG_TYPE, NET_PARAMS, CHAT } from './constants.js';
 
 /**
- * Smart Core v12 - Direct Force & Log
- * 
- * 1. 移除 Lightbox，点击图片直接新窗口打开原图 (Blob)。
- * 2. 传输逻辑：无视 ID，向所有当前 open 的连接广播请求。
- * 3. 增加详细日志，显示请求发送目标和回包情况。
+ * Smart Core v13 - Android Fix & Instant UI
  */
 
 export function init() {
-  console.log('📦 加载模块: Smart Core v12 (Direct-Force)');
+  console.log('📦 加载模块: Smart Core v13 (Android Fix)');
   
   const req = indexedDB.open('P1_FILE_DB', 1);
   req.onupgradeneeded = e => {
@@ -38,44 +34,73 @@ function applyHooks() {
     all.forEach(c => c.send(pkt));
   };
 
-  // 2. 发送拦截
+  // 2. 发送拦截 (支持立即上屏)
   const originalSendMsg = window.protocol.sendMsg;
   window.protocol.sendMsg = async function(txt, kind, fileInfo) {
+    // 只有用户主动发送的大文件/图片才走分块
     if (!window.state.isUserAction && !fileInfo) { originalSendMsg.apply(this, arguments); return; }
     if (kind === CHAT.KIND_IMAGE && txt.length < 400000) { originalSendMsg.apply(this, arguments); return; }
 
     if ((kind === CHAT.KIND_FILE || kind === CHAT.KIND_IMAGE) && txt.length > 1024) {
       const fileId = window.util.uuid();
-      const rawData = base64ToArrayBuffer(txt);
-      const chunks = sliceData(rawData, 16 * 1024);
+      const now = window.util.now();
       
-      await saveChunks(fileId, chunks, fileInfo);
-      
+      // === 立即上屏 (占位状态) ===
       const metaMsg = {
         t: 'SMART_META',
         id: window.util.uuid(),
         fileId: fileId,
         fileName: fileInfo ? fileInfo.name : `File_${Date.now()}`,
         fileType: fileInfo ? fileInfo.type : 'application/octet-stream',
-        fileSize: rawData.byteLength,
-        totalChunks: chunks.length,
-        ts: window.util.now(),
+        fileSize: 0, // 暂时未知，读取完更新
+        totalChunks: 0,
+        ts: now,
         senderId: window.state.myId,
         n: window.state.myName,
         ttl: 16
       };
-
-      if (kind === CHAT.KIND_IMAGE) {
-          try {
-             const preview = await makePreview(txt, 600, 0.6);
-             metaMsg.preview = preview;
-          } catch(e) {}
-      }
       
-      window.db.addPending(metaMsg);
-      const uiMsg = { id: metaMsg.id, senderId: metaMsg.senderId, n: metaMsg.n, ts: metaMsg.ts, kind: 'SMART_FILE_UI', meta: metaMsg };
+      // 先显示一个“正在处理”的消息
+      const uiMsg = { id: metaMsg.id, senderId: metaMsg.senderId, n: metaMsg.n, ts: metaMsg.ts, kind: 'SMART_FILE_UI', meta: metaMsg, isProcessing: true };
       window.ui.appendMsg(uiMsg);
-      window.protocol.flood(metaMsg); 
+
+      // 异步处理大文件
+      setTimeout(async () => {
+          try {
+              const rawData = base64ToArrayBuffer(txt);
+              const chunks = sliceData(rawData, 16 * 1024);
+              
+              metaMsg.fileSize = rawData.byteLength;
+              metaMsg.totalChunks = chunks.length;
+
+              if (kind === CHAT.KIND_IMAGE) {
+                  try {
+                     // 生成缩略图
+                     const preview = await makePreview(txt, 600, 0.6);
+                     metaMsg.preview = preview;
+                  } catch(e) {}
+              }
+              
+              await saveChunks(fileId, chunks, metaMsg);
+              
+              // 存完后，广播出去，并更新本地UI
+              window.db.addPending(metaMsg);
+              window.protocol.flood(metaMsg); 
+              
+              // 刷新 UI (移除处理中状态)
+              const card = document.getElementById('card-' + metaMsg.id);
+              if (card) {
+                  // 简单粗暴：移除旧的，重新渲染一条新的（实际使用中 updateSelf 会刷新，或者用户刷新页面也会正常）
+                  // 这里为了体验，我们手动 update 一下 UI 元素
+                  // 但最简单的是直接让用户知道“发送成功”
+                  const statusDiv = document.getElementById('status-' + metaMsg.id);
+                  if (statusDiv) statusDiv.innerText = '✅ 已就绪';
+              }
+          } catch(e) {
+              window.util.log('处理文件失败: ' + e.message);
+          }
+      }, 50);
+      
       return;
     }
     originalSendMsg.apply(this, arguments);
@@ -104,13 +129,12 @@ function applyHooks() {
   window.ui.appendMsg = function(m) {
     if (m.kind === 'SMART_FILE_UI') {
       const box = document.getElementById('msgList');
-      // 使用消息 ID 防止重复
       const domId = m.id;
       if (!box || document.getElementById('msg-' + m.id)) return;
 
       const isMe = m.senderId === window.state.myId;
-      const sizeStr = (m.meta.fileSize / (1024*1024)).toFixed(2) + ' MB';
-      const isImg = m.meta.fileType.startsWith('image');
+      const sizeStr = m.meta.fileSize ? (m.meta.fileSize / (1024*1024)).toFixed(2) + ' MB' : '计算中...';
+      const isImg = m.meta.fileType && m.meta.fileType.startsWith('image');
       
       let inner = '';
       if (isImg && m.meta.preview) {
@@ -119,7 +143,7 @@ function applyHooks() {
            <div class="smart-card" id="card-${domId}" style="position:relative;min-width:150px">
              <img src="${m.meta.preview}" style="display:block;max-width:100%;max-height:200px;object-fit:contain;border-radius:8px;${isMe?'':'filter:brightness(0.7)'}">
              ${isMe ? 
-               `<div style="position:absolute;bottom:4px;right:4px;background:rgba(0,0,0,0.5);color:#fff;font-size:10px;padding:2px 4px;border-radius:4px;cursor:pointer" onclick="window.smartCore.openLocal('${m.meta.fileId}')">已发送</div>` 
+               `<div id="status-${domId}" style="position:absolute;bottom:4px;right:4px;background:rgba(0,0,0,0.5);color:#fff;font-size:10px;padding:2px 4px;border-radius:4px;cursor:pointer" onclick="window.smartCore.openLocal('${m.meta.fileId}')">${m.isProcessing ? '⏳ 处理中' : '已发送'}</div>` 
                : 
                `<div class="overlay" style="position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;cursor:pointer" onclick="window.smartCore.download('${m.meta.fileId}', '${domId}')">
                   <div class="dl-btn" style="background:rgba(0,0,0,0.5);border:2px solid #fff;border-radius:50%;width:40px;height:40px;display:grid;place-items:center;color:#fff;font-size:20px">⬇</div>
@@ -133,12 +157,12 @@ function applyHooks() {
       } else {
          // 文件卡片
          inner = `
-           <div class="smart-card" style="padding:10px;min-width:200px">
+           <div class="smart-card" id="card-${domId}" style="padding:10px;min-width:200px">
              <div style="font-weight:bold;color:#4ea8ff">📄 ${window.util.escape(m.meta.fileName)}</div>
              <div style="font-size:11px;color:#aaa">${sizeStr}</div>
              <div style="margin-top:8px;text-align:right">
                ${isMe ? 
-                 `<button onclick="window.smartCore.openLocal('${m.meta.fileId}')" style="background:transparent;border:1px solid #555;color:#ddd;padding:4px 8px;border-radius:4px;cursor:pointer">📂 打开</button>` 
+                 `<button id="status-${domId}" onclick="window.smartCore.openLocal('${m.meta.fileId}')" style="background:transparent;border:1px solid #555;color:#ddd;padding:4px 8px;border-radius:4px;cursor:pointer">${m.isProcessing ? '⏳' : '📂 打开'}</button>` 
                  : 
                  `<button onclick="window.smartCore.download('${m.meta.fileId}', '${domId}')" id="btn-${domId}"
                     style="background:#2a7cff;border:none;color:#fff;padding:5px 10px;border-radius:4px;cursor:pointer">⚡ 下载</button>`
@@ -177,8 +201,22 @@ const transfers = {};
 async function openFileViewer(fileId) {
     const url = await assembleFile(fileId);
     if (!url) { alert('文件尚未就绪'); return; }
-    // 直接新窗口打开，浏览器原生行为
-    window.open(url, '_blank');
+    
+    // === 修复：调用 UI 的预览/下载，而不是 window.open ===
+    const meta = await getMeta(fileId);
+    if (meta && meta.fileType && meta.fileType.startsWith('image/')) {
+        if(window.ui && window.ui.previewImage) {
+            window.ui.previewImage(url);
+        } else {
+            window.open(url); // Fallback
+        }
+    } else {
+        if(window.ui && window.ui.downloadBlob) {
+            window.ui.downloadBlob(url, meta ? meta.fileName : 'file.dat');
+        } else {
+            window.open(url);
+        }
+    }
 }
 
 async function startDownload(fileId, domId) {
@@ -186,7 +224,7 @@ async function startDownload(fileId, domId) {
   const url = await assembleFile(fileId);
   if (url) {
       finishDownload(fileId, domId, url);
-      window.open(url, '_blank');
+      openFileViewer(fileId); // 直接尝试打开
       return;
   }
 
@@ -233,8 +271,7 @@ function downloadLoop(fileId) {
 
   let reqCount = 0;
   for (let i = 0; i < task.chunks.length; i++) {
-    if (!task.chunks[i] && reqCount < 6) { // 并发6
-       // 轮询发送
+    if (!task.chunks[i] && reqCount < 8) { // 并发增加到8
        const target = allConns[reqCount % allConns.length];
        if (reqCount === 0) window.util.log(`请求块 #${i} -> ${target.peer.slice(0,5)}`);
        target.send({ 
@@ -255,7 +292,6 @@ async function handleChunkRequest(pkt, fromPeerId) {
   const conn = window.state.conns[fromPeerId];
   
   if (chunk) {
-      window.util.log(`📤 发送数据 -> ${fromPeerId.slice(0,5)}`);
       if (conn && conn.open) {
           conn.send({ 
               t: 'SMART_DATA', 
@@ -264,8 +300,6 @@ async function handleChunkRequest(pkt, fromPeerId) {
               data: chunk.data
           });
       }
-  } else {
-      window.util.log(`⚠️ 缺块 #${pkt.chunkIdx}`);
   }
 }
 
@@ -274,8 +308,6 @@ function handleChunkData(pkt) {
   if (!task || task.chunks[pkt.chunkIdx]) return;
   task.chunks[pkt.chunkIdx] = pkt.data;
   task.needed--;
-  
-  // window.util.log(`📥 收到块 #${pkt.chunkIdx}`);
   
   if (task.needed === 0) {
       const blob = new Blob(task.chunks, { type: task.meta.fileType });
@@ -290,6 +322,8 @@ function finishDownload(fileId, domId, url) {
   const card = document.getElementById('card-' + domId);
   const prog = document.getElementById('prog-wrap-' + domId);
   
+  // === 修复：不自动 window.open，而是改变按钮状态 ===
+  
   if (card) {
       const img = card.querySelector('img');
       const overlay = card.querySelector('.overlay');
@@ -298,12 +332,14 @@ function finishDownload(fileId, domId, url) {
           img.style.filter = 'none';
       }
       if (overlay) overlay.style.display = 'none';
-      card.onclick = () => window.open(url, '_blank');
+      
+      // 绑定新的打开事件
+      card.onclick = () => openFileViewer(fileId);
   } 
   else if (btn) {
       btn.innerText = '🔗 打开';
       btn.style.background = '#22c55e';
-      btn.onclick = () => window.open(url, '_blank');
+      btn.onclick = () => openFileViewer(fileId);
   }
   if (prog) prog.style.display = 'none';
   window.util.log('✅ 下载完成');
