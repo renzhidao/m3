@@ -2,16 +2,16 @@
 import { MSG_TYPE, NET_PARAMS, CHAT } from './constants.js';
 
 /**
- * Smart Core v5 - Stability Fix
+ * Smart Core v8 - Direct P2P Enforcer
  * 
- * 修复内容：
- * 1. 修复点击下载后导致“自动重发”的严重 Bug。
- * 2. 修复图片/文件点击无法打开的问题 (改用原生 A 标签触发)。
- * 3. 增强 Blob URL 的生命周期管理。
+ * 核心修正：
+ * 1. 废弃数据转发模式，强制建立点对点直连通道。
+ * 2. 解决远程传输 0% 问题：点击下载 -> 强制连接 Sender -> 直连传输。
+ * 3. 只有直连建立后，才开始请求数据块。
  */
 
 export function init() {
-  console.log('📦 加载模块: Smart Core v5 (Stable)');
+  console.log(' 加载模块: Smart Core v8 (Direct-P2P)');
   
   const req = indexedDB.open('P1_FILE_DB', 1);
   req.onupgradeneeded = e => {
@@ -24,15 +24,15 @@ export function init() {
     applyHooks();
   };
 
-  // 暴露给 HTML 的全局 API
   window.smartCore = {
     download: (fileId) => startDownload(fileId),
-    openFile: (url) => { 
-        // 强制新窗口打开，避开拦截
-        const a = document.createElement('a');
-        a.href = url;
-        a.target = '_blank';
-        a.click();
+    openLocal: async (fileId) => {
+        const url = await assembleFile(fileId);
+        if (url) {
+            const a = document.createElement('a'); a.href = url; a.target = '_blank'; a.click();
+        } else {
+            alert('文件未就绪，请稍候');
+        }
     }
   };
 }
@@ -40,24 +40,36 @@ export function init() {
 function applyHooks() {
   if (!window.protocol || !window.ui) { setTimeout(applyHooks, 500); return; }
 
-  // === HOOK 1: 发送拦截 (修正：防止递归调用) ===
+  // 1. 路由 (Gossip 仅用于广播 Meta，不传数据)
+  window.protocol.flood = function(pkt, excludePeerId) {
+    // 过滤掉数据包，防止全网风暴
+    if (pkt.t === 'SMART_DATA' || pkt.t === 'SMART_REQ') return; 
+
+    let all = Object.values(window.state.conns).filter(c => c.open && c.peer !== excludePeerId);
+    if (all.length <= 12) { all.forEach(c => c.send(pkt)); return; }
+    
+    // 简单的随机路由
+    const targets = [];
+    // 必发房主
+    all.filter(c => c.peer.startsWith(window.config.hub.prefix)).forEach(c => targets.push(c));
+    // 随机路人
+    const normals = all.filter(c => !c.peer.startsWith(window.config.hub.prefix));
+    if (normals.length > 0) {
+        targets.push(normals[Math.floor(Math.random() * normals.length)]); // 至少选一个
+        if (normals.length > 1) targets.push(normals[Math.floor(Math.random() * normals.length)]);
+    }
+    
+    if (typeof pkt.ttl === 'number') { if (pkt.ttl <= 0) return; pkt.ttl--; }
+    targets.forEach(c => c.send(pkt));
+  };
+
+  // 2. 发送 (正常存库 + 广播 Meta)
   const originalSendMsg = window.protocol.sendMsg;
   window.protocol.sendMsg = async function(txt, kind, fileInfo) {
-    // 只有用户主动触发的“大文件”才拦截
-    // 防止内部系统消息触发此逻辑
-    if (!window.state.isUserAction && !fileInfo) {
-        originalSendMsg.apply(this, arguments);
-        return;
-    }
-
-    if (kind === CHAT.KIND_IMAGE && txt.length < 400000) {
-        originalSendMsg.apply(this, arguments);
-        return;
-    }
+    if (!window.state.isUserAction && !fileInfo) { originalSendMsg.apply(this, arguments); return; }
+    if (kind === CHAT.KIND_IMAGE && txt.length < 400000) { originalSendMsg.apply(this, arguments); return; }
 
     if ((kind === CHAT.KIND_FILE || kind === CHAT.KIND_IMAGE) && txt.length > 1024) {
-      window.util.log('🚀 处理大文件上传...');
-      
       const fileId = window.util.uuid();
       const rawData = base64ToArrayBuffer(txt);
       const chunks = sliceData(rawData, 16 * 1024);
@@ -80,45 +92,47 @@ function applyHooks() {
 
       if (kind === CHAT.KIND_IMAGE) {
           try {
-             const preview = await makePreview(txt, 1024, 0.6);
+             const preview = await makePreview(txt, 600, 0.6);
              metaMsg.preview = preview;
           } catch(e) {}
       }
       
       window.db.addPending(metaMsg);
-      // 本地直接渲染（不走网络回路，防止重复）
       const uiMsg = { id: metaMsg.id, senderId: metaMsg.senderId, n: metaMsg.n, ts: metaMsg.ts, kind: 'SMART_FILE_UI', meta: metaMsg };
       window.ui.appendMsg(uiMsg);
-      
-      // 仅广播 Meta
       window.protocol.flood(metaMsg); 
       return;
     }
-    
     originalSendMsg.apply(this, arguments);
   };
 
-  // === HOOK 2: 接收处理 (修正：严格过滤自己发的消息) ===
+  // 3. 接收 (只处理直连数据)
   const originalProcess = window.protocol.processIncoming;
   window.protocol.processIncoming = function(pkt, fromPeerId) {
-    // 忽略自己发的 Meta (因为本地已经渲染过了)
     if (pkt.senderId === window.state.myId && pkt.t === 'SMART_META') return;
-
+    
     if (pkt.t === 'SMART_META') {
-      registerSource(pkt.fileId, fromPeerId || pkt.senderId);
       saveMeta(pkt);
       const uiMsg = { id: pkt.id, senderId: pkt.senderId, n: pkt.n, ts: pkt.ts, kind: 'SMART_FILE_UI', meta: pkt };
       window.ui.appendMsg(uiMsg); 
       window.protocol.flood(pkt, fromPeerId);
       return;
     }
-    if (pkt.t === 'SMART_REQ') { handleChunkRequest(pkt, fromPeerId); return; }
-    if (pkt.t === 'SMART_DATA') { handleChunkData(pkt); return; }
+    
+    // 直连请求处理
+    if (pkt.t === 'SMART_REQ') { 
+        handleChunkRequest(pkt, fromPeerId); 
+        return; 
+    }
+    if (pkt.t === 'SMART_DATA') { 
+        handleChunkData(pkt); 
+        return; 
+    }
     
     originalProcess.apply(this, arguments);
   };
 
-  // === HOOK 3: UI 渲染 (外链修正) ===
+  // 4. UI 渲染 (样式优化)
   const originalAppend = window.ui.appendMsg;
   window.ui.appendMsg = function(m) {
     if (m.kind === 'SMART_FILE_UI') {
@@ -130,31 +144,55 @@ function applyHooks() {
       const isImg = m.meta.fileType.startsWith('image');
       
       let inner = '';
-      if (isImg && m.meta.preview) {
-         // 图片卡片
-         inner = `
-           <div class="smart-card" id="card-${m.meta.fileId}" style="position:relative; min-width:200px">
-             <img src="${m.meta.preview}" style="display:block;max-width:100%;border-radius:8px;filter:brightness(0.7)">
-             <div class="overlay" style="position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center">
-                <button onclick="window.smartCore.download('${m.meta.fileId}')" id="btn-${m.meta.fileId}" 
-                   style="background:rgba(0,0,0,0.6);border:1px solid #fff;color:#fff;padding:6px 12px;border-radius:16px;cursor:pointer">
-                   ⬇ 原图
-                </button>
-             </div>
-           </div>`;
+      
+      if (isMe) {
+          // 我发的：直接打开
+          if (isImg && m.meta.preview) {
+              inner = `
+               <div class="smart-card" style="cursor:pointer" onclick="window.smartCore.openLocal('${m.meta.fileId}')">
+                 <img src="${m.meta.preview}" style="display:block;max-width:100%;max-height:200px;object-fit:contain;border-radius:8px;">
+                 <div style="position:absolute;bottom:4px;right:4px;background:rgba(0,0,0,0.5);color:#fff;font-size:10px;padding:2px 4px;border-radius:4px">已发送</div>
+               </div>`;
+          } else {
+              inner = `
+               <div class="smart-card" style="padding:10px;min-width:200px">
+                 <div style="font-weight:bold;color:#4ea8ff">📄 ${window.util.escape(m.meta.fileName)}</div>
+                 <div style="font-size:11px;color:#aaa">${sizeStr}</div>
+                 <div style="margin-top:4px;text-align:right">
+                    <button onclick="window.smartCore.openLocal('${m.meta.fileId}')" style="background:transparent;border:1px solid #555;color:#ddd;padding:4px 8px;border-radius:4px;cursor:pointer">📂 打开</button>
+                 </div>
+               </div>`;
+          }
       } else {
-         // 文件卡片
-         inner = `
-           <div class="smart-card" style="padding:10px;min-width:200px">
-             <div style="font-weight:bold;color:#4ea8ff;margin-bottom:4px">📄 ${window.util.escape(m.meta.fileName)}</div>
-             <div style="font-size:11px;color:#aaa">${sizeStr}</div>
-             <div style="margin-top:8px;text-align:right">
-               <button onclick="window.smartCore.download('${m.meta.fileId}')" id="btn-${m.meta.fileId}"
-                  style="background:#2a7cff;border:none;color:#fff;padding:5px 10px;border-radius:4px;cursor:pointer">
-                  ⚡ 下载
-               </button>
-             </div>
-           </div>`;
+          // 别人发的：下载交互
+          if (isImg && m.meta.preview) {
+              inner = `
+               <div class="smart-card" id="card-${m.meta.fileId}" style="position:relative;cursor:pointer;min-width:150px" onclick="window.smartCore.download('${m.meta.fileId}')">
+                 <img src="${m.meta.preview}" style="display:block;max-width:100%;max-height:200px;object-fit:contain;border-radius:8px;filter:brightness(0.7)">
+                 <div class="overlay" style="position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center">
+                    <div class="dl-icon" style="background:rgba(0,0,0,0.5);border:2px solid #fff;border-radius:50%;width:40px;height:40px;display:grid;place-items:center;color:#fff;font-size:20px">⬇</div>
+                    <div style="color:#fff;font-size:10px;margin-top:4px;text-shadow:0 1px 2px #000">${sizeStr}</div>
+                 </div>
+                 <div id="prog-wrap-${m.meta.fileId}" style="position:absolute;bottom:0;left:0;right:0;height:4px;background:rgba(0,0,0,0.5);display:none">
+                    <div id="prog-${m.meta.fileId}" style="height:100%;width:0%;background:#0f0;transition:width 0.2s"></div>
+                 </div>
+               </div>`;
+          } else {
+              inner = `
+               <div class="smart-card" style="padding:10px;min-width:200px">
+                 <div style="font-weight:bold;color:#4ea8ff">📄 ${window.util.escape(m.meta.fileName)}</div>
+                 <div style="font-size:11px;color:#aaa">${sizeStr}</div>
+                 <div style="margin-top:8px;text-align:right">
+                   <button onclick="window.smartCore.download('${m.meta.fileId}')" id="btn-${m.meta.fileId}"
+                      style="background:#2a7cff;border:none;color:#fff;padding:5px 10px;border-radius:4px;cursor:pointer">
+                      ⚡ 下载
+                   </button>
+                 </div>
+                 <div id="prog-wrap-${m.meta.fileId}" style="margin-top:6px;height:3px;background:#333;display:none">
+                    <div id="prog-${m.meta.fileId}" style="height:100%;width:0%;background:#0f0;transition:width 0.2s"></div>
+                 </div>
+               </div>`;
+          }
       }
 
       const html = `
@@ -162,8 +200,6 @@ function applyHooks() {
           <div>
             <div class="msg-bubble" style="padding:0;overflow:hidden;background:#2b2f3a;border:1px solid #444;color:#fff">
               ${inner}
-              <!-- 隐形进度条 -->
-              <div id="prog-${m.meta.fileId}" style="height:3px;width:0%;background:#0f0;transition:width 0.2s"></div>
             </div>
             <div class="msg-meta">${isMe ? '我' : window.util.escape(m.n)} ${new Date(m.ts).toLocaleTimeString()}</div>
           </div>
@@ -175,16 +211,25 @@ function applyHooks() {
     }
     originalAppend.apply(this, arguments);
   };
-  
-  // 注入一段 CSS 来处理样式
-  const css = document.createElement('style');
-  css.innerHTML = `.smart-card img { transition: filter 0.3s; } .smart-card img:hover { filter: brightness(0.9); }`;
-  document.head.appendChild(css);
 }
 
 // ---------------------------------------------------------
-// 业务逻辑
+// 业务逻辑：强制直连下载
 // ---------------------------------------------------------
+
+async function assembleFile(fileId) {
+    const meta = await getMeta(fileId);
+    if (!meta) return null;
+    const chunks = [];
+    for(let i=0; i<meta.totalChunks; i++) {
+        const c = await getChunk(fileId, i);
+        if(!c) return null;
+        chunks.push(c.data);
+    }
+    const blob = new Blob(chunks, { type: meta.fileType });
+    return URL.createObjectURL(blob);
+}
+
 function makePreview(base64, maxWidth, quality) {
     return new Promise((r, j) => {
         const img = new Image(); img.src = base64;
@@ -202,76 +247,103 @@ function makePreview(base64, maxWidth, quality) {
 
 const transfers = {};
 
-function registerSource(fileId, peerId) {
-  if (!peerId) return;
-  if (!transfers[fileId]) transfers[fileId] = { sources: new Set() };
-  transfers[fileId].sources.add(peerId);
-}
-
 async function startDownload(fileId) {
   const btn = document.getElementById('btn-' + fileId);
-  // 防止重复点击
-  if (btn && btn.disabled) return;
+  const card = document.getElementById('card-' + fileId);
   
-  // 如果已经下载完成 (dataset.url 存在)，直接打开
-  if (btn && btn.dataset.url) {
-      window.smartCore.openFile(btn.dataset.url);
+  // 1. 检查本地是否有缓存
+  const url = await assembleFile(fileId);
+  if (url) {
+      finishDownload(fileId, url);
+      // 自动打开
+      const a = document.createElement('a'); a.href = url; a.target = '_blank'; a.click();
       return;
   }
 
-  if (btn) btn.innerText = '⏳ 连接中...';
-
+  // 2. 准备下载
   const meta = await getMeta(fileId);
-  if (!meta) { alert('文件元数据丢失'); return; }
+  if (!meta) { alert('元数据丢失'); return; }
+
+  // UI 状态
+  const progWrap = document.getElementById('prog-wrap-' + fileId);
+  if (progWrap) progWrap.style.display = 'block';
+  if (btn) btn.innerText = '📡 连接中...';
+  if (card) {
+      const icon = card.querySelector('.dl-icon');
+      if(icon) icon.innerText = '📡';
+  }
 
   // 初始化任务
-  if (!transfers[fileId]) transfers[fileId] = { sources: new Set() };
-  transfers[fileId].meta = meta;
-  transfers[fileId].chunks = new Array(meta.totalChunks).fill(null);
-  transfers[fileId].needed = meta.totalChunks;
+  if (!transfers[fileId]) transfers[fileId] = { meta: meta, chunks: new Array(meta.totalChunks).fill(null), needed: meta.totalChunks };
   
-  if (window.state.conns[meta.senderId]) transfers[fileId].sources.add(meta.senderId);
+  const senderId = meta.senderId;
   
-  if (transfers[fileId].sources.size === 0) {
-    window.protocol.flood({ t: 'SMART_REQ', q: 'WHO_HAS', fileId: fileId });
-    setTimeout(() => downloadLoop(fileId), 2000);
-    return;
+  // 3. 强制直连检测逻辑
+  if (!window.state.conns[senderId] || !window.state.conns[senderId].open) {
+      console.log('🔗 [Smart] 无直连，正在强制连接 Sender:', senderId);
+      if (window.p2p) window.p2p.connectTo(senderId);
+      
+      // 等待连接建立 (最多等 10 秒)
+      waitForConnection(senderId, fileId, 0);
+  } else {
+      console.log('✅ [Smart] 直连已就绪，开始请求');
+      downloadLoop(fileId);
   }
-  downloadLoop(fileId);
+}
+
+function waitForConnection(targetId, fileId, attempt) {
+    if (attempt > 20) { // 10秒超时
+        const btn = document.getElementById('btn-' + fileId);
+        if(btn) btn.innerText = '❌ 连接失败';
+        alert('无法连接到发送者，请确认对方在线');
+        return;
+    }
+    
+    if (window.state.conns[targetId] && window.state.conns[targetId].open) {
+        console.log('✅ [Smart] 直连建立成功！');
+        downloadLoop(fileId);
+    } else {
+        setTimeout(() => waitForConnection(targetId, fileId, attempt + 1), 500);
+    }
 }
 
 function downloadLoop(fileId) {
   const task = transfers[fileId];
   if (!task || task.needed <= 0) return;
-  const sources = Array.from(task.sources).filter(pid => window.state.conns[pid] && window.state.conns[pid].open);
   
-  if (sources.length === 0) {
-      const btn = document.getElementById('btn-' + fileId);
-      if(btn) btn.innerText = '等待资源...';
-      setTimeout(() => downloadLoop(fileId), 2000); 
-      return; 
+  const senderId = task.meta.senderId;
+  const conn = window.state.conns[senderId];
+  
+  // 再次确认连接
+  if (!conn || !conn.open) {
+      // 连接断开了，尝试重连
+      window.p2p.connectTo(senderId);
+      setTimeout(() => downloadLoop(fileId), 2000);
+      return;
   }
 
+  // UI 更新
   const pct = Math.floor(((task.chunks.length - task.needed) / task.chunks.length) * 100);
-  const btn = document.getElementById('btn-' + fileId);
-  if(btn) btn.innerText = `${pct}%`;
-  
   const bar = document.getElementById('prog-' + fileId);
+  const btn = document.getElementById('btn-' + fileId);
   if(bar) bar.style.width = pct + '%';
+  if(btn) btn.innerText = `${pct}%`;
 
+  // 并发请求 (直连模式下可以激进一点，发 16 个请求)
   let reqCount = 0;
   for (let i = 0; i < task.chunks.length; i++) {
-    if (!task.chunks[i] && reqCount < 8) { 
-       const target = sources[Math.floor(Math.random() * sources.length)];
-       window.state.conns[target].send({ t: 'SMART_REQ', fileId: fileId, chunkIdx: i });
+    if (!task.chunks[i] && reqCount < 16) { 
+       conn.send({ t: 'SMART_REQ', fileId: fileId, chunkIdx: i });
        reqCount++;
     }
   }
-  setTimeout(() => downloadLoop(fileId), 500);
+  
+  // 0.2秒一轮，高速轮询
+  setTimeout(() => downloadLoop(fileId), 200);
 }
 
 async function handleChunkRequest(pkt, fromPeerId) {
-  if (pkt.q === 'WHO_HAS') return;
+  // 收到请求，立刻回传
   const chunk = await getChunk(pkt.fileId, pkt.chunkIdx);
   if (chunk && window.state.conns[fromPeerId]) {
     window.state.conns[fromPeerId].send({ t: 'SMART_DATA', fileId: pkt.fileId, chunkIdx: pkt.chunkIdx, data: chunk.data });
@@ -283,47 +355,41 @@ function handleChunkData(pkt) {
   if (!task || task.chunks[pkt.chunkIdx]) return;
   task.chunks[pkt.chunkIdx] = pkt.data;
   task.needed--;
-  if (task.needed === 0) finishDownload(pkt.fileId);
+  
+  const pct = Math.floor(((task.chunks.length - task.needed) / task.chunks.length) * 100);
+  const bar = document.getElementById('prog-' + pkt.fileId);
+  if(bar) bar.style.width = pct + '%';
+  
+  if (task.needed === 0) {
+      const blob = new Blob(task.chunks, { type: task.meta.fileType });
+      const url = URL.createObjectURL(blob);
+      finishDownload(pkt.fileId, url);
+      // 存库
+      saveChunks(pkt.fileId, task.chunks, null);
+  }
 }
 
-async function finishDownload(fileId) {
-  const task = transfers[fileId];
+function finishDownload(fileId, url) {
   const btn = document.getElementById('btn-' + fileId);
-  const bar = document.getElementById('prog-' + fileId);
-  if(bar) bar.style.width = '100%';
+  const card = document.getElementById('card-' + fileId);
+  const prog = document.getElementById('prog-wrap-' + fileId);
   
-  const blob = new Blob(task.chunks, { type: task.meta.fileType });
-  const url = URL.createObjectURL(blob);
-  
-  // 保存到 DB (可选)
-  await saveChunks(fileId, task.chunks, null);
-
-  // === 核心逻辑：转换为外链模式 ===
-  if (task.meta.fileType.startsWith('image')) {
-      // 图片模式：替换 src，移除遮罩
-      const card = document.getElementById('card-' + fileId);
-      if (card) {
-          const img = card.querySelector('img');
-          const overlay = card.querySelector('.overlay');
-          if (img) {
-              img.src = url;
-              img.style.filter = 'none';
-              img.style.cursor = 'pointer';
-              img.onclick = () => window.smartCore.openFile(url);
-          }
-          if (overlay) overlay.style.display = 'none';
+  if (card) {
+      const img = card.querySelector('img');
+      const overlay = card.querySelector('.overlay');
+      if (img) {
+          img.src = url;
+          img.style.filter = 'none';
       }
-  } else {
-      // 文件模式：按钮变色，点击跳转
-      if (btn) {
-          btn.innerText = '🔗 打开';
-          btn.style.background = '#22c55e';
-          btn.dataset.url = url; // 标记 URL
-          btn.onclick = () => window.smartCore.openFile(url);
-      }
+      if (overlay) overlay.style.display = 'none';
+      card.onclick = () => window.smartCore.openLocal(fileId);
+  } 
+  else if (btn) {
+      btn.innerText = '🔗 打开';
+      btn.style.background = '#22c55e';
+      btn.onclick = () => window.smartCore.openLocal(fileId);
   }
-  
-  console.log('✅ 下载完成，URL:', url);
+  if (prog) prog.style.display = 'none';
 }
 
 function base64ToArrayBuffer(base64) {
