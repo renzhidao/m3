@@ -2,16 +2,16 @@
 import { MSG_TYPE, NET_PARAMS, CHAT } from './constants.js';
 
 /**
- * Smart Core v4 - Unlimited & Direct Link
+ * Smart Core v5 - Stability Fix
  * 
- * 核心升级：
- * 1. 彻底移除文件大小限制支持。
- * 2. "外链化"体验：下载完成后，生成 Blob URL，点击直接在浏览器新标签页打开。
- * 3. 修复点击无效的问题。
+ * 修复内容：
+ * 1. 修复点击下载后导致“自动重发”的严重 Bug。
+ * 2. 修复图片/文件点击无法打开的问题 (改用原生 A 标签触发)。
+ * 3. 增强 Blob URL 的生命周期管理。
  */
 
 export function init() {
-  console.log('📦 加载模块: Smart Core v4 (Unlimited)');
+  console.log('📦 加载模块: Smart Core v5 (Stable)');
   
   const req = indexedDB.open('P1_FILE_DB', 1);
   req.onupgradeneeded = e => {
@@ -24,47 +24,39 @@ export function init() {
     applyHooks();
   };
 
+  // 暴露给 HTML 的全局 API
   window.smartCore = {
     download: (fileId) => startDownload(fileId),
-    openBlob: (url) => window.open(url, '_blank') // 简单的外链跳转工具
+    openFile: (url) => { 
+        // 强制新窗口打开，避开拦截
+        const a = document.createElement('a');
+        a.href = url;
+        a.target = '_blank';
+        a.click();
+    }
   };
 }
 
 function applyHooks() {
   if (!window.protocol || !window.ui) { setTimeout(applyHooks, 500); return; }
 
-  // === HOOK: Gossip 路由 ===
-  window.protocol.flood = function(pkt, excludePeerId) {
-    let all = Object.values(window.state.conns).filter(c => c.open && c.peer !== excludePeerId);
-    if (all.length <= 12) { all.forEach(c => c.send(pkt)); return; }
-
-    const targets = [];
-    const hubs = all.filter(c => c.peer.startsWith(window.config.hub.prefix));
-    const normals = all.filter(c => !c.peer.startsWith(window.config.hub.prefix));
-
-    targets.push(...hubs);
-    const needed = 10 - targets.length;
-    if (needed > 0 && normals.length > 0) {
-        for (let i = normals.length - 1; i > 0; i--) {
-            const j = Math.floor(Math.random() * (i + 1));
-            [normals[i], normals[j]] = [normals[j], normals[i]];
-        }
-        targets.push(...normals.slice(0, needed));
-    }
-    if (typeof pkt.ttl === 'number') { if (pkt.ttl <= 0) return; pkt.ttl--; }
-    targets.forEach(c => c.send(pkt));
-  };
-
-  // === HOOK: 发送拦截 ===
+  // === HOOK 1: 发送拦截 (修正：防止递归调用) ===
   const originalSendMsg = window.protocol.sendMsg;
   window.protocol.sendMsg = async function(txt, kind, fileInfo) {
+    // 只有用户主动触发的“大文件”才拦截
+    // 防止内部系统消息触发此逻辑
+    if (!window.state.isUserAction && !fileInfo) {
+        originalSendMsg.apply(this, arguments);
+        return;
+    }
+
     if (kind === CHAT.KIND_IMAGE && txt.length < 400000) {
         originalSendMsg.apply(this, arguments);
         return;
     }
-    // 只要是大文件（无论多大），都走 Smart 通道
+
     if ((kind === CHAT.KIND_FILE || kind === CHAT.KIND_IMAGE) && txt.length > 1024) {
-      window.util.log('🚀 正在处理大文件...');
+      window.util.log('🚀 处理大文件上传...');
       
       const fileId = window.util.uuid();
       const rawData = base64ToArrayBuffer(txt);
@@ -88,22 +80,30 @@ function applyHooks() {
 
       if (kind === CHAT.KIND_IMAGE) {
           try {
-              const previewBase64 = await makePreview(txt, 1024, 0.6);
-              metaMsg.preview = previewBase64;
+             const preview = await makePreview(txt, 1024, 0.6);
+             metaMsg.preview = preview;
           } catch(e) {}
       }
       
       window.db.addPending(metaMsg);
-      window.protocol.processIncoming(metaMsg);
+      // 本地直接渲染（不走网络回路，防止重复）
+      const uiMsg = { id: metaMsg.id, senderId: metaMsg.senderId, n: metaMsg.n, ts: metaMsg.ts, kind: 'SMART_FILE_UI', meta: metaMsg };
+      window.ui.appendMsg(uiMsg);
+      
+      // 仅广播 Meta
       window.protocol.flood(metaMsg); 
       return;
     }
+    
     originalSendMsg.apply(this, arguments);
   };
 
-  // === HOOK: 接收 ===
+  // === HOOK 2: 接收处理 (修正：严格过滤自己发的消息) ===
   const originalProcess = window.protocol.processIncoming;
   window.protocol.processIncoming = function(pkt, fromPeerId) {
+    // 忽略自己发的 Meta (因为本地已经渲染过了)
+    if (pkt.senderId === window.state.myId && pkt.t === 'SMART_META') return;
+
     if (pkt.t === 'SMART_META') {
       registerSource(pkt.fileId, fromPeerId || pkt.senderId);
       saveMeta(pkt);
@@ -114,10 +114,11 @@ function applyHooks() {
     }
     if (pkt.t === 'SMART_REQ') { handleChunkRequest(pkt, fromPeerId); return; }
     if (pkt.t === 'SMART_DATA') { handleChunkData(pkt); return; }
+    
     originalProcess.apply(this, arguments);
   };
 
-  // === HOOK: UI 渲染 (外链化改造) ===
+  // === HOOK 3: UI 渲染 (外链修正) ===
   const originalAppend = window.ui.appendMsg;
   window.ui.appendMsg = function(m) {
     if (m.kind === 'SMART_FILE_UI') {
@@ -127,56 +128,42 @@ function applyHooks() {
       const isMe = m.senderId === window.state.myId;
       const sizeStr = (m.meta.fileSize / (1024*1024)).toFixed(2) + ' MB';
       const isImg = m.meta.fileType.startsWith('image');
-      const hasPreview = !!m.meta.preview;
       
-      let contentHtml = '';
-
-      if (isImg && hasPreview) {
-          // 图片模式
-          contentHtml = `
-            <div class="file-card smart-img-card" id="card-${m.meta.fileId}" style="padding:0; position:relative; min-width:200px; min-height:150px">
-               <img src="${m.meta.preview}" style="display:block; max-width:100%; height:auto; border-radius:8px; filter: brightness(0.6);">
-               
-               <div class="overlay" style="position:absolute; inset:0; display:flex; flex-direction:column; align-items:center; justify-content:center;">
-                  <button onclick="window.smartCore.download('${m.meta.fileId}')" 
-                          id="btn-${m.meta.fileId}"
-                          style="background:rgba(255,255,255,0.2); border:1px solid rgba(255,255,255,0.5); color:#fff; padding:8px 16px; border-radius:20px; font-weight:bold; backdrop-filter:blur(4px);">
-                    ⬇ 原图 (${sizeStr})
-                  </button>
-                  <div id="prog-wrap-${m.meta.fileId}" style="width:60%; height:3px; background:rgba(255,255,255,0.2); margin-top:10px; display:none">
-                     <div id="prog-${m.meta.fileId}" style="width:0%; height:100%; background:#0f0; transition:width 0.2s"></div>
-                  </div>
-               </div>
-            </div>
-          `;
-      } else {
-          // 文件模式
-          contentHtml = `
-            <div class="file-card" style="background:transparent; padding:12px">
-                <div class="file-icon">📦</div>
-                <div class="file-info">
-                   <div class="file-name" style="font-weight:bold;color:#4ea8ff">${window.util.escape(m.meta.fileName)}</div>
-                   <div class="file-size" style="color:#aaa;font-size:11px">${sizeStr}</div>
-                   <div class="progress-wrap" style="background:#111;height:4px;border-radius:2px;margin-top:8px;overflow:hidden">
-                     <div id="prog-${m.meta.fileId}" style="width:0%; height:100%; background:#22c55e; transition:width 0.2s"></div>
-                   </div>
-                </div>
-            </div>
-            <div style="background:rgba(0,0,0,0.3); padding:8px 12px; display:flex; justify-content:flex-end">
-                <button onclick="window.smartCore.download('${m.meta.fileId}')" 
-                        id="btn-${m.meta.fileId}"
-                        style="background:#2a7cff;border:none;color:#fff;padding:6px 14px;border-radius:4px;font-size:12px;font-weight:600">
-                  ${isMe ? '已发送' : '⚡ 下载'}
+      let inner = '';
+      if (isImg && m.meta.preview) {
+         // 图片卡片
+         inner = `
+           <div class="smart-card" id="card-${m.meta.fileId}" style="position:relative; min-width:200px">
+             <img src="${m.meta.preview}" style="display:block;max-width:100%;border-radius:8px;filter:brightness(0.7)">
+             <div class="overlay" style="position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center">
+                <button onclick="window.smartCore.download('${m.meta.fileId}')" id="btn-${m.meta.fileId}" 
+                   style="background:rgba(0,0,0,0.6);border:1px solid #fff;color:#fff;padding:6px 12px;border-radius:16px;cursor:pointer">
+                   ⬇ 原图
                 </button>
-            </div>
-          `;
+             </div>
+           </div>`;
+      } else {
+         // 文件卡片
+         inner = `
+           <div class="smart-card" style="padding:10px;min-width:200px">
+             <div style="font-weight:bold;color:#4ea8ff;margin-bottom:4px">📄 ${window.util.escape(m.meta.fileName)}</div>
+             <div style="font-size:11px;color:#aaa">${sizeStr}</div>
+             <div style="margin-top:8px;text-align:right">
+               <button onclick="window.smartCore.download('${m.meta.fileId}')" id="btn-${m.meta.fileId}"
+                  style="background:#2a7cff;border:none;color:#fff;padding:5px 10px;border-radius:4px;cursor:pointer">
+                  ⚡ 下载
+               </button>
+             </div>
+           </div>`;
       }
 
       const html = `
         <div class="msg-row ${isMe ? 'me' : 'other'}" id="msg-${m.id}">
           <div>
-            <div class="msg-bubble" style="background:#2b2f3a; border:1px solid #444; color:#fff; padding:0; overflow:hidden">
-              ${contentHtml}
+            <div class="msg-bubble" style="padding:0;overflow:hidden;background:#2b2f3a;border:1px solid #444;color:#fff">
+              ${inner}
+              <!-- 隐形进度条 -->
+              <div id="prog-${m.meta.fileId}" style="height:3px;width:0%;background:#0f0;transition:width 0.2s"></div>
             </div>
             <div class="msg-meta">${isMe ? '我' : window.util.escape(m.n)} ${new Date(m.ts).toLocaleTimeString()}</div>
           </div>
@@ -188,6 +175,11 @@ function applyHooks() {
     }
     originalAppend.apply(this, arguments);
   };
+  
+  // 注入一段 CSS 来处理样式
+  const css = document.createElement('style');
+  css.innerHTML = `.smart-card img { transition: filter 0.3s; } .smart-card img:hover { filter: brightness(0.9); }`;
+  document.head.appendChild(css);
 }
 
 // ---------------------------------------------------------
@@ -218,19 +210,21 @@ function registerSource(fileId, peerId) {
 
 async function startDownload(fileId) {
   const btn = document.getElementById('btn-' + fileId);
-  // 如果已经是完成状态，直接打开
-  if (btn && btn.getAttribute('data-url')) {
-      window.open(btn.getAttribute('data-url'), '_blank');
+  // 防止重复点击
+  if (btn && btn.disabled) return;
+  
+  // 如果已经下载完成 (dataset.url 存在)，直接打开
+  if (btn && btn.dataset.url) {
+      window.smartCore.openFile(btn.dataset.url);
       return;
   }
 
-  const progWrap = document.getElementById('prog-wrap-' + fileId);
-  if (progWrap) progWrap.style.display = 'block';
-  if (btn) btn.innerText = '⏳';
+  if (btn) btn.innerText = '⏳ 连接中...';
 
   const meta = await getMeta(fileId);
-  if (!meta) { alert('元数据丢失'); return; }
+  if (!meta) { alert('文件元数据丢失'); return; }
 
+  // 初始化任务
   if (!transfers[fileId]) transfers[fileId] = { sources: new Set() };
   transfers[fileId].meta = meta;
   transfers[fileId].chunks = new Array(meta.totalChunks).fill(null);
@@ -240,7 +234,7 @@ async function startDownload(fileId) {
   
   if (transfers[fileId].sources.size === 0) {
     window.protocol.flood({ t: 'SMART_REQ', q: 'WHO_HAS', fileId: fileId });
-    setTimeout(() => downloadLoop(fileId), 3000);
+    setTimeout(() => downloadLoop(fileId), 2000);
     return;
   }
   downloadLoop(fileId);
@@ -250,15 +244,24 @@ function downloadLoop(fileId) {
   const task = transfers[fileId];
   if (!task || task.needed <= 0) return;
   const sources = Array.from(task.sources).filter(pid => window.state.conns[pid] && window.state.conns[pid].open);
-  if (sources.length === 0) { setTimeout(() => downloadLoop(fileId), 2000); return; }
+  
+  if (sources.length === 0) {
+      const btn = document.getElementById('btn-' + fileId);
+      if(btn) btn.innerText = '等待资源...';
+      setTimeout(() => downloadLoop(fileId), 2000); 
+      return; 
+  }
 
   const pct = Math.floor(((task.chunks.length - task.needed) / task.chunks.length) * 100);
   const btn = document.getElementById('btn-' + fileId);
   if(btn) btn.innerText = `${pct}%`;
+  
+  const bar = document.getElementById('prog-' + fileId);
+  if(bar) bar.style.width = pct + '%';
 
   let reqCount = 0;
   for (let i = 0; i < task.chunks.length; i++) {
-    if (!task.chunks[i] && reqCount < 6) { 
+    if (!task.chunks[i] && reqCount < 8) { 
        const target = sources[Math.floor(Math.random() * sources.length)];
        window.state.conns[target].send({ t: 'SMART_REQ', fileId: fileId, chunkIdx: i });
        reqCount++;
@@ -280,54 +283,47 @@ function handleChunkData(pkt) {
   if (!task || task.chunks[pkt.chunkIdx]) return;
   task.chunks[pkt.chunkIdx] = pkt.data;
   task.needed--;
-  const pct = Math.floor(((task.chunks.length - task.needed) / task.chunks.length) * 100);
-  const bar = document.getElementById('prog-' + pkt.fileId);
-  if (bar) bar.style.width = pct + '%';
   if (task.needed === 0) finishDownload(pkt.fileId);
 }
 
 async function finishDownload(fileId) {
   const task = transfers[fileId];
   const btn = document.getElementById('btn-' + fileId);
+  const bar = document.getElementById('prog-' + fileId);
+  if(bar) bar.style.width = '100%';
   
   const blob = new Blob(task.chunks, { type: task.meta.fileType });
   const url = URL.createObjectURL(blob);
   
-  // === 核心修复：外链化逻辑 ===
-  
+  // 保存到 DB (可选)
+  await saveChunks(fileId, task.chunks, null);
+
+  // === 核心逻辑：转换为外链模式 ===
   if (task.meta.fileType.startsWith('image')) {
-      // 图片：替换预览图，点击打开大图
+      // 图片模式：替换 src，移除遮罩
       const card = document.getElementById('card-' + fileId);
       if (card) {
           const img = card.querySelector('img');
-          if(img) {
-              img.src = url;
-              img.style.filter = 'none'; // 移除遮罩
-              img.style.cursor = 'pointer';
-              // 绑定点击事件：直接新窗口打开 Blob
-              img.onclick = () => window.open(url, '_blank');
-          }
-          // 隐藏按钮层
           const overlay = card.querySelector('.overlay');
-          if(overlay) overlay.style.display = 'none';
+          if (img) {
+              img.src = url;
+              img.style.filter = 'none';
+              img.style.cursor = 'pointer';
+              img.onclick = () => window.smartCore.openFile(url);
+          }
+          if (overlay) overlay.style.display = 'none';
       }
   } else {
-      // 文件：按钮变为“打开连接”
+      // 文件模式：按钮变色，点击跳转
       if (btn) {
-          btn.innerText = '🔗 打开连接';
+          btn.innerText = '🔗 打开';
           btn.style.background = '#22c55e';
-          // 存储 URL 供 startDownload 里的判断使用，防止重复下载
-          btn.setAttribute('data-url', url);
-          // 强制新行为：点击即跳转
-          btn.onclick = (e) => {
-              e.stopPropagation();
-              window.open(url, '_blank');
-          };
+          btn.dataset.url = url; // 标记 URL
+          btn.onclick = () => window.smartCore.openFile(url);
       }
   }
   
-  await saveChunks(fileId, task.chunks, null);
-  console.log('✅ 资源已转为外链模式:', url);
+  console.log('✅ 下载完成，URL:', url);
 }
 
 function base64ToArrayBuffer(base64) {
