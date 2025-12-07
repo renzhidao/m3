@@ -2,12 +2,13 @@
 import { MSG_TYPE, NET_PARAMS, CHAT } from './constants.js';
 
 /**
- * Smart Core v16 - Cancelable & Error Handling
- * 新增：下载取消按钮、对方无数据时报错停止、日志净化
+ * Smart Core v19 - Trust Existing Connection
+ * 修复：严禁在下载时主动断开/重置现有的 P2P 连接。
+ * 保留：流媒体预览、蜂群下载、取消功能。
  */
 
 export function init() {
-  console.log('📦 加载模块: Smart Core v16 (Cancelable)');
+  console.log('📦 加载模块: Smart Core v19 (Trust-Fix)');
   
   const req = indexedDB.open('P1_FILE_DB', 1);
   req.onupgradeneeded = e => {
@@ -17,14 +18,39 @@ export function init() {
   };
   req.onsuccess = e => {
     window.smartDB = e.target.result;
+    setTimeout(broadcastInventory, 2000);
     applyHooks();
   };
 
   window.smartCore = {
     download: (fileId, msgId) => startDownload(fileId, msgId),
     cancel: (fileId) => cancelDownload(fileId),
-    openLocal: (fileId) => openFileViewer(fileId)
+    openLocal: (fileId) => openFileViewer(fileId),
+    playVideo: (fileId, domId) => startStreaming(fileId, domId)
   };
+}
+
+async function broadcastInventory() {
+    if (!window.smartDB || !window.protocol) return;
+    const tx = window.smartDB.transaction(['meta'], 'readonly');
+    const req = tx.objectStore('meta').getAllKeys();
+    req.onsuccess = () => {
+        const fileIds = req.result;
+        if (fileIds && fileIds.length > 0) {
+            window.protocol.flood({
+                t: 'SMART_I_HAVE',
+                list: fileIds,
+                id: window.util.uuid()
+            });
+        }
+    };
+}
+
+const fileProviders = {}; 
+
+function addProvider(fileId, peerId) {
+    if (!fileProviders[fileId]) fileProviders[fileId] = new Set();
+    fileProviders[fileId].add(peerId);
 }
 
 function applyHooks() {
@@ -76,6 +102,8 @@ function applyHooks() {
               }
               
               await saveChunks(fileId, chunks, metaMsg);
+              addProvider(fileId, window.state.myId);
+              
               window.db.addPending(metaMsg);
               window.protocol.flood(metaMsg); 
               
@@ -94,21 +122,26 @@ function applyHooks() {
     
     if (pkt.t === 'SMART_META') {
       saveMeta(pkt);
+      addProvider(pkt.fileId, pkt.senderId);
       const uiMsg = { id: pkt.id, senderId: pkt.senderId, n: pkt.n, ts: pkt.ts, kind: 'SMART_FILE_UI', meta: pkt };
       window.ui.appendMsg(uiMsg); 
       window.protocol.flood(pkt, fromPeerId);
       return;
     }
     
-    if (pkt.t === 'SMART_WAKE') {
-       handleWakeSignal(pkt, fromPeerId);
-       window.protocol.flood(pkt, fromPeerId);
-       return;
+    if (pkt.t === 'SMART_I_HAVE' && Array.isArray(pkt.list)) {
+        pkt.list.forEach(fid => addProvider(fid, fromPeerId || pkt.senderId)); 
+        return; 
+    }
+    
+    if (pkt.t === 'SMART_WHO_HAS') {
+        checkAndRespond(pkt.fileId, fromPeerId);
+        window.protocol.flood(pkt, fromPeerId);
+        return;
     }
 
     if (pkt.t === 'SMART_REQ') { handleChunkRequest(pkt, fromPeerId); return; }
     if (pkt.t === 'SMART_DATA') { handleChunkData(pkt); return; }
-    // 对方没有数据
     if (pkt.t === 'SMART_404') { handle404(pkt); return; }
     
     originalProcess.apply(this, arguments);
@@ -124,10 +157,36 @@ function applyHooks() {
       const isMe = m.senderId === window.state.myId;
       const sizeStr = m.meta.fileSize ? (m.meta.fileSize / (1024*1024)).toFixed(2) + ' MB' : '计算中...';
       const isImg = m.meta.fileType && m.meta.fileType.startsWith('image');
+      const isVideo = m.meta.fileType && m.meta.fileType.startsWith('video');
       
       let inner = '';
-      // === 重点修改：覆盖层增加取消逻辑，ID统一管理 ===
-      if (isImg && m.meta.preview) {
+      if (isVideo) {
+           inner = `
+           <div class="smart-card" id="card-${domId}" style="padding:0;min-width:220px;background:#000;border-radius:8px;overflow:hidden">
+             <div style="padding:10px;background:rgba(255,255,255,0.1)">
+                <div style="font-weight:bold;color:#4ea8ff">🎬 ${window.util.escape(m.meta.fileName)}</div>
+                <div style="font-size:11px;color:#aaa">${sizeStr}</div>
+             </div>
+             <div id="video-box-${domId}" style="width:100%;height:180px;display:flex;align-items:center;justify-content:center;background:#111;position:relative">
+                ${isMe ? 
+                  `<div style="color:#666">本地视频</div>` :
+                  `<div id="play-btn-${domId}" style="width:60px;height:60px;background:rgba(255,255,255,0.2);border-radius:50%;display:grid;place-items:center;cursor:pointer;font-size:28px" 
+                        onclick="window.smartCore.playVideo('${m.meta.fileId}', '${domId}')">▶</div>`
+                }
+                <video id="player-${domId}" controls style="width:100%;height:100%;display:none"></video>
+                <div id="buf-tip-${domId}" style="position:absolute;bottom:10px;left:10px;color:#fff;font-size:10px;background:rgba(0,0,0,0.6);padding:2px 6px;border-radius:4px;display:none">缓冲中...</div>
+             </div>
+             <div style="padding:8px;display:flex;justify-content:space-between;align-items:center;background:#1a1a1a">
+                <div id="dl-txt-${domId}" style="font-size:10px;color:#aaa">点击播放</div>
+                ${!isMe ? `<button id="btn-${domId}" onclick="window.smartCore.download('${m.meta.fileId}', '${domId}')" 
+                   style="background:#333;border:1px solid #555;color:#fff;padding:4px 10px;border-radius:4px;font-size:12px">缓存</button>` : ''}
+             </div>
+             <div id="prog-wrap-${domId}" style="height:4px;background:#333;display:none">
+                <div id="prog-${domId}" style="height:100%;width:0%;background:#2a7cff;transition:width 0.2s"></div>
+             </div>
+           </div>`;
+      } 
+      else if (isImg && m.meta.preview) {
          inner = `
            <div class="smart-card" id="card-${domId}" style="position:relative;min-width:150px">
              <img src="${m.meta.preview}" style="display:block;max-width:100%;max-height:200px;object-fit:contain;border-radius:8px;${isMe?'':'filter:brightness(0.7)'}">
@@ -152,8 +211,11 @@ function applyHooks() {
                ${isMe ? 
                  `<button id="status-${domId}" onclick="window.smartCore.openLocal('${m.meta.fileId}')" style="background:transparent;border:1px solid #555;color:#ddd;padding:4px 8px;border-radius:4px;cursor:pointer">${m.isProcessing ? '⏳' : '📂 打开'}</button>` 
                  : 
-                 `<button onclick="window.smartCore.download('${m.meta.fileId}', '${domId}')" id="btn-${domId}"
-                    style="background:#2a7cff;border:none;color:#fff;padding:5px 10px;border-radius:4px;cursor:pointer">⚡ 下载</button>`
+                 `<div style="display:flex;gap:10px;justify-content:flex-end">
+                    <span id="dl-txt-${domId}" style="font-size:10px;align-self:center;color:#666"></span>
+                    <button onclick="window.smartCore.download('${m.meta.fileId}', '${domId}')" id="btn-${domId}"
+                        style="background:#2a7cff;border:none;color:#fff;padding:5px 10px;border-radius:4px;cursor:pointer">⚡ 下载</button>
+                  </div>`
                }
              </div>
              <div id="prog-wrap-${domId}" style="margin-top:6px;height:3px;background:#333;display:none">
@@ -182,65 +244,60 @@ function applyHooks() {
 
 const transfers = {};
 
-async function openFileViewer(fileId) {
-    const url = await assembleFile(fileId);
-    if (!url) { alert('文件尚未就绪'); return; }
-    
-    const meta = await getMeta(fileId);
-    if (meta && meta.fileType && meta.fileType.startsWith('image/')) {
-        if(window.ui && window.ui.previewImage) window.ui.previewImage(url);
-        else window.open(url);
-    } else {
-        if(window.ui && window.ui.downloadBlob) window.ui.downloadBlob(url, meta ? meta.fileName : 'file.dat');
-        else window.open(url);
+async function checkAndRespond(fileId, peerId) {
+    const chunks = await getChunk(fileId, 0);
+    if (chunks) {
+        const conn = window.state.conns[peerId];
+        if (conn && conn.open) {
+            conn.send({ t: 'SMART_I_HAVE', list: [fileId] });
+        } else {
+            if(window.p2p) window.p2p.connectTo(peerId);
+        }
     }
 }
 
-// 停止下载
 function cancelDownload(fileId) {
     const task = transfers[fileId];
     if (task) {
         task.isCancelled = true;
         resetUI(task.domId, '已取消');
-        window.util.log('❌ 任务已手动取消');
         delete transfers[fileId];
     }
 }
 
-async function startDownload(fileId, domId) {
-  // 防止重复点击
-  if (transfers[fileId]) {
-      cancelDownload(fileId);
-      return;
-  }
+async function startStreaming(fileId, domId) {
+    startDownload(fileId, domId, true);
+}
+
+async function startDownload(fileId, domId, isStreaming = false) {
+  if (transfers[fileId] && !transfers[fileId].isCancelled) return;
 
   const url = await assembleFile(fileId);
   if (url) {
       finishDownload(fileId, domId, url);
-      openFileViewer(fileId);
+      if(!isStreaming) openFileViewer(fileId);
       return;
   }
 
   const meta = await getMeta(fileId);
   if (!meta) { alert('元数据丢失'); return; }
 
-  // === UI 切换为取消状态 ===
   const progWrap = document.getElementById('prog-wrap-' + domId);
   if (progWrap) progWrap.style.display = 'block';
   
   const btn = document.getElementById('btn-' + domId);
   if (btn) {
       btn.innerText = '❌ 取消';
-      btn.style.background = '#ff3b30'; // 红色
-      btn.onclick = () => cancelDownload(fileId); // 绑定取消事件
+      btn.style.background = '#ff3b30';
+      btn.onclick = () => cancelDownload(fileId);
   }
   
-  const icon = document.getElementById('dl-icon-' + domId);
-  const overlay = document.getElementById('overlay-' + domId);
-  if (icon && overlay) {
-      icon.innerText = '❌';
-      icon.style.borderColor = '#ff3b30';
-      overlay.onclick = () => cancelDownload(fileId);
+  if (isStreaming) {
+      document.getElementById('play-btn-' + domId).style.display = 'none';
+      const v = document.getElementById('player-' + domId);
+      v.style.display = 'block';
+      const tip = document.getElementById('buf-tip-' + domId);
+      if(tip) tip.style.display = 'block';
   }
 
   transfers[fileId] = { 
@@ -248,100 +305,94 @@ async function startDownload(fileId, domId) {
       chunks: new Array(meta.totalChunks).fill(null), 
       needed: meta.totalChunks, 
       domId: domId,
-      isCancelled: false
+      isCancelled: false,
+      isStreaming: isStreaming,
+      streamInit: false
   };
-  
+
+  window.util.log('🚀 开始下载 (信任模式)...');
   const senderId = meta.senderId;
   const conn = window.state.conns[senderId];
-  window.util.log('🚀 发起下载请求...');
-  window.util.log(`👤 目标发送者: ${window.util.escape(meta.n)} (${senderId.slice(0,6)})`);
   
+  // === 核心修复：绝对不主动关闭连接 ===
   if (conn) {
       if (conn.open) {
-          window.util.log(`🟢 P2P通道: 已连接 (RTT: ${Date.now() - (conn.lastPong||0)}ms)`);
+          window.util.log(`🟢 P2P通道: 已就绪`);
       } else {
-          window.util.log(`🟡 P2P通道: 存在但未Open (正在尝试重连)`);
-          conn.close(); 
-          if(window.p2p) window.p2p.connectTo(senderId);
+          window.util.log(`⏳ 通道存在但未Open，等待中...`);
+          // 不关闭，只等待
       }
   } else {
-      window.util.log(`🔴 P2P通道: 未连接 (尝试发起连接...)`);
+      window.util.log(`🔴 无连接，发起连接: ${senderId.slice(0,6)}`);
       if(window.p2p) window.p2p.connectTo(senderId);
   }
 
-  window.protocol.flood({
-      t: 'SMART_WAKE',
-      id: window.util.uuid(),
-      fileId: fileId,
-      requester: window.state.myId,
-      ttl: 8
-  });
+  // 广播找人 (Swarm)
+  window.protocol.flood({ t: 'SMART_WHO_HAS', fileId: fileId, senderId: window.state.myId });
 
   downloadLoop(fileId);
 }
 
 function downloadLoop(fileId) {
   const task = transfers[fileId];
-  // 检查是否已取消
   if (!task || task.isCancelled) return;
   if (task.needed <= 0) return;
 
   const pct = Math.floor(((task.chunks.length - task.needed) / task.chunks.length) * 100);
   const bar = document.getElementById('prog-' + task.domId);
-  // 更新百分比提示（如果是图片，显示在文字上）
   const txt = document.getElementById('dl-txt-' + task.domId);
-  if(txt) txt.innerText = `${pct}%`;
+  
+  if (task.isStreaming && !task.streamInit) {
+      const chunksCount = 128; 
+      let hasHead = true;
+      for(let i=0; i<Math.min(task.chunks.length, chunksCount); i++) {
+          if(!task.chunks[i]) { hasHead = false; break; }
+      }
+      
+      if (hasHead) {
+          task.streamInit = true;
+          const headChunks = task.chunks.slice(0, chunksCount);
+          const blob = new Blob(headChunks, { type: task.meta.fileType });
+          const v = document.getElementById('player-' + task.domId);
+          const tip = document.getElementById('buf-tip-' + task.domId);
+          if (v) {
+              v.src = URL.createObjectURL(blob);
+              v.play().catch(()=>{}); 
+              if(tip) tip.innerText = '正在预览 (后台下载中...)';
+          }
+      }
+  }
+
+  const providers = fileProviders[fileId] || new Set();
+  if(task.meta.senderId) providers.add(task.meta.senderId);
+
+  const activeSeeds = [];
+  providers.forEach(pid => {
+      const c = window.state.conns[pid];
+      if (c && c.open) activeSeeds.push(c);
+  });
+  
+  if(txt) txt.innerText = `下载中: ${pct}% (源:${activeSeeds.length})`;
   if(bar) bar.style.width = pct + '%';
 
-  const allConns = Object.values(window.state.conns).filter(c => c.open);
-  const senderId = task.meta.senderId;
-  allConns.sort((a, b) => {
-      if (a.peer === senderId) return -1;
-      if (b.peer === senderId) return 1;
-      return 0;
-  });
-
-  if (allConns.length === 0) {
+  if (activeSeeds.length === 0) {
       if(txt) txt.innerText = '等待连接...';
-      setTimeout(() => downloadLoop(fileId), 2000);
+      setTimeout(() => downloadLoop(fileId), 1000);
       return;
-  }
-  
-  if (Math.random() < 0.1) {
-       window.protocol.flood({
-          t: 'SMART_WAKE',
-          id: window.util.uuid(),
-          fileId: fileId,
-          requester: window.state.myId,
-          ttl: 4
-      });
   }
 
   let reqCount = 0;
-  for (let i = 0; i < task.chunks.length; i++) {
-    if (!task.chunks[i] && reqCount < 8) { 
-       const target = allConns[reqCount % allConns.length];
-       if (target && target.open) {
-           target.send({ t: 'SMART_REQ', fileId: fileId, chunkIdx: i });
-           reqCount++;
-       }
+  for (let i = 0; i < task.chunks.length && reqCount < 10; i++) {
+    if (!task.chunks[i]) { 
+       const seed = activeSeeds[reqCount % activeSeeds.length];
+       seed.send({ t: 'SMART_REQ', fileId: fileId, chunkIdx: i });
+       reqCount++;
     }
   }
   
-  setTimeout(() => downloadLoop(fileId), 500);
+  setTimeout(() => downloadLoop(fileId), 200); 
 }
 
-async function handleWakeSignal(pkt, fromPeerId) {
-    if (pkt.requester === window.state.myId) return;
-    const chunks = await getChunk(pkt.fileId, 0); 
-    if (chunks) {
-        if (window.p2p && !window.state.conns[pkt.requester]) {
-            window.p2p.connectTo(pkt.requester);
-        }
-    }
-}
-
-// 收到请求：即使没有数据，也要回个 404
 async function handleChunkRequest(pkt, fromPeerId) {
   const chunk = await getChunk(pkt.fileId, pkt.chunkIdx);
   const conn = window.state.conns[fromPeerId];
@@ -349,26 +400,12 @@ async function handleChunkRequest(pkt, fromPeerId) {
       if (chunk) {
           conn.send({ t: 'SMART_DATA', fileId: pkt.fileId, chunkIdx: pkt.chunkIdx, data: chunk.data });
       } else {
-          // 告诉对方：我没有这个数据
           conn.send({ t: 'SMART_404', fileId: pkt.fileId, chunkIdx: pkt.chunkIdx });
       }
   }
 }
 
-// 收到 404
-function handle404(pkt) {
-    const task = transfers[pkt.fileId];
-    if (!task) return;
-    
-    // 如果是源头告诉我没了，那就真没了
-    if (!task.hasError) {
-        task.hasError = true;
-        window.util.log('⚠️ 对方提示：数据丢失或未找到');
-        // 不立即停止，可能其他人有，但 UI 上给个提示
-        const txt = document.getElementById('dl-txt-' + task.domId);
-        if(txt) txt.innerText = '源数据丢失?';
-    }
-}
+function handle404(pkt) {}
 
 function handleChunkData(pkt) {
   const task = transfers[pkt.fileId];
@@ -385,59 +422,60 @@ function handleChunkData(pkt) {
 }
 
 function finishDownload(fileId, domId, url) {
+  const task = transfers[fileId];
+  const isVideo = task && task.meta.fileType.startsWith('video');
+
   const btn = document.getElementById('btn-' + domId);
-  const card = document.getElementById('card-' + domId);
   const prog = document.getElementById('prog-wrap-' + domId);
+  const txt = document.getElementById('dl-txt-' + domId);
   
-  if (card) {
-      const img = card.querySelector('img');
-      const overlay = card.querySelector('.overlay');
-      if (img) {
-          img.src = url;
-          img.style.filter = 'none';
+  if(txt) txt.innerText = '下载完成';
+  if(prog) prog.style.display = 'none';
+
+  if (isVideo) {
+      const v = document.getElementById('player-' + domId);
+      const tip = document.getElementById('buf-tip-' + domId);
+      if(tip) tip.style.display = 'none';
+      if(v) {
+          const curTime = v.currentTime;
+          v.src = url;
+          v.currentTime = curTime; 
+          v.play(); 
       }
-      if (overlay) overlay.style.display = 'none';
-      card.onclick = () => openFileViewer(fileId);
-  } 
-  else if (btn) {
-      btn.innerText = '🔗 打开';
-      btn.style.background = '#22c55e';
-      btn.onclick = () => openFileViewer(fileId);
+      if(btn) btn.style.display = 'none'; 
+  } else {
+      resetUI(domId, '✅ 完成');
+      if (btn) {
+          btn.innerText = '🔗 打开';
+          btn.style.background = '#22c55e';
+          btn.onclick = () => openFileViewer(fileId);
+      }
+      if(document.getElementById('dl-icon-' + domId)) {
+          const card = document.getElementById('card-' + domId);
+          if(card) card.onclick = () => openFileViewer(fileId);
+      }
   }
-  if (prog) prog.style.display = 'none';
-  window.util.log('✅ 下载完成');
-  delete transfers[fileId];
+  
+  window.util.log('✅ 传输完成');
 }
 
 function resetUI(domId, msg) {
     const btn = document.getElementById('btn-' + domId);
     const icon = document.getElementById('dl-icon-' + domId);
     const txt = document.getElementById('dl-txt-' + domId);
-    const overlay = document.getElementById('overlay-' + domId);
-    const prog = document.getElementById('prog-wrap-' + domId);
     
     if (btn) {
         btn.innerText = '⚡ 下载';
         btn.style.background = '#2a7cff';
-        // 恢复下载绑定
         const oldClone = btn.cloneNode(true);
         btn.parentNode.replaceChild(oldClone, btn);
-        oldClone.onclick = () => {
-             const card = document.getElementById('card-' + domId);
-             const fid = card ? card.dataset.fid : null; // 需要一种方式获取 fileId，这里简化处理
-             // 实际上因为 domId 对应唯一 fileId，在内存里找回来有点难
-             // 简单做法：刷新页面或者等待用户再次点击（闭包失效问题）
-             // 这里的 cancel 主要是停止网络风暴
-             alert('请刷新页面重试');
-        };
+        oldClone.onclick = () => alert('请刷新页面重试');
     }
     if (icon) {
         icon.innerText = '⬇';
         icon.style.borderColor = '#fff';
-        if(overlay) overlay.onclick = null; // 暂时禁用
     }
     if (txt) txt.innerText = msg || '已取消';
-    if (prog) prog.style.display = 'none';
 }
 
 // Utils (保持不变)
