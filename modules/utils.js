@@ -80,25 +80,66 @@ export function init() {
       const c = (hash & 0x00FFFFFF).toString(16).toUpperCase();
       return '#' + '000000'.substring(0, 6 - c.length) + c;
     },
-    stressTest() {
-        window.util.log('💣 开始压力测试(模拟资源耗尽)...');
-        let count = 0;
-        const timer = setInterval(() => {
-            if (!window.state.peer || window.state.peer.destroyed) {
-                clearInterval(timer); return;
-            }
-            for(let i=0; i<50; i++) {
-                count++;
-                try { window.state.peer.connect('fake_' + count); } catch(e) {
-                    window.util.log('💥 已爆内存: ' + e.message);
+        stressTest() {
+        const logKey = 'p1_stress_log';
+        const addLog = (msg) => {
+            const line = `[${new Date().toLocaleTimeString()}] ${msg}`;
+            console.log('💣 ' + line);
+            window.util.log('💣 ' + msg);
+            const logs = JSON.parse(localStorage.getItem(logKey) || '[]');
+            logs.push(line);
+            localStorage.setItem(logKey, JSON.stringify(logs));
+        };
+
+        if(confirm('⚠️ 即将开始阶梯式压测。
+请不要关闭页面，直到出现崩溃提示。
+刷新后日志会自动保留。')) {
+            localStorage.removeItem(logKey); // 清空旧记录
+            addLog('=== 开始阶梯式压测 ===');
+            
+            let total = 0;
+            let batch = 20; // 每次20个
+            
+            const timer = setInterval(() => {
+                if (!window.state.peer || window.state.peer.destroyed) {
+                    addLog('❌ Peer已销毁，压测中止。当前总量: ' + total);
                     clearInterval(timer);
-                    window.util.log('🚑 尝试触发自动救活...');
-                    if(window.p2p) window.p2p.connectTo('trigger_fix');
                     return;
                 }
-            }
-            if(count%500===0) window.util.log(`已堆积 ${count} 个连接`);
-        }, 10);
+
+                addLog(`正在尝试创建 +${batch} 个连接 (当前: ${total})...`);
+                
+                try {
+                    for(let i=0; i<batch; i++) {
+                        total++;
+                        // 使用无操作的 dummy 连接，仅占用配额
+                        window.state.peer.connect('stress_test_' + Date.now() + '_' + total);
+                    }
+                } catch(e) {
+                    clearInterval(timer);
+                    addLog(`💥 崩溃触发！极限阈值 ≈ ${total}`);
+                    addLog(`错误信息: ${e.message}`);
+                    addLog('=== 测试结束，请刷新页面查看结果 ===');
+                    alert(`测得极限连接数: ${total}
+错误: ${e.message}`);
+                }
+            }, 500); // 每0.5秒一波
+        }
+    },
+    
+    showStressReport() {
+        const logs = JSON.parse(localStorage.getItem('p1_stress_log') || '[]');
+        if(logs.length > 0) {
+            console.log(logs.join('
+'));
+            alert('📜 压测报告已输出到控制台，最近一条:
+' + logs[logs.length-1]);
+            // 也可以直接打到屏幕上
+            logs.forEach(l => window.util.log(l));
+        } else {
+            alert('暂无压测记录');
+        }
+    }, 10);
     },
     compressImage(file) {
       return new Promise((resolve) => {
@@ -154,4 +195,10 @@ export function init() {
       } catch(e) {}
     }
   }, 1000);
+  setTimeout(() => {
+    const logs = JSON.parse(localStorage.getItem('p1_stress_log') || '[]');
+    if (logs.length > 0 && logs[logs.length-1].includes('崩溃')) {
+        window.util.log('📊 发现上次压测记录，极限值: ' + logs[logs.length-2]);
+    }
+  }, 1500);
 }
