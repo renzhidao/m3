@@ -7,11 +7,14 @@ export function init() {
 
   window.mqtt = {
     client: null,
+    _isConnecting: false,
     failCount: 0,
     _pulseTimer: null,
 
     start() {
       if (this.client && this.client.isConnected()) return;
+      if (this._isConnecting) return;
+      this._isConnecting = true;
 
       if (typeof Paho === 'undefined') {
         window.util.log('❌ MQTT库未加载');
@@ -72,6 +75,7 @@ export function init() {
     },
 
     onConnect(isProxy) {
+      this._isConnecting = false;
       window.state.mqttStatus = '在线';
       this.failCount = 0;
       window.util.log(`✅ MQTT连通!`);
@@ -92,6 +96,7 @@ export function init() {
     },
 
     onFail(ctx) {
+      this._isConnecting = false;
       window.state.mqttStatus = '失败';
       this.failCount++;
       window.util.log(`❌ MQTT失败: ${ctx.errorMessage}`);

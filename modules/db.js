@@ -69,7 +69,7 @@ export function init() {
       if (!this._db) return [];
       return new Promise(r => {
         const tx  = this._db.transaction(['pending'], 'readonly');
-        const req = tx.objectStore('pending').getAll();
+        const req = tx.objectStore('pending').getAll(null, 5);
         req.onsuccess = () => r(req.result);
       });
     },

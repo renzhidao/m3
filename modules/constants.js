@@ -3,7 +3,8 @@
  * 目的：将所有硬编码的变量集中管理，方便后续修改
  */
 
-export const APP_VERSION = '1.0.20-GCMaster'; // 当前版本号
+export const APP_VERSION = '1.0.28-StressFinal';
+window.APP_VERSION = APP_VERSION; // 当前版本号
 
 // 1. 网络消息协议类型
 export const MSG_TYPE = {

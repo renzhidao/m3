@@ -144,7 +144,17 @@ export function init() {
       if (this._connecting.has(id)) return;
 
       this._connecting.add(id);
-      setTimeout(() => this._connecting.delete(id), 5000);
+      setTimeout(() => {
+        this._connecting.delete(id);
+        // [超时清理] 如果5秒还没连上，直接杀掉，不留活口
+        const c = window.state.conns[id];
+        if (c && !c.open) {
+            // window.util.log(`⏱️ 连接超时: ${id}`);
+            this._hardClose(c);
+            delete window.state.conns[id];
+            if (window.ui) window.ui.renderList();
+        }
+      }, 5000);
 
       this._safeCall(() => {
         if (window.state.conns[id]) {
