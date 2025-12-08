@@ -1,12 +1,14 @@
 import { MSG_TYPE, CHAT, NET_PARAMS } from './constants.js';
 
 /**
- * Smart Core v2.4.0 - Full Trace
- * 包含 [STEP 1-7] 全链路埋点日志
+ * Smart Core v2.4.1 - Log Folding & Polling Flow
+ * 修复：
+ * 1. 日志折叠：Watchdog 超时日志合并显示，不再刷屏
+ * 2. 暴力流控：使用 setTimeout 轮询替代 bufferedamountlow 事件，兼容性更强
  */
 
 export function init() {
-  if (window.monitor) window.monitor.info('Core', 'Smart Core v2.4.0 (Trace) 启动');
+  if (window.monitor) window.monitor.info('Core', 'Smart Core v2.4.1 (LogFold) 启动');
 
   window.virtualFiles = new Map(); 
   window.remoteFiles = new Map();  
@@ -79,50 +81,42 @@ export function init() {
   applyHooks();
 }
 
-// === 混合流控 ===
+// === 核心修改：暴力轮询流控 (更稳) ===
 function flowSend(conn, data, callback) {
     if (!conn || !conn.open) return callback(new Error('Connection Closed'));
     
+    // JSON 信令直通
     if (!(data instanceof ArrayBuffer || data instanceof Uint8Array)) {
         try { conn.send(data); callback(null); } catch(e) { callback(e); }
         return;
     }
 
     const dc = conn.dataChannel;
+    // 如果拿不到底层通道，硬发
     if (!dc || typeof dc.bufferedAmount !== 'number') {
         try { conn.send(data); callback(null); } catch(e) { callback(e); }
         return;
     }
 
-    if (dc.bufferedAmount < 1.5 * 1024 * 1024) {
-        try { conn.send(data); callback(null); } catch(e) { callback(e); }
-        return;
-    }
-
-    // if(window.monitor) window.monitor.warn('Flow', `缓冲满(${dc.bufferedAmount}), 等待...`);
-
-    const timeout = setTimeout(() => {
-        cleanup();
-        callback(new Error('FlowControl Timeout (5s)'));
-    }, 5000);
-
-    const onLow = () => {
-        cleanup();
-        flowSend(conn, data, callback);
+    // 轮询检查函数
+    const attempt = () => {
+        if (!conn.open) return callback(new Error('Closed during send'));
+        
+        // 1.5MB 水位线
+        if (dc.bufferedAmount < 1.5 * 1024 * 1024) {
+            try { 
+                conn.send(data); 
+                callback(null); 
+            } catch(e) { 
+                callback(e); 
+            }
+        } else {
+            // 堵了，过 50ms 再看 (不依赖 unreliable 的事件)
+            setTimeout(attempt, 50);
+        }
     };
 
-    function cleanup() {
-        clearTimeout(timeout);
-        try { dc.removeEventListener('bufferedamountlow', onLow); } catch(e){}
-    }
-
-    try {
-        if (dc.bufferedAmountLowThreshold === 0) dc.bufferedAmountLowThreshold = 64 * 1024;
-        dc.addEventListener('bufferedamountlow', onLow);
-    } catch(e) {
-        cleanup();
-        setTimeout(() => flowSend(conn, data, callback), 50);
-    }
+    attempt();
 }
 
 async function restoreMetaFromDB() {
@@ -159,7 +153,6 @@ const HIGH_WATER_MARK = 50 * 1024 * 1024;
 function startStreamTask(req) {
     const { requestId, fileId, range } = req;
     
-    // 如果任务请求的是本地文件，且走到了 SW 逻辑（说明 play 方法没拦截住，或者是直接 URL 访问）
     if (window.virtualFiles.has(fileId)) {
         if(window.monitor) window.monitor.info('STEP', `[Local] SW 请求本地文件`);
         serveLocalFile(req);
@@ -172,8 +165,6 @@ function startStreamTask(req) {
         sendToSW({ type: 'STREAM_ERROR', requestId, msg: 'Meta Not Found' });
         return;
     }
-
-    // if(window.monitor) window.monitor.info('Task', `🚀 开始任务: ${meta.fileName}`, {size: meta.fileSize});
 
     let start = 0;
     let end = meta.fileSize - 1;
@@ -238,18 +229,12 @@ function sendToSW(msg) {
 function pumpStream(task) {
     if (task.finished || !window.activeStreams.has(task.requestId)) return;
     
-    // 喂给 SW
     while (task.buffer.has(task.cursor)) {
         const chunk = task.buffer.get(task.cursor);
         task.buffer.delete(task.cursor); 
         task.bufferBytes -= chunk.byteLength;
         
         sendToSW({ type: 'STREAM_DATA', requestId: task.requestId, chunk });
-        
-        // 日志采样：每 10 片打一条，避免刷屏
-        // if (task.cursor % (CHUNK_SIZE * 10) === 0 && window.monitor) {
-        //    window.monitor.info('STEP', `[STEP 7] 喂给SW: Offset ${task.cursor}`);
-        // }
         
         task.cursor += chunk.byteLength;
         task.stalledCount = 0; 
@@ -266,7 +251,6 @@ function pumpStream(task) {
     const isHighWater = task.bufferBytes > HIGH_WATER_MARK;
     if (isHighWater) return;
 
-    // 发起请求
     while (task.inflight.size < MAX_INFLIGHT) {
         if (task.peers.length === 0) break;
         
@@ -290,8 +274,6 @@ function pumpStream(task) {
         
         if (conn && conn.open) {
             try {
-                // if(window.monitor && offset === 0) window.monitor.info('STEP', `[STEP 5] 发起首块请求`);
-                
                 conn.send({
                     t: 'SMART_GET',
                     fileId: task.fileId,
@@ -312,8 +294,11 @@ function pumpStream(task) {
     }
 }
 
+// === 核心修改：日志折叠 ===
 function watchdog() {
     const now = Date.now();
+    let timeoutCount = 0; // 统计超时数量
+    
     window.activeStreams.forEach(task => {
         let needsPump = false;
         task.inflight.forEach((ts, offset) => {
@@ -321,12 +306,17 @@ function watchdog() {
                 task.inflight.delete(offset);
                 task.missing.add(offset);
                 needsPump = true;
-                if(window.monitor) window.monitor.warn('Timeout', `块超时: ${offset}`);
+                timeoutCount++; // 计数，不打印
             }
         });
         if (task.inflight.size === 0 && !task.finished) needsPump = true;
         if (needsPump) pumpStream(task); 
     });
+    
+    // 汇总打印
+    if (timeoutCount > 0 && window.monitor) {
+        window.monitor.warn('Timeout', `⚠️ 有 ${timeoutCount} 个数据块请求超时 (正在重试)`);
+    }
     
     window.pendingAcks.forEach((meta, id) => {
         if (now - meta._sentTs > 2000) { 
@@ -358,8 +348,6 @@ function handleIncomingBinary(rawBuffer, fromPeerId) {
         if (task) {
             const body = buffer.slice(1 + headerLen);
             const offset = header.offset; 
-            
-            // if(window.monitor && offset === 0) window.monitor.info('STEP', `[STEP 6] 收到首块数据!`);
             
             if (task.inflight.has(offset)) {
                 task.inflight.delete(offset);
@@ -396,8 +384,6 @@ function handleSmartGet(pkt, requesterId) {
         packet[0] = headerLen;
         packet.set(headerBytes, 1);
         packet.set(new Uint8Array(raw), 1 + headerLen);
-        
-        // if(window.monitor && pkt.offset === 0) window.monitor.info('STEP', `[STEP 6b] 发送首块数据`);
         
         flowSend(conn, packet, (err) => {
             if (err && window.monitor) {
