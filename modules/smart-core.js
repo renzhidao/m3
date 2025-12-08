@@ -1,12 +1,12 @@
 import { MSG_TYPE, CHAT } from './constants.js';
 
 /**
- * Smart Core v24 - Final Polish
- * 修复：高水位死锁、提升块大小至 64KB、IO 错误捕获
+ * Smart Core v25 - Loop Fix
+ * 修复：泛洪死循环、去重逻辑增强
  */
 
 export function init() {
-  if (window.monitor) window.monitor.info('Core', 'Smart Core v24 (HighPerf) 启动');
+  if (window.monitor) window.monitor.info('Core', 'Smart Core v25 (LoopFix) 启动');
 
   window.virtualFiles = new Map(); 
   window.remoteFiles = new Map();  
@@ -44,6 +44,7 @@ async function restoreMetaFromDB() {
         let restored = 0;
         msgs.forEach(m => {
             if (m.kind === 'SMART_FILE_UI' && m.meta) {
+                // 恢复时不触发泛洪
                 window.smartMetaCache.set(m.meta.fileId, m.meta);
                 if (m.senderId !== window.state.myId) {
                    if (!window.remoteFiles.has(m.meta.fileId)) window.remoteFiles.set(m.meta.fileId, new Set());
@@ -64,8 +65,6 @@ function handleSWMessage(event) {
     else if (d.type === 'STREAM_CANCEL') stopStreamTask(d.requestId);
 }
 
-// === 核心参数调整 ===
-// Fix 3: 提升至 64KB 以加速起播 (现代 WebRTC 支持)
 const CHUNK_SIZE = 64 * 1024; 
 const MAX_INFLIGHT = 32; 
 const TIMEOUT_MS = 5000;
@@ -73,7 +72,6 @@ const HIGH_WATER_MARK = 50 * 1024 * 1024;
 
 function startStreamTask(req) {
     const { requestId, fileId, range } = req;
-    if(window.monitor) window.monitor.info('Task', `新建流任务: ${requestId.slice(0,4)}`, {range});
     
     if (window.virtualFiles.has(fileId)) {
         serveLocalFile(req);
@@ -141,7 +139,6 @@ function startStreamTask(req) {
 }
 
 function stopStreamTask(requestId) {
-    if(window.monitor) window.monitor.info('Task', `任务结束/取消: ${requestId.slice(0,4)}`);
     window.activeStreams.delete(requestId);
 }
 
@@ -154,7 +151,6 @@ function sendToSW(msg) {
 function pumpStream(task) {
     if (task.finished || !window.activeStreams.has(task.requestId)) return;
     
-    // 1. 提交数据
     while (task.buffer.has(task.cursor)) {
         const chunk = task.buffer.get(task.cursor);
         task.buffer.delete(task.cursor); 
@@ -172,25 +168,17 @@ function pumpStream(task) {
         }
     }
 
-    // Fix 1: 高水位检查前移到“新数据请求”前，但不能阻塞“重传”
     const isHighWater = task.bufferBytes > HIGH_WATER_MARK;
-    if (isHighWater && window.monitor && Math.random() < 0.05) {
-        window.monitor.warn('Flow', '高水位，暂停获取新块', {bytes: task.bufferBytes});
-    }
 
     while (task.inflight.size < MAX_INFLIGHT) {
         if (task.peers.length === 0) break;
         
         let offset;
-        // 优先重传（即使高水位也允许，因为重传能填坑，降低水位）
         if (task.missing.size > 0) {
             const it = task.missing.values();
             offset = it.next().value;
             task.missing.delete(offset);
-            if(window.monitor) window.monitor.warn('Retry', `重传块: ${offset}`);
-        } 
-        // 只有非高水位时，才请求新数据
-        else if (!isHighWater && task.nextReq <= task.end) {
+        } else if (!isHighWater && task.nextReq <= task.end) {
             offset = task.nextReq;
             task.nextReq += CHUNK_SIZE;
         } else {
@@ -267,18 +255,12 @@ function handleIncomingBinary(rawBuffer, fromPeerId) {
                 pumpStream(task);
             }
         }
-    } catch(e) {
-        if(window.monitor) window.monitor.error('Proto', '二进制解析失败', e);
-    }
+    } catch(e) {}
 }
 
 function handleSmartGet(pkt, requesterId) {
     const file = window.virtualFiles.get(pkt.fileId);
-    if (!file) {
-        // Fix 2: 找不到文件时，给个日志 (协议不支持回传错误，让接收端超时即可)
-        if(window.monitor) window.monitor.warn('IO', '收到请求但文件不存在', pkt);
-        return;
-    }
+    if (!file) return;
 
     const conn = window.state.conns[requesterId];
     if (!conn || !conn.open) return;
@@ -304,10 +286,6 @@ function handleSmartGet(pkt, requesterId) {
         packet.set(new Uint8Array(raw), 1 + headerLen);
         
         conn.send(packet);
-    };
-    // Fix 2: 捕获读取错误
-    reader.onerror = () => {
-        if(window.monitor) window.monitor.error('IO', '文件读取失败', {file: file.name, offset: pkt.offset});
     };
     reader.readAsArrayBuffer(blob);
 }
@@ -365,6 +343,10 @@ function applyHooks() {
                 n: window.state.myName,
                 ts: window.util.now()
             };
+            
+            // 发送前先缓存自己，防止被回环处理
+            window.smartMetaCache.set(fileId, meta);
+            
             window.protocol.flood(meta);
             window.ui.appendMsg({ id: window.util.uuid(), senderId: window.state.myId, kind: 'SMART_FILE_UI', meta: meta });
             return;
@@ -375,12 +357,21 @@ function applyHooks() {
     const originalProcess = window.protocol.processIncoming;
     window.protocol.processIncoming = function(pkt, fromPeerId) {
         if (pkt.t === 'SMART_META') {
-            if (!window.smartMetaCache) window.smartMetaCache = new Map();
+            // === 核心修复：严格去重与防回环 ===
+            if (window.smartMetaCache.has(pkt.fileId)) {
+                // 已存在（无论是自己发的还是收过的），直接更新源列表，不转发，不显示UI
+                if (!window.remoteFiles.has(pkt.fileId)) window.remoteFiles.set(pkt.fileId, new Set());
+                window.remoteFiles.get(pkt.fileId).add(pkt.senderId);
+                return;
+            }
+            
+            // 首次收到
             window.smartMetaCache.set(pkt.fileId, pkt);
             
             if (!window.remoteFiles.has(pkt.fileId)) window.remoteFiles.set(pkt.fileId, new Set());
             window.remoteFiles.get(pkt.fileId).add(pkt.senderId);
             
+            // 唤醒任务
             window.activeStreams.forEach(task => {
                 if (task.fileId === pkt.fileId && !task.peers.includes(pkt.senderId)) {
                     task.peers.push(pkt.senderId);

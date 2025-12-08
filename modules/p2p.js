@@ -1,7 +1,7 @@
 import { MSG_TYPE, NET_PARAMS } from './constants.js';
 
 export function init() {
-  console.log('📦 加载模块: P2P (Monitored)');
+  console.log('📦 加载模块: P2P (Quiet)');
   const CFG = window.config;
 
   window.p2p = {
@@ -57,7 +57,21 @@ export function init() {
         p.on('connection', conn => this.setupConn(conn));
         
         p.on('error', e => {
+          // === Fix: 降噪处理 ===
+          if (e.type === 'peer-unavailable') {
+              // 仅记录 info，不报错，不弹窗
+              if(window.monitor) window.monitor.info('P2P', `节点离线: ${e.message}`);
+              
+              const deadId = e.message.replace('Could not connect to peer ', '');
+              if (deadId && window.state.conns[deadId]) {
+                  this._hardClose(window.state.conns[deadId]);
+                  delete window.state.conns[deadId];
+              }
+              return;
+          }
+          
           if(window.monitor) window.monitor.error('P2P', `错误: ${e.type}`, e);
+          
           if (e.type === 'unavailable-id') {
              const newId = 'u_' + Math.random().toString(36).substr(2, 9);
              window.state.myId = newId;
@@ -79,7 +93,6 @@ export function init() {
     },
 
     stop() {
-        if(window.monitor) window.monitor.warn('P2P', '停止服务');
         if (window.state.peer) {
             try { window.state.peer.destroy(); } catch(e){}
             window.state.peer = null;
