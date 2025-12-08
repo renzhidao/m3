@@ -1,5 +1,5 @@
 export function init() {
-  console.log('📦 加载模块: Utils (Log-Folder-Fix)');
+  console.log('📦 加载模块: Utils (Time-Sync Fix)');
   
   window.onerror = function(msg, url, line, col, error) {
     const info = `❌ [全局错误] ${msg} @ ${url}:${line}:${col}`;
@@ -19,14 +19,12 @@ export function init() {
       
       const el = document.getElementById('logContent');
       
-      // === 实时折叠逻辑 (DOM 操作版) ===
+      // === 实时折叠逻辑 ===
       if (text === this._lastMsg) {
         this._repeatCount++;
         if (el && el.firstChild) {
-          // 尝试查找现有的计数标签
           let countSpan = el.firstChild.querySelector('.log-count');
           if (!countSpan) {
-             // 没找到就创建一个新的
              countSpan = document.createElement('span');
              countSpan.className = 'log-count';
              countSpan.style.color = '#ff0';
@@ -64,7 +62,31 @@ export function init() {
   window.util = {
     log: (s) => window.logSystem.add(s),
     now() { return Date.now() + (window.state ? window.state.timeOffset : 0); },
-    async syncTime() { try { window.state.timeOffset = 0; } catch (e) {} },
+    
+    // === 修复：真实时间校准 ===
+    async syncTime() { 
+      try {
+        const start = Date.now();
+        // 请求 config.json 或当前页面，只为获取 Date 头
+        const res = await fetch(location.href, { method: 'HEAD' });
+        const dateStr = res.headers.get('Date');
+        if (dateStr) {
+            const serverTime = new Date(dateStr).getTime();
+            const end = Date.now();
+            const latency = (end - start) / 2;
+            const realTime = serverTime + latency;
+            window.state.timeOffset = realTime - end;
+            window.util.log(`🕒 时间校准: 偏移 ${Math.round(window.state.timeOffset)}ms`);
+        } else {
+            // window.util.log('⚠️ 无法获取服务器时间，使用本地时间');
+            window.state.timeOffset = 0;
+        }
+      } catch (e) {
+        // window.util.log('⚠️ 校时请求失败: ' + e.message);
+        window.state.timeOffset = 0;
+      }
+    },
+    
     uuid: () => Math.random().toString(36).substr(2, 9),
     escape(s) { return String(s||'').replace(/&/g, '&').replace(/</g, '<').replace(/>/g, '>'); },
     colorHash(str) { return '#333'; },

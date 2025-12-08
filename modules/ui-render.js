@@ -1,7 +1,7 @@
 import { CHAT, UI_CONFIG } from './constants.js';
 
 export function init() {
-  console.log('📦 加载模块: UI Render (Fixed DL)');
+  console.log('📦 加载模块: UI Render (Preview Fix)');
   window.ui = window.ui || {};
   
   const style = document.createElement('style');
@@ -11,10 +11,13 @@ export function init() {
         background: rgba(0,0,0,0.95); z-index: 9999;
         display: flex; flex-direction: column; align-items: center; justify-content: center;
         cursor: zoom-out;
+        animation: fadeIn 0.2s ease;
     }
+    @keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
     .img-preview-content {
-        max-width: 100%; max-height: 80%;
+        max-width: 100%; max-height: 90%;
         object-fit: contain;
+        box-shadow: 0 0 20px rgba(0,0,0,0.5);
     }
     .stream-card {
         background: rgba(0,0,0,0.3); padding: 10px; border-radius: 8px; min-width: 220px;
@@ -130,9 +133,10 @@ export function init() {
              </div>`;
              style = 'background:transparent;padding:0;border:none';
          } else if (isImg) {
+             // === 修复：添加 chat-img 类名以便触发点击预览 ===
              content = `
              <div class="stream-card">
-                 <img src="${streamUrl}" style="max-width:200px;border-radius:4px;display:block">
+                 <img src="${streamUrl}" class="chat-img" style="max-width:200px;border-radius:4px;display:block">
                  <div style="font-size:10px;color:#aaa;margin-top:4px">${sizeStr}</div>
              </div>`;
              style = 'background:transparent;padding:0;border:none';
@@ -150,6 +154,7 @@ export function init() {
          }
 
       } else if (m.kind === CHAT.KIND_IMAGE) {
+         // === 修复：保留 chat-img 类 ===
          content = `<img src="${m.txt}" class="chat-img" style="min-height:50px; background:#222;">`;
          style = 'background:transparent;padding:0';
       } else {
@@ -170,13 +175,10 @@ export function init() {
       if (window.uiEvents && window.uiEvents.bindMsgEvents) window.uiEvents.bindMsgEvents();
     },
     
-    // === 修复：通用下载器 ===
     downloadBlob(data, name) {
         try {
-            // 支持 base64 string 或普通 string
             let url;
             if (typeof data === 'string') {
-                // 如果是 base64
                 if (data.startsWith('data:')) {
                      const a = document.createElement('a');
                      a.href = data;
@@ -184,11 +186,9 @@ export function init() {
                      a.click();
                      return;
                 }
-                // 纯文本 -> Blob
                 const blob = new Blob([data], {type: 'text/plain'});
                 url = URL.createObjectURL(blob);
             } else {
-                // Blob 对象
                 url = URL.createObjectURL(data);
             }
             

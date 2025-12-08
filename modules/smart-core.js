@@ -1,12 +1,13 @@
-import { MSG_TYPE, CHAT } from './constants.js';
+import { MSG_TYPE, CHAT, NET_PARAMS } from './constants.js';
 
 /**
- * Smart Core v26 - Loop Fix Final
- * 修复：发送方回环刷屏、自我识别漏洞
+ * Smart Core v2.1.0 - MaxSpeed Edition
+ * 修复：信令可靠化
+ * 优化：移除所有人工限速，并发窗口最大化
  */
 
 export function init() {
-  if (window.monitor) window.monitor.info('Core', 'Smart Core v26 (FixSelfLoop) 启动');
+  if (window.monitor) window.monitor.info('Core', 'Smart Core v2.1.0 (MaxSpeed) 启动');
 
   window.virtualFiles = new Map(); 
   window.remoteFiles = new Map();  
@@ -64,10 +65,11 @@ function handleSWMessage(event) {
     else if (d.type === 'STREAM_CANCEL') stopStreamTask(d.requestId);
 }
 
-const CHUNK_SIZE = 64 * 1024; 
-const MAX_INFLIGHT = 32; 
+// === 极致性能配置 ===
+const CHUNK_SIZE = 16 * 1024; // 16KB (物理稳定基石，不可改大)
+const MAX_INFLIGHT = 256;     // 并发 256 * 16KB = 4MB 在途数据，跑满带宽
 const TIMEOUT_MS = 5000;
-const HIGH_WATER_MARK = 50 * 1024 * 1024; 
+const HIGH_WATER_MARK = 50 * 1024 * 1024; // 50MB 缓冲水位
 
 function startStreamTask(req) {
     const { requestId, fileId, range } = req;
@@ -191,6 +193,7 @@ function pumpStream(task) {
         const conn = window.state.conns[peerId];
         
         if (conn && conn.open) {
+            // === 极限流控：只要缓冲区不满 1MB 就猛发 ===
             const buf = (conn.dataChannel && conn.dataChannel.bufferedAmount) || 0;
             if (buf > 1024 * 1024) { 
                 task.missing.add(offset); 
@@ -221,7 +224,6 @@ function watchdog() {
                 task.inflight.delete(offset);
                 task.missing.add(offset);
                 hasTimeout = true;
-                if(window.monitor) window.monitor.warn('Timeout', `块超时重置: ${offset}`);
             }
         });
         if (hasTimeout) pumpStream(task); 
@@ -264,8 +266,9 @@ function handleSmartGet(pkt, requesterId) {
     const conn = window.state.conns[requesterId];
     if (!conn || !conn.open) return;
     
+    // === 极限流控：发送端允许 4MB 积压 ===
     const buf = (conn.dataChannel && conn.dataChannel.bufferedAmount) || 0;
-    if (buf > 2 * 1024 * 1024) return; 
+    if (buf > 4 * 1024 * 1024) return; 
 
     const blob = file.slice(pkt.offset, pkt.offset + pkt.size);
     const reader = new FileReader();
@@ -289,6 +292,7 @@ function handleSmartGet(pkt, requesterId) {
     reader.readAsArrayBuffer(blob);
 }
 
+// === 修复：本地全速读取 + 智能中断 ===
 function serveLocalFile(req) {
     const file = window.virtualFiles.get(req.fileId);
     const range = req.range;
@@ -303,19 +307,33 @@ function serveLocalFile(req) {
     sendToSW({ type: 'STREAM_META', requestId: req.requestId, fileSize: file.size, fileType: file.type, start, end });
 
     let offset = start;
-    const CHUNK = 1024 * 1024; 
+    const CHUNK = 1024 * 1024; // 本地读取仍保持 1MB 大块，效率最高
     
+    // 注册到 activeStreams 以便能被监测到取消
+    window.activeStreams.set(req.requestId, { finished: false });
+
     function readLoop() {
+        // 智能中断检查：如果任务已被 cancel (从 activeStreams 中移除)，立即停止
+        if (!window.activeStreams.has(req.requestId)) return;
+
         if (offset > end) {
             sendToSW({ type: 'STREAM_END', requestId: req.requestId });
+            window.activeStreams.delete(req.requestId);
             return;
         }
+        
         const sliceEnd = Math.min(offset + CHUNK, end + 1);
         const reader = new FileReader();
         reader.onload = () => {
+             // 双重检查，防止异步期间被取消
+             if (!window.activeStreams.has(req.requestId)) return;
+             
              sendToSW({ type: 'STREAM_DATA', requestId: req.requestId, chunk: reader.result });
              offset += CHUNK;
-             setTimeout(readLoop, 10); 
+             
+             // === 移除延迟，全速递归 ===
+             // 使用 microtask 避免调用栈溢出，同时保持最高优先级
+             queueMicrotask(readLoop);
         };
         reader.readAsArrayBuffer(file.slice(offset, sliceEnd));
     }
@@ -334,20 +352,23 @@ function applyHooks() {
             
             const meta = {
                 t: 'SMART_META',
+                id: window.util.uuid(),
                 fileId: fileId,
                 fileName: file.name,
                 fileType: file.type,
                 fileSize: file.size,
                 senderId: window.state.myId,
                 n: window.state.myName,
-                ts: window.util.now()
+                ts: window.util.now(),
+                target: CHAT.PUBLIC_ID,  
+                ttl: NET_PARAMS.GOSSIP_SIZE
             };
             
-            // === 修复1：发送时立即缓存 ===
             window.smartMetaCache.set(fileId, meta);
-            
-            window.protocol.flood(meta);
             window.ui.appendMsg({ id: window.util.uuid(), senderId: window.state.myId, kind: 'SMART_FILE_UI', meta: meta });
+            window.db.addPending(meta);
+            window.protocol.retryPending();
+            
             return;
         }
         originalSendMsg.apply(this, arguments);
@@ -356,9 +377,19 @@ function applyHooks() {
     const originalProcess = window.protocol.processIncoming;
     window.protocol.processIncoming = function(pkt, fromPeerId) {
         if (pkt.t === 'SMART_META') {
-            // === 修复2：过滤自己发回来的包 ===
             if (pkt.senderId === window.state.myId) return;
             
+            window.db.saveMsg({ 
+                id: pkt.id || window.util.uuid(),
+                t: 'MSG', 
+                senderId: pkt.senderId,
+                target: CHAT.PUBLIC_ID,
+                kind: 'SMART_FILE_UI', 
+                ts: pkt.ts,
+                n: pkt.n,
+                meta: pkt
+            });
+
             if (window.smartMetaCache.has(pkt.fileId)) {
                 if (!window.remoteFiles.has(pkt.fileId)) window.remoteFiles.set(pkt.fileId, new Set());
                 window.remoteFiles.get(pkt.fileId).add(pkt.senderId);

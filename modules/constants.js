@@ -1,9 +1,9 @@
 /**
  * 全局常量与配置定义
- * P2P Stream Edition
+ * P2P Stream Edition - MaxSpeed
  */
 
-export const APP_VERSION = '2.0.0-Stream-Final';
+export const APP_VERSION = '2.1.0-MaxSpeed';
 
 export const MSG_TYPE = {
   PING: 'PING',         

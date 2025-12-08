@@ -1,7 +1,7 @@
 import { CHAT, UI_CONFIG } from './constants.js';
 
 export function init() {
-  console.log('📦 加载模块: UI Events (Monitor)');
+  console.log('📦 加载模块: UI Events (Preview Enabled)');
   
   window.uiEvents = {
     init() {
@@ -12,7 +12,6 @@ export function init() {
     },
     
     addMonitorBtn() {
-        // 在 Header 增加诊断按钮
         const header = document.querySelector('.chat-header div:last-child');
         if (header && !document.getElementById('btnMonitor')) {
             const btn = document.createElement('div');
@@ -149,6 +148,7 @@ export function init() {
     },
 
     bindMsgEvents() {
+      // 1. 消息气泡右键菜单
       document.querySelectorAll('.msg-bubble').forEach(el => {
          if (el.dataset.bound) return;
          el.dataset.bound = 'true';
@@ -160,6 +160,30 @@ export function init() {
             selection.addRange(range);
          });
       });
+      
+      // 2. === 修复：图片点击全屏预览 ===
+      document.querySelectorAll('.chat-img').forEach(img => {
+          if (img.dataset.previewBound) return;
+          img.dataset.previewBound = 'true';
+          img.style.cursor = 'zoom-in';
+          
+          img.onclick = (e) => {
+              e.stopPropagation();
+              this.showImagePreview(img.src);
+          };
+      });
+    },
+    
+    showImagePreview(src) {
+        const overlay = document.createElement('div');
+        overlay.className = 'img-preview-overlay';
+        overlay.innerHTML = `<img src="${src}" class="img-preview-content">`;
+        
+        overlay.onclick = () => {
+            document.body.removeChild(overlay);
+        };
+        
+        document.body.appendChild(overlay);
     }
   };
   
