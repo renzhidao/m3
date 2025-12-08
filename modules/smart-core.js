@@ -1,12 +1,12 @@
 import { MSG_TYPE, CHAT, NET_PARAMS } from './constants.js';
 
 /**
- * Smart Core v2.1.1 - Connection Trust
- * 修复：发送文件时触发重连导致断网
+ * Smart Core v2.2.0 - Log & Auto-Heal
+ * 增强：全链路日志 + 僵尸连接自动重连
  */
 
 export function init() {
-  if (window.monitor) window.monitor.info('Core', 'Smart Core v2.1.1 (Trust) 启动');
+  if (window.monitor) window.monitor.info('Core', 'Smart Core v2.2.0 (Healer) 启动');
 
   window.virtualFiles = new Map(); 
   window.remoteFiles = new Map();  
@@ -41,7 +41,6 @@ export function init() {
 async function restoreMetaFromDB() {
     try {
         const msgs = await window.db.getRecent(50, 'all');
-        let restored = 0;
         msgs.forEach(m => {
             if (m.kind === 'SMART_FILE_UI' && m.meta) {
                 window.smartMetaCache.set(m.meta.fileId, m.meta);
@@ -49,10 +48,8 @@ async function restoreMetaFromDB() {
                    if (!window.remoteFiles.has(m.meta.fileId)) window.remoteFiles.set(m.meta.fileId, new Set());
                    window.remoteFiles.get(m.meta.fileId).add(m.senderId);
                 }
-                restored++;
             }
         });
-        if (restored > 0 && window.monitor) window.monitor.info('DB', `恢复历史元数据: ${restored}条`);
     } catch(e) {}
 }
 
@@ -64,26 +61,28 @@ function handleSWMessage(event) {
     else if (d.type === 'STREAM_CANCEL') stopStreamTask(d.requestId);
 }
 
-// === 极致性能配置 ===
-const CHUNK_SIZE = 16 * 1024; // 16KB
-const MAX_INFLIGHT = 256;     // 并发 256
+const CHUNK_SIZE = 16 * 1024; 
+const MAX_INFLIGHT = 256;     
 const TIMEOUT_MS = 5000;
-const HIGH_WATER_MARK = 50 * 1024 * 1024; // 50MB
+const HIGH_WATER_MARK = 50 * 1024 * 1024; 
 
 function startStreamTask(req) {
     const { requestId, fileId, range } = req;
     
     if (window.virtualFiles.has(fileId)) {
+        if(window.monitor) window.monitor.info('Task', '提供本地文件流', {fileId});
         serveLocalFile(req);
         return;
     }
 
     const meta = window.smartMetaCache.get(fileId);
     if (!meta) {
-        if(window.monitor) window.monitor.error('Task', '元数据丢失，无法开始任务', {fileId});
+        if(window.monitor) window.monitor.error('Task', '❌ 元数据丢失', {fileId});
         sendToSW({ type: 'STREAM_ERROR', requestId, msg: 'Meta Not Found' });
         return;
     }
+
+    if(window.monitor) window.monitor.info('Task', `🚀 开始任务: ${meta.fileName}`, {size: meta.fileSize});
 
     let start = 0;
     let end = meta.fileSize - 1;
@@ -100,7 +99,6 @@ function startStreamTask(req) {
     }
     if (start < 0) start = 0;
     if (end >= meta.fileSize) end = meta.fileSize - 1;
-    if (start > end) { start = 0; end = meta.fileSize - 1; }
 
     sendToSW({
         type: 'STREAM_META',
@@ -125,13 +123,14 @@ function startStreamTask(req) {
         inflight: new Map(),   
         missing: new Set(),    
         
-        finished: false
+        finished: false,
+        stalledCount: 0 // 卡顿计数器
     };
     
     window.activeStreams.set(requestId, task);
     
     if (task.peers.length === 0) {
-        if(window.monitor) window.monitor.warn('Swarm', '无可用节点，广播寻找中...');
+        if(window.monitor) window.monitor.warn('Swarm', '📡 无可用节点，广播搜寻...');
         window.protocol.flood({ t: 'SMART_WHO_HAS', fileId });
     } else {
         pumpStream(task);
@@ -151,6 +150,7 @@ function sendToSW(msg) {
 function pumpStream(task) {
     if (task.finished || !window.activeStreams.has(task.requestId)) return;
     
+    // 1. 提交缓冲区数据
     while (task.buffer.has(task.cursor)) {
         const chunk = task.buffer.get(task.cursor);
         task.buffer.delete(task.cursor); 
@@ -158,18 +158,24 @@ function pumpStream(task) {
         
         sendToSW({ type: 'STREAM_DATA', requestId: task.requestId, chunk });
         task.cursor += chunk.byteLength;
+        task.stalledCount = 0; // 重置卡顿
         
         if (task.cursor > task.end) {
             sendToSW({ type: 'STREAM_END', requestId: task.requestId });
             task.finished = true;
             window.activeStreams.delete(task.requestId);
-            if(window.monitor) window.monitor.info('Task', `任务完成: ${task.requestId.slice(0,4)}`);
+            if(window.monitor) window.monitor.info('Task', `✅ 任务完成: ${task.requestId.slice(0,4)}`);
             return;
         }
     }
 
     const isHighWater = task.bufferBytes > HIGH_WATER_MARK;
+    if (isHighWater) {
+        // if(window.monitor) window.monitor.warn('Flow', '🌊 高水位暂停');
+        return;
+    }
 
+    // 2. 发起新请求
     while (task.inflight.size < MAX_INFLIGHT) {
         if (task.peers.length === 0) break;
         
@@ -178,7 +184,7 @@ function pumpStream(task) {
             const it = task.missing.values();
             offset = it.next().value;
             task.missing.delete(offset);
-        } else if (!isHighWater && task.nextReq <= task.end) {
+        } else if (task.nextReq <= task.end) {
             offset = task.nextReq;
             task.nextReq += CHUNK_SIZE;
         } else {
@@ -188,34 +194,43 @@ function pumpStream(task) {
         if (offset > task.end) continue;
         const size = Math.min(CHUNK_SIZE, task.end - offset + 1);
         
+        // 轮询选择节点
         const peerId = task.peers[Math.floor(offset / CHUNK_SIZE) % task.peers.length];
-        
-        // === 修复：直接信任现有连接，绝不触发 connectTo ===
         const conn = window.state.conns[peerId];
         
         if (conn && conn.open) {
             const buf = (conn.dataChannel && conn.dataChannel.bufferedAmount) || 0;
+            
             if (buf > 1024 * 1024) { 
-                // 只是稍后重试，不重连！
+                // 缓冲区满，但不报错，只重试
                 task.missing.add(offset); 
                 break; 
             }
             
-            conn.send({
-                t: 'SMART_GET',
-                fileId: task.fileId,
-                offset: offset,
-                size: size,
-                reqId: task.requestId
-            });
-            
-            task.inflight.set(offset, Date.now());
+            try {
+                conn.send({
+                    t: 'SMART_GET',
+                    fileId: task.fileId,
+                    offset: offset,
+                    size: size,
+                    reqId: task.requestId
+                });
+                task.inflight.set(offset, Date.now());
+            } catch(e) {
+                if(window.monitor) window.monitor.error('Net', `发送GET失败: ${peerId}`, e);
+                task.missing.add(offset);
+                // 这里可能需要重连
+            }
         } else {
-            // 如果没连接，说明节点真的断了。
-            // 这里我们只标记缺失，让系统去 flood 寻找新节点，
-            // 或者等待 p2p.js 自动重连（如果它觉得需要的话）
-            // 绝对不要在这里手动调用 p2p.connectTo，防止死循环
+            // 连接不可用
             task.missing.add(offset);
+            
+            // === 自动救活机制 ===
+            // 如果这个节点在列表里，但没连接，尝试去连
+            if (peerId && window.p2p) {
+                // if(window.monitor) window.monitor.warn('Heal', `尝试重连源: ${peerId}`);
+                window.p2p.connectTo(peerId);
+            }
         }
     }
 }
@@ -224,13 +239,29 @@ function watchdog() {
     const now = Date.now();
     window.activeStreams.forEach(task => {
         let hasTimeout = false;
+        
+        // 检查卡顿
+        if (task.inflight.size > 0) {
+            task.stalledCount++;
+            if (task.stalledCount > 5) { // 5秒没动静
+                if(window.monitor) window.monitor.warn('Stall', `⚠️ 任务卡顿，正在重置 inflight...`);
+                // 强制重置所有 inflight
+                task.inflight.forEach((_, off) => task.missing.add(off));
+                task.inflight.clear();
+                task.stalledCount = 0;
+                hasTimeout = true;
+            }
+        }
+
         task.inflight.forEach((ts, offset) => {
             if (now - ts > TIMEOUT_MS) {
                 task.inflight.delete(offset);
                 task.missing.add(offset);
                 hasTimeout = true;
+                if(window.monitor) window.monitor.warn('Timeout', `⏱️ 块超时: ${offset}`);
             }
         });
+        
         if (hasTimeout) pumpStream(task); 
     });
 }
@@ -254,6 +285,9 @@ function handleIncomingBinary(rawBuffer, fromPeerId) {
             const body = buffer.slice(1 + headerLen);
             const offset = header.offset; 
             
+            // 收到数据，日志确认
+            // if(window.monitor && Math.random() < 0.05) window.monitor.info('Data', `收到块: ${offset}`);
+
             if (task.inflight.has(offset)) {
                 task.inflight.delete(offset);
                 task.buffer.set(offset, body);
@@ -269,9 +303,13 @@ function handleSmartGet(pkt, requesterId) {
     if (!file) return;
 
     const conn = window.state.conns[requesterId];
-    if (!conn || !conn.open) return;
     
-    // === 极限流控 ===
+    // === 修复：如果连接断了，也打个日志 ===
+    if (!conn || !conn.open) {
+        if(window.monitor) window.monitor.warn('Serve', `请求者 ${requesterId.slice(0,4)} 连接断开`);
+        return;
+    }
+    
     const buf = (conn.dataChannel && conn.dataChannel.bufferedAmount) || 0;
     if (buf > 4 * 1024 * 1024) return; 
 
@@ -292,7 +330,11 @@ function handleSmartGet(pkt, requesterId) {
         packet.set(headerBytes, 1);
         packet.set(new Uint8Array(raw), 1 + headerLen);
         
-        conn.send(packet);
+        try {
+            conn.send(packet);
+        } catch(e) {
+            if(window.monitor) window.monitor.error('Serve', `发送块失败`, e);
+        }
     };
     reader.readAsArrayBuffer(blob);
 }
@@ -367,6 +409,7 @@ function applyHooks() {
             window.db.addPending(meta);
             window.protocol.retryPending();
             
+            if(window.monitor) window.monitor.info('Msg', `📤 发送文件信令: ${file.name}`);
             return;
         }
         originalSendMsg.apply(this, arguments);
@@ -387,6 +430,8 @@ function applyHooks() {
                 n: pkt.n,
                 meta: pkt
             });
+
+            if(window.monitor) window.monitor.info('Msg', ` 收到文件信令: ${pkt.fileName}`);
 
             if (window.smartMetaCache.has(pkt.fileId)) {
                 if (!window.remoteFiles.has(pkt.fileId)) window.remoteFiles.set(pkt.fileId, new Set());

@@ -1,12 +1,32 @@
 export function init() {
-  console.log('📦 加载模块: Utils (Time-Sync Fix)');
+  console.log('📦 加载模块: Utils (Log-Enhanced)');
   
+  // === 崩溃捕捉 (找回 DiagMaster 功能) ===
   window.onerror = function(msg, url, line, col, error) {
     const info = `❌ [全局错误] ${msg} @ ${url}:${line}:${col}`;
     console.error(info, error);
     if (window.logSystem) window.logSystem.add(info);
+    
+    // 保存崩溃现场
+    try {
+      localStorage.setItem('p1_crash', JSON.stringify({
+        time: new Date().toISOString(),
+        msg: msg,
+        stack: error ? error.stack : null,
+        state: window.state ? {
+            myId: window.state.myId,
+            conns: Object.keys(window.state.conns||{}).length
+        } : null
+      }));
+    } catch(e){}
     return false;
   };
+
+  window.addEventListener('unhandledrejection', function(e) {
+    const info = `❌ [Promise挂掉] ${e.reason}`;
+    console.error(info, e);
+    if (window.logSystem) window.logSystem.add(info);
+  });
 
   window.logSystem = {
     history: JSON.parse(localStorage.getItem('p1_blackbox') || '[]'),
@@ -19,7 +39,6 @@ export function init() {
       
       const el = document.getElementById('logContent');
       
-      // === 实时折叠逻辑 ===
       if (text === this._lastMsg) {
         this._repeatCount++;
         if (el && el.firstChild) {
@@ -63,27 +82,30 @@ export function init() {
     log: (s) => window.logSystem.add(s),
     now() { return Date.now() + (window.state ? window.state.timeOffset : 0); },
     
-    // === 修复：真实时间校准 ===
+    // === 增强：防抖动时间校准 ===
     async syncTime() { 
       try {
         const start = Date.now();
-        // 请求 config.json 或当前页面，只为获取 Date 头
-        const res = await fetch(location.href, { method: 'HEAD' });
+        const res = await fetch(location.href, { method: 'HEAD', cache: 'no-store' });
         const dateStr = res.headers.get('Date');
         if (dateStr) {
             const serverTime = new Date(dateStr).getTime();
             const end = Date.now();
-            const latency = (end - start) / 2;
+            const rtt = end - start;
+            
+            // 如果网络延迟超过 2秒，说明网络极差，本次校准不可信
+            if (rtt > 2000) {
+                window.util.log(`⚠️ 网络抖动 (RTT:${rtt}ms)，跳过校时`);
+                return;
+            }
+            
+            const latency = rtt / 2;
             const realTime = serverTime + latency;
             window.state.timeOffset = realTime - end;
-            window.util.log(`🕒 时间校准: 偏移 ${Math.round(window.state.timeOffset)}ms`);
-        } else {
-            // window.util.log('⚠️ 无法获取服务器时间，使用本地时间');
-            window.state.timeOffset = 0;
+            window.util.log(`🕒 时间校准完成: 偏移 ${Math.round(window.state.timeOffset)}ms (RTT:${rtt}ms)`);
         }
       } catch (e) {
-        // window.util.log('⚠️ 校时请求失败: ' + e.message);
-        window.state.timeOffset = 0;
+        window.util.log('⚠️ 校时失败: ' + e.message);
       }
     },
     
@@ -114,8 +136,14 @@ export function init() {
     }
   };
 
+  // 启动检查
   setTimeout(() => {
     const crash = localStorage.getItem('p1_crash');
-    if (crash) { try { window.util.log('⚠️ 上次崩溃: ' + JSON.parse(crash).msg); } catch(e){} }
+    if (crash) { 
+        try { 
+            const c = JSON.parse(crash);
+            window.util.log(`⚠️上次崩溃: ${c.msg} (${c.time})`); 
+        } catch(e){} 
+    }
   }, 1000);
 }
