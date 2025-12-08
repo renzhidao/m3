@@ -1,9 +1,9 @@
 /**
  * 全局常量与配置定义
- * P2P Stream Edition - MaxSpeed
+ * P2P Stream Edition - Stable
  */
 
-export const APP_VERSION = '2.4.0-Trace'; // 更新版本号
+export const APP_VERSION = '2.5.0-Media'; // 更新版本号
 
 export const MSG_TYPE = {
   PING: 'PING',         

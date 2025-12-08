@@ -1,12 +1,12 @@
 import { MSG_TYPE, CHAT, NET_PARAMS } from './constants.js';
 
 /**
- * Smart Core v2.4.2 - Debug Trace Mode
- * 增强：发送方日志全开，监控请求接收与处理状态
+ * Smart Core v2.4.3 - Stable Download
+ * 改进：小文件(<20MB)采用 Fetch+Blob 缓冲下载，避免断流
  */
 
 export function init() {
-  if (window.monitor) window.monitor.info('Core', 'Smart Core v2.4.2 (Debug) 启动');
+  if (window.monitor) window.monitor.info('Core', 'Smart Core v2.4.3 (Stable) 启动');
 
   window.virtualFiles = new Map(); 
   window.remoteFiles = new Map();  
@@ -25,22 +25,48 @@ export function init() {
   window.smartCore = {
       handleBinary: (data, fromPeerId) => handleIncomingBinary(data, fromPeerId),
       
-      download: (fileId, fileName) => {
+      download: async (fileId, fileName) => {
+          // 1. 本地已有
           if (window.virtualFiles.has(fileId)) {
-              if(window.monitor) window.monitor.info('STEP', `[Local] 本地直接下载: ${fileName}`);
+              if(window.monitor) window.monitor.info('UI', `[Local] 本地导出: ${fileName}`);
               const file = window.virtualFiles.get(fileId);
-              const url = URL.createObjectURL(file);
-              const a = document.createElement('a');
-              a.href = url;
-              a.download = fileName;
-              document.body.appendChild(a);
-              a.click();
-              document.body.removeChild(a);
-              setTimeout(() => URL.revokeObjectURL(url), 10000);
+              if (window.ui && window.ui.downloadBlob) {
+                  window.ui.downloadBlob(file, fileName);
+              } else {
+                  // Fallback
+                  const url = URL.createObjectURL(file);
+                  const a = document.createElement('a'); a.href = url; a.download = fileName;
+                  document.body.appendChild(a); a.click(); document.body.removeChild(a);
+              }
               return;
           }
           
-          if(window.monitor) window.monitor.info('STEP', `[Start] 请求远程下载: ${fileName}`);
+          const meta = window.smartMetaCache.get(fileId);
+          const size = meta ? meta.fileSize : 0;
+          
+          // 2. 小文件（< 20MB）：Fetch 缓冲模式
+          if (size > 0 && size < 20 * 1024 * 1024) {
+              if(window.monitor) window.monitor.info('UI', `[Smart] 正在缓冲小文件 (${(size/1024/1024).toFixed(1)}MB)...`);
+              window.util.log(`⏳ 正在缓冲: ${fileName} ...`);
+              
+              try {
+                  const url = `/virtual/file/${fileId}/${encodeURIComponent(fileName)}`;
+                  const res = await fetch(url);
+                  if (!res.ok) throw new Error(`Stream Error ${res.status}`);
+                  const blob = await res.blob();
+                  window.util.log(`✅ 缓冲完成，开始保存`);
+                  if (window.ui && window.ui.downloadBlob) {
+                      window.ui.downloadBlob(blob, fileName);
+                  }
+              } catch(e) {
+                  window.util.log(`❌ 下载失败: ${e.message}`);
+                  if(window.monitor) window.monitor.error('UI', `缓冲失败`, e);
+              }
+              return;
+          }
+          
+          // 3. 大文件：流式下载
+          if(window.monitor) window.monitor.info('UI', `[Start] 启动流式下载: ${fileName}`);
           const url = `/virtual/file/${fileId}/${encodeURIComponent(fileName)}`;
           const a = document.createElement('a');
           a.href = url;
@@ -82,37 +108,25 @@ export function init() {
 function flowSend(conn, data, callback) {
     if (!conn || !conn.open) return callback(new Error('Connection Closed'));
     
-    // JSON 信令直通
     if (!(data instanceof ArrayBuffer || data instanceof Uint8Array)) {
         try { conn.send(data); callback(null); } catch(e) { callback(e); }
         return;
     }
 
     const dc = conn.dataChannel;
-    // 如果拿不到底层通道，硬发
     if (!dc || typeof dc.bufferedAmount !== 'number') {
         try { conn.send(data); callback(null); } catch(e) { callback(e); }
         return;
     }
 
-    // 轮询检查函数
     const attempt = () => {
         if (!conn.open) return callback(new Error('Closed during send'));
-        
-        // 1.5MB 水位线
         if (dc.bufferedAmount < 1.5 * 1024 * 1024) {
-            try { 
-                conn.send(data); 
-                callback(null); 
-            } catch(e) { 
-                callback(e); 
-            }
+            try { conn.send(data); callback(null); } catch(e) { callback(e); }
         } else {
-            // 堵了，过 50ms 再看
             setTimeout(attempt, 50);
         }
     };
-
     attempt();
 }
 
@@ -354,23 +368,19 @@ function handleIncomingBinary(rawBuffer, fromPeerId) {
     } catch(e) {}
 }
 
-// === 修改：详细打印所有收到的请求 ===
 function handleSmartGet(pkt, requesterId) {
     const file = window.virtualFiles.get(pkt.fileId);
     
-    // 1. 文件校验报警
     if (!file) {
-        if(window.monitor) window.monitor.warn('Serve', `❌ 拒绝请求: 无此文件 (可能已刷新页面)`, {fileId: pkt.fileId.slice(0,6)});
+        if(window.monitor) window.monitor.warn('Serve', `❌ 拒绝请求: 无此文件`, {fileId: pkt.fileId.slice(0,6)});
         return;
     }
 
     const conn = window.state.conns[requesterId];
     if (!conn || !conn.open) {
-        if(window.monitor) window.monitor.warn('Serve', `❌ 无法响应: 目标连接已断开`, {target: requesterId.slice(0,4)});
         return;
     }
     
-    // 2. 打印每一个请求 (Debug模式全开)
     if(window.monitor) {
         window.monitor.info('Serve', `📥 处理请求: Offset ${pkt.offset} (Size ${pkt.size})`, {to: requesterId.slice(0,4)});
     }
@@ -396,7 +406,6 @@ function handleSmartGet(pkt, requesterId) {
             if (err) {
                 if (window.monitor) window.monitor.warn('Serve', `❌ 发送失败: ${err.message}`);
             }
-            // 成功时不打印，避免日志量翻倍 (请求日志已经证明开始处理了)
         });
     };
     reader.readAsArrayBuffer(blob);
