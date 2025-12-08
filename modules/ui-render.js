@@ -135,12 +135,15 @@ export function init() {
              // 别人发的，默认认为是活的（依赖P2P）
              let streamUrl = window.smartCore.play(meta.fileId, meta.fileName);
              
-             if (isMe && !streamUrl) {
-                 // 本地发送方，且文件对象已死 -> 显示过期
+             // 检查是否已标记过期
+             const isExpired = (window.smartCore && window.smartCore.expiredFiles && window.smartCore.expiredFiles.has(meta.fileId));
+             
+             if (isExpired || (isMe && !streamUrl)) {
+                 // 已过期或本地丢失
                  content = `
                  <div class="file-expired">
                      <div style="font-weight:bold">❌ ${window.util.escape(meta.fileName)}</div>
-                     <div>文件引用已失效 (请重新发送)</div>
+                     <div>${isExpired ? '发送方不在线或已过期' : '文件引用已失效 (请重新发送)'}</div>
                  </div>`;
                  style = 'background:transparent;padding:0;border:none';
              } else {
@@ -152,7 +155,7 @@ export function init() {
                      const errScript = `this.style.display='none';this.nextElementSibling.style.display='block';`;
                      
                      content = `
-                     <div class="stream-card">
+                     <div class="stream-card" data-file-id="${meta.fileId}">
                          <div style="font-weight:bold;color:#4ea8ff">🎬 ${window.util.escape(meta.fileName)}</div>
                          <div style="font-size:11px;color:#aaa;margin-bottom:8px">${sizeStr} (流式直连)</div>
                          
@@ -171,7 +174,7 @@ export function init() {
                      style = 'background:transparent;padding:0;border:none';
                  } else if (isAudio) {
                      content = `
-                     <div class="stream-card">
+                     <div class="stream-card" data-file-id="${meta.fileId}">
                          <div style="font-weight:bold;color:#4ea8ff">🎵 ${window.util.escape(meta.fileName)}</div>
                          <div style="font-size:11px;color:#aaa;margin-bottom:8px">${sizeStr} (流式音频)</div>
                          <audio controls src="${streamUrl}" style="width:100%;max-width:260px;height:40px;margin-top:4px"></audio>
@@ -182,14 +185,14 @@ export function init() {
                      style = 'background:transparent;padding:0;border:none';
                  } else if (isImg) {
                      content = `
-                     <div class="stream-card">
+                     <div class="stream-card" data-file-id="${meta.fileId}">
                          <img src="${streamUrl}" class="chat-img" style="max-width:200px;border-radius:4px;display:block">
                          <div style="font-size:10px;color:#aaa;margin-top:4px">${sizeStr}</div>
                      </div>`;
                      style = 'background:transparent;padding:0;border:none';
                  } else {
                      content = `
-                     <div class="stream-card">
+                     <div class="stream-card" data-file-id="${meta.fileId}">
                          <div style="font-weight:bold;color:#fff">📄 ${window.util.escape(meta.fileName)}</div>
                          <div style="font-size:11px;color:#aaa;margin:4px 0">${sizeStr}</div>
                          <a href="javascript:void(0)" onclick="window.smartCore.download('${meta.fileId}','${window.util.escape(meta.fileName)}')"
@@ -225,6 +228,24 @@ export function init() {
       }
     },
     
+    markExpired(fileId) {
+        // 查找所有关联该文件的卡片（包括视频、音频、文件）
+        const cards = document.querySelectorAll(`.stream-card[data-file-id="${fileId}"]`);
+        cards.forEach(card => {
+            const parent = card.closest('.msg-bubble');
+            if (parent) {
+                parent.style.background = 'transparent';
+                parent.style.padding = '0';
+                parent.style.border = 'none';
+                parent.innerHTML = `
+                  <div class="file-expired">
+                      <div style="font-weight:bold">❌ 文件已过期</div>
+                      <div>发送方不在线或已清除 (超时)</div>
+                  </div>`;
+            }
+        });
+    },
+
     downloadBlob(data, name) {
         try {
             let url;

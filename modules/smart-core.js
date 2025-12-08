@@ -24,6 +24,7 @@ export function init() {
   }
 
   window.smartCore = {
+      expiredFiles: new Set(),
       handleBinary: (data, fromPeerId) => handleIncomingBinary(data, fromPeerId),
       
       // === 修复：显式增加下载参数 ===
@@ -197,6 +198,26 @@ function startStreamTask(req) {
     
     if (task.peers.length === 0) {
         window.protocol.flood({ t: 'SMART_WHO_HAS', fileId });
+        
+        // === 新增：3秒超时判定 ===
+        setTimeout(() => {
+            const t = window.activeStreams.get(requestId);
+            if (t && t.peers.length === 0) {
+                if(window.monitor) window.monitor.warn('Core', `文件超时未找到: ${fileId}`);
+                
+                // 1. 标记过期
+                if (window.smartCore.expiredFiles) window.smartCore.expiredFiles.add(fileId);
+                
+                // 2. 终止 HTTP 请求 (404/410)
+                sendToSW({ type: 'STREAM_ERROR', requestId, msg: 'Expired/Offline' });
+                stopStreamTask(requestId);
+                
+                // 3. 通知 UI 变身
+                if (window.ui && window.ui.markExpired) {
+                    window.ui.markExpired(fileId);
+                }
+            }
+        }, 3000);
     } else {
         pumpStream(task);
     }
@@ -527,6 +548,9 @@ function applyHooks() {
         }
         
         if (pkt.t === 'SMART_I_HAVE') {
+            // 既然有人有了，就从过期列表移除
+            if (window.smartCore.expiredFiles) window.smartCore.expiredFiles.delete(pkt.fileId);
+
             if (!window.remoteFiles.has(pkt.fileId)) window.remoteFiles.set(pkt.fileId, new Set());
             window.remoteFiles.get(pkt.fileId).add(fromPeerId);
             
