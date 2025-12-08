@@ -1,14 +1,12 @@
 import { MSG_TYPE, CHAT, NET_PARAMS } from './constants.js';
 
 /**
- * Smart Core v2.4.1 - Log Folding & Polling Flow
- * 修复：
- * 1. 日志折叠：Watchdog 超时日志合并显示，不再刷屏
- * 2. 暴力流控：使用 setTimeout 轮询替代 bufferedamountlow 事件，兼容性更强
+ * Smart Core v2.4.2 - Debug Trace Mode
+ * 增强：发送方日志全开，监控请求接收与处理状态
  */
 
 export function init() {
-  if (window.monitor) window.monitor.info('Core', 'Smart Core v2.4.1 (LogFold) 启动');
+  if (window.monitor) window.monitor.info('Core', 'Smart Core v2.4.2 (Debug) 启动');
 
   window.virtualFiles = new Map(); 
   window.remoteFiles = new Map();  
@@ -81,7 +79,6 @@ export function init() {
   applyHooks();
 }
 
-// === 核心修改：暴力轮询流控 (更稳) ===
 function flowSend(conn, data, callback) {
     if (!conn || !conn.open) return callback(new Error('Connection Closed'));
     
@@ -111,7 +108,7 @@ function flowSend(conn, data, callback) {
                 callback(e); 
             }
         } else {
-            // 堵了，过 50ms 再看 (不依赖 unreliable 的事件)
+            // 堵了，过 50ms 再看
             setTimeout(attempt, 50);
         }
     };
@@ -294,10 +291,9 @@ function pumpStream(task) {
     }
 }
 
-// === 核心修改：日志折叠 ===
 function watchdog() {
     const now = Date.now();
-    let timeoutCount = 0; // 统计超时数量
+    let timeoutCount = 0; 
     
     window.activeStreams.forEach(task => {
         let needsPump = false;
@@ -306,14 +302,13 @@ function watchdog() {
                 task.inflight.delete(offset);
                 task.missing.add(offset);
                 needsPump = true;
-                timeoutCount++; // 计数，不打印
+                timeoutCount++; 
             }
         });
         if (task.inflight.size === 0 && !task.finished) needsPump = true;
         if (needsPump) pumpStream(task); 
     });
     
-    // 汇总打印
     if (timeoutCount > 0 && window.monitor) {
         window.monitor.warn('Timeout', `⚠️ 有 ${timeoutCount} 个数据块请求超时 (正在重试)`);
     }
@@ -359,14 +354,26 @@ function handleIncomingBinary(rawBuffer, fromPeerId) {
     } catch(e) {}
 }
 
+// === 修改：详细打印所有收到的请求 ===
 function handleSmartGet(pkt, requesterId) {
     const file = window.virtualFiles.get(pkt.fileId);
-    if (!file) return;
+    
+    // 1. 文件校验报警
+    if (!file) {
+        if(window.monitor) window.monitor.warn('Serve', `❌ 拒绝请求: 无此文件 (可能已刷新页面)`, {fileId: pkt.fileId.slice(0,6)});
+        return;
+    }
 
     const conn = window.state.conns[requesterId];
-    if (!conn || !conn.open) return;
+    if (!conn || !conn.open) {
+        if(window.monitor) window.monitor.warn('Serve', `❌ 无法响应: 目标连接已断开`, {target: requesterId.slice(0,4)});
+        return;
+    }
     
-    if(window.monitor && pkt.offset === 0) window.monitor.info('STEP', `[STEP 6a] 收到对方下载请求`, {peer: requesterId.slice(0,4)});
+    // 2. 打印每一个请求 (Debug模式全开)
+    if(window.monitor) {
+        window.monitor.info('Serve', `📥 处理请求: Offset ${pkt.offset} (Size ${pkt.size})`, {to: requesterId.slice(0,4)});
+    }
     
     const blob = file.slice(pkt.offset, pkt.offset + pkt.size);
     const reader = new FileReader();
@@ -386,9 +393,10 @@ function handleSmartGet(pkt, requesterId) {
         packet.set(new Uint8Array(raw), 1 + headerLen);
         
         flowSend(conn, packet, (err) => {
-            if (err && window.monitor) {
-                window.monitor.warn('Serve', `[STEP 6 Fail] 流控发送失败: ${err.message}`);
+            if (err) {
+                if (window.monitor) window.monitor.warn('Serve', `❌ 发送失败: ${err.message}`);
             }
+            // 成功时不打印，避免日志量翻倍 (请求日志已经证明开始处理了)
         });
     };
     reader.readAsArrayBuffer(blob);
