@@ -1,22 +1,19 @@
 import { MSG_TYPE, CHAT } from './constants.js';
 
 /**
- * Smart Core v22 - Final Robust
- * 修复：死锁重传、内存水位、类型安全、元数据恢复
+ * Smart Core v24 - Final Polish
+ * 修复：高水位死锁、提升块大小至 64KB、IO 错误捕获
  */
 
 export function init() {
-  console.log('📦 加载模块: Smart Core v22 (Final)');
+  if (window.monitor) window.monitor.info('Core', 'Smart Core v24 (HighPerf) 启动');
 
   window.virtualFiles = new Map(); 
   window.remoteFiles = new Map();  
   window.smartMetaCache = new Map(); 
   window.activeStreams = new Map(); 
   
-  // 启动全局看门狗 (处理超时)
   setInterval(watchdog, 1000);
-
-  // 恢复历史元数据
   setTimeout(restoreMetaFromDB, 1000);
 
   if ('serviceWorker' in navigator) {
@@ -26,6 +23,7 @@ export function init() {
   window.smartCore = {
       handleBinary: (data, fromPeerId) => handleIncomingBinary(data, fromPeerId),
       download: (fileId, fileName) => {
+          if(window.monitor) window.monitor.info('UI', `用户请求下载: ${fileName}`);
           const url = `/virtual/file/${fileId}/${encodeURIComponent(fileName)}`;
           const a = document.createElement('a');
           a.href = url;
@@ -54,7 +52,7 @@ async function restoreMetaFromDB() {
                 restored++;
             }
         });
-        if (restored > 0) console.log(`♻️ 恢复元数据: ${restored}`);
+        if (restored > 0 && window.monitor) window.monitor.info('DB', `恢复历史元数据: ${restored}条`);
     } catch(e) {}
 }
 
@@ -66,17 +64,17 @@ function handleSWMessage(event) {
     else if (d.type === 'STREAM_CANCEL') stopStreamTask(d.requestId);
 }
 
-// === 任务管理 ===
-
-const CHUNK_SIZE = 16 * 1024; 
-const MAX_INFLIGHT = 32; // 提高并发
+// === 核心参数调整 ===
+// Fix 3: 提升至 64KB 以加速起播 (现代 WebRTC 支持)
+const CHUNK_SIZE = 64 * 1024; 
+const MAX_INFLIGHT = 32; 
 const TIMEOUT_MS = 5000;
-const HIGH_WATER_MARK = 50 * 1024 * 1024; // 50MB 乱序缓冲上限
+const HIGH_WATER_MARK = 50 * 1024 * 1024; 
 
 function startStreamTask(req) {
     const { requestId, fileId, range } = req;
+    if(window.monitor) window.monitor.info('Task', `新建流任务: ${requestId.slice(0,4)}`, {range});
     
-    // 本地文件直接处理
     if (window.virtualFiles.has(fileId)) {
         serveLocalFile(req);
         return;
@@ -84,11 +82,11 @@ function startStreamTask(req) {
 
     const meta = window.smartMetaCache.get(fileId);
     if (!meta) {
+        if(window.monitor) window.monitor.error('Task', '元数据丢失，无法开始任务', {fileId});
         sendToSW({ type: 'STREAM_ERROR', requestId, msg: 'Meta Not Found' });
         return;
     }
 
-    // Range 解析
     let start = 0;
     let end = meta.fileSize - 1;
     if (range && range.startsWith('bytes=')) {
@@ -114,7 +112,6 @@ function startStreamTask(req) {
         start, end
     });
 
-    // 创建任务状态机
     const task = {
         requestId,
         fileId,
@@ -124,11 +121,11 @@ function startStreamTask(req) {
         nextReq: start, 
         peers: Array.from(window.remoteFiles.get(fileId) || []),
         
-        buffer: new Map(),     // offset -> data (乱序暂存)
-        bufferBytes: 0,        // 内存水位监控
+        buffer: new Map(),     
+        bufferBytes: 0,        
         
-        inflight: new Map(),   // offset -> timestamp (超时监控)
-        missing: new Set(),    // offset (重传队列)
+        inflight: new Map(),   
+        missing: new Set(),    
         
         finished: false
     };
@@ -136,6 +133,7 @@ function startStreamTask(req) {
     window.activeStreams.set(requestId, task);
     
     if (task.peers.length === 0) {
+        if(window.monitor) window.monitor.warn('Swarm', '无可用节点，广播寻找中...');
         window.protocol.flood({ t: 'SMART_WHO_HAS', fileId });
     } else {
         pumpStream(task);
@@ -143,6 +141,7 @@ function startStreamTask(req) {
 }
 
 function stopStreamTask(requestId) {
+    if(window.monitor) window.monitor.info('Task', `任务结束/取消: ${requestId.slice(0,4)}`);
     window.activeStreams.delete(requestId);
 }
 
@@ -152,12 +151,10 @@ function sendToSW(msg) {
     }
 }
 
-// === 核心调度 pumpStream ===
-
 function pumpStream(task) {
     if (task.finished || !window.activeStreams.has(task.requestId)) return;
     
-    // 1. 提交缓冲区中连续的数据
+    // 1. 提交数据
     while (task.buffer.has(task.cursor)) {
         const chunk = task.buffer.get(task.cursor);
         task.buffer.delete(task.cursor); 
@@ -170,43 +167,45 @@ function pumpStream(task) {
             sendToSW({ type: 'STREAM_END', requestId: task.requestId });
             task.finished = true;
             window.activeStreams.delete(task.requestId);
+            if(window.monitor) window.monitor.info('Task', `任务完成: ${task.requestId.slice(0,4)}`);
             return;
         }
     }
 
-    // 2. 水位检查 (Backpressure)
-    if (task.bufferBytes > HIGH_WATER_MARK) return; 
+    // Fix 1: 高水位检查前移到“新数据请求”前，但不能阻塞“重传”
+    const isHighWater = task.bufferBytes > HIGH_WATER_MARK;
+    if (isHighWater && window.monitor && Math.random() < 0.05) {
+        window.monitor.warn('Flow', '高水位，暂停获取新块', {bytes: task.bufferBytes});
+    }
 
-    // 3. 填充请求管道
     while (task.inflight.size < MAX_INFLIGHT) {
         if (task.peers.length === 0) break;
         
         let offset;
-        // 优先处理重传队列
+        // 优先重传（即使高水位也允许，因为重传能填坑，降低水位）
         if (task.missing.size > 0) {
             const it = task.missing.values();
             offset = it.next().value;
             task.missing.delete(offset);
-        } else if (task.nextReq <= task.end) {
+            if(window.monitor) window.monitor.warn('Retry', `重传块: ${offset}`);
+        } 
+        // 只有非高水位时，才请求新数据
+        else if (!isHighWater && task.nextReq <= task.end) {
             offset = task.nextReq;
             task.nextReq += CHUNK_SIZE;
         } else {
-            break; // 既没有重传的，也没有新的，等待中
+            break; 
         }
         
-        // 边界修正
         if (offset > task.end) continue;
         const size = Math.min(CHUNK_SIZE, task.end - offset + 1);
         
-        // 调度 Peer
         const peerId = task.peers[Math.floor(offset / CHUNK_SIZE) % task.peers.length];
         const conn = window.state.conns[peerId];
         
         if (conn && conn.open) {
-            // 类型安全的流控检查
             const buf = (conn.dataChannel && conn.dataChannel.bufferedAmount) || 0;
             if (buf > 1024 * 1024) { 
-                // 这个 Peer 堵住了，把 offset 放回重试队列
                 task.missing.add(offset); 
                 break; 
             }
@@ -221,33 +220,26 @@ function pumpStream(task) {
             
             task.inflight.set(offset, Date.now());
         } else {
-            // Peer 不可用，放回队列
             task.missing.add(offset);
         }
     }
 }
 
-// === 看门狗 (Watchdog) ===
-
 function watchdog() {
     const now = Date.now();
     window.activeStreams.forEach(task => {
         let hasTimeout = false;
-        
         task.inflight.forEach((ts, offset) => {
             if (now - ts > TIMEOUT_MS) {
-                // 超时：移除并加入重传
                 task.inflight.delete(offset);
                 task.missing.add(offset);
                 hasTimeout = true;
+                if(window.monitor) window.monitor.warn('Timeout', `块超时重置: ${offset}`);
             }
         });
-        
-        if (hasTimeout) pumpStream(task); // 触发重传
+        if (hasTimeout) pumpStream(task); 
     });
 }
-
-// === 二进制处理 ===
 
 function handleIncomingBinary(rawBuffer, fromPeerId) {
     let buffer = rawBuffer;
@@ -270,30 +262,29 @@ function handleIncomingBinary(rawBuffer, fromPeerId) {
             
             if (task.inflight.has(offset)) {
                 task.inflight.delete(offset);
-                
-                // 存入缓冲区
                 task.buffer.set(offset, body);
                 task.bufferBytes += body.byteLength;
-                
                 pumpStream(task);
             }
         }
     } catch(e) {
-        console.error('Bin Parse Error', e);
+        if(window.monitor) window.monitor.error('Proto', '二进制解析失败', e);
     }
 }
 
-// === 发送方逻辑 ===
-
 function handleSmartGet(pkt, requesterId) {
     const file = window.virtualFiles.get(pkt.fileId);
-    if (!file) return;
+    if (!file) {
+        // Fix 2: 找不到文件时，给个日志 (协议不支持回传错误，让接收端超时即可)
+        if(window.monitor) window.monitor.warn('IO', '收到请求但文件不存在', pkt);
+        return;
+    }
 
     const conn = window.state.conns[requesterId];
     if (!conn || !conn.open) return;
     
     const buf = (conn.dataChannel && conn.dataChannel.bufferedAmount) || 0;
-    if (buf > 2 * 1024 * 1024) return; // 丢包流控
+    if (buf > 2 * 1024 * 1024) return; 
 
     const blob = file.slice(pkt.offset, pkt.offset + pkt.size);
     const reader = new FileReader();
@@ -314,21 +305,23 @@ function handleSmartGet(pkt, requesterId) {
         
         conn.send(packet);
     };
+    // Fix 2: 捕获读取错误
+    reader.onerror = () => {
+        if(window.monitor) window.monitor.error('IO', '文件读取失败', {file: file.name, offset: pkt.offset});
+    };
     reader.readAsArrayBuffer(blob);
 }
 
-// 本地文件读取 (简版流式)
 function serveLocalFile(req) {
     const file = window.virtualFiles.get(req.fileId);
     const range = req.range;
     let start = 0;
     let end = file.size - 1;
-    // ... Range Parse (同 startStreamTask) ...
     if (range && range.startsWith('bytes=')) {
         const parts = range.replace('bytes=', '').split('-');
         if (parts[0]) start = parseInt(parts[0], 10);
         if (parts[1]) end = parseInt(parts[1], 10);
-    } // 简化展示，实际代码应完整解析
+    }
 
     sendToSW({ type: 'STREAM_META', requestId: req.requestId, fileSize: file.size, fileType: file.type, start, end });
 
@@ -388,10 +381,10 @@ function applyHooks() {
             if (!window.remoteFiles.has(pkt.fileId)) window.remoteFiles.set(pkt.fileId, new Set());
             window.remoteFiles.get(pkt.fileId).add(pkt.senderId);
             
-            // 死锁唤醒
             window.activeStreams.forEach(task => {
                 if (task.fileId === pkt.fileId && !task.peers.includes(pkt.senderId)) {
                     task.peers.push(pkt.senderId);
+                    if(window.monitor) window.monitor.info('Swarm', `发现新源: ${pkt.senderId.slice(0,4)}`);
                     pumpStream(task);
                 }
             });
@@ -419,6 +412,7 @@ function applyHooks() {
             window.activeStreams.forEach(task => {
                 if (task.fileId === pkt.fileId && !task.peers.includes(fromPeerId)) {
                     task.peers.push(fromPeerId);
+                    if(window.monitor) window.monitor.info('Swarm', `源上线: ${fromPeerId.slice(0,4)}`);
                     pumpStream(task);
                 }
             });

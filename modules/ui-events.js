@@ -1,13 +1,30 @@
 import { CHAT, UI_CONFIG } from './constants.js';
 
 export function init() {
-  console.log('📦 加载模块: UI Events (Stream Select)');
+  console.log('📦 加载模块: UI Events (Monitor)');
   
   window.uiEvents = {
     init() {
       this.bindClicks();
       this.bindMsgEvents(); 
       this.injectStyles();
+      this.addMonitorBtn();
+    },
+    
+    addMonitorBtn() {
+        // 在 Header 增加诊断按钮
+        const header = document.querySelector('.chat-header div:last-child');
+        if (header && !document.getElementById('btnMonitor')) {
+            const btn = document.createElement('div');
+            btn.className = 'btn-icon';
+            btn.id = 'btnMonitor';
+            btn.innerHTML = '🐞';
+            btn.title = '打开诊断面板';
+            btn.onclick = () => {
+                if(window.monitor) window.monitor.show();
+            };
+            header.prepend(btn);
+        }
     },
 
     injectStyles() {
@@ -25,7 +42,6 @@ export function init() {
     bindClicks() {
       const bind = (id, fn) => { const el = document.getElementById(id); if (el) el.onclick = fn; };
 
-      // 发送按钮
       bind('btnSend', () => {
         const el = document.getElementById('editor');
         if (el && el.innerText.trim()) {
@@ -34,7 +50,6 @@ export function init() {
         }
       });
 
-      // 开关日志
       bind('btnToggleLog', () => {
         const el = document.getElementById('miniLog');
         if (el) el.style.display = (el.style.display === 'flex') ? 'none' : 'flex';
@@ -60,7 +75,6 @@ export function init() {
         }
       });
 
-      // 设置面板
       bind('btnSettings', () => {
         document.getElementById('settings-panel').style.display = 'grid';
         document.getElementById('iptNick').value = window.state.myName;
@@ -77,7 +91,6 @@ export function init() {
         document.getElementById('settings-panel').style.display = 'none';
       });
 
-      // === 核心修改：文件选择逻辑 (Stream Select) ===
       bind('btnFile', () => document.getElementById('fileInput').click());
       const fi = document.getElementById('fileInput');
       if (fi) {
@@ -85,23 +98,20 @@ export function init() {
           const file = e.target.files[0];
           if (!file) return;
 
-          // 1. 立即反馈
           const editor = document.getElementById('editor');
           if (editor) editor.innerText = `⏳ 准备发送: ${file.name}`;
 
-          // 2. 直接发送元数据 (不读取内容)
-          // 传递 fileObj 给 protocol.sendMsg，由 hooks 拦截
           const kind = file.type.startsWith('image/') ? CHAT.KIND_IMAGE : CHAT.KIND_FILE;
           
           window.protocol.sendMsg(null, kind, {
-              fileObj: file, // 传递原生 File 对象
+              fileObj: file, 
               name: file.name,
               size: file.size,
               type: file.type
           });
           
           if (editor) editor.innerText = '';
-          window.util.log(`🚀 已分享文件: ${file.name} (流式)`);
+          if(window.monitor) window.monitor.info('UI', `选择文件: ${file.name}`);
           
           e.target.value = '';
         };

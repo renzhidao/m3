@@ -1,7 +1,7 @@
 import { MSG_TYPE, NET_PARAMS } from './constants.js';
 
 export function init() {
-  console.log('📦 加载模块: P2P (Binary Stream Support)');
+  console.log('📦 加载模块: P2P (Monitored)');
   const CFG = window.config;
 
   window.p2p = {
@@ -36,25 +36,20 @@ export function init() {
 
     start() {
       if (typeof Peer === 'undefined') {
-          if (!this._waitLogShown) {
-              window.util.log('[P2P] ⏳ Peer库未就绪，开始等待...');
-              this._waitLogShown = true;
-          }
           setTimeout(() => this.start(), 200);
           return;
       }
       
       if (window.state.peer && !window.state.peer.destroyed) return;
 
-      window.util.log(`[P2P] 🚀 正在启动 (流式增强版)... ID: ${window.state.myId}`);
+      if(window.monitor) window.monitor.info('P2P', `正在启动... ID: ${window.state.myId}`);
       try {
         const p = new Peer(window.state.myId, CFG.peer);
         
         p.on('open', id => {
           window.state.myId = id;
           window.state.peer = p;
-          window.util.log(`✅ 就绪: ${id.slice(0, 6)}`);
-          this._searchLogShown = false;
+          if(window.monitor) window.monitor.info('P2P', `✅ 就绪: ${id.slice(0, 6)}`);
           if (window.ui) window.ui.updateSelf();
           this.patrolHubs();
         });
@@ -62,16 +57,8 @@ export function init() {
         p.on('connection', conn => this.setupConn(conn));
         
         p.on('error', e => {
-          if (e.type === 'peer-unavailable') {
-              const deadId = e.message.replace('Could not connect to peer ', '');
-              if (deadId && window.state.conns[deadId]) {
-                  this._hardClose(window.state.conns[deadId]);
-                  delete window.state.conns[deadId];
-              }
-              return;
-          }
+          if(window.monitor) window.monitor.error('P2P', `错误: ${e.type}`, e);
           if (e.type === 'unavailable-id') {
-             window.util.log('⚠️ ID冲突，正在自动更换...');
              const newId = 'u_' + Math.random().toString(36).substr(2, 9);
              window.state.myId = newId;
              localStorage.setItem('p1_my_id', newId);
@@ -79,26 +66,20 @@ export function init() {
              return;
           }
           if (e.type === 'disconnected') {
-             if (!this._searchLogShown) {
-               window.util.log('📡 正在重连 P2P 网络...');
-               this._searchLogShown = true;
-             }
              p.reconnect();
              return;    
           }
-          
           if (['network', 'server-error', 'socket-error', 'socket-closed'].includes(e.type)) {
              setTimeout(() => this.start(), 5000);
           }
-          window.util.log('❌ P2P 错误: ' + e.type);
         });
       } catch (err) {
-        window.util.log('❌ P2P 初始化崩溃: ' + err.message);
+        if(window.monitor) window.monitor.fatal('P2P', `初始化崩溃: ${err.message}`);
       }
     },
 
     stop() {
-        window.util.log('🛑 [系统] 暂停 P2P 服务');
+        if(window.monitor) window.monitor.warn('P2P', '停止服务');
         if (window.state.peer) {
             try { window.state.peer.destroy(); } catch(e){}
             window.state.peer = null;
@@ -116,12 +97,6 @@ export function init() {
       if (this._connecting.has(id)) return;
       
       this._connecting.add(id);
-      
-      if (id.startsWith(NET_PARAMS.HUB_PREFIX)) {
-        window.util.log('🔍 寻找房主中...');
-      } else {
-        // window.util.log(`⚡ 发起P2P -> ${id.slice(0,15)}`);
-      }
       
       setTimeout(() => {
           this._connecting.delete(id);
@@ -163,7 +138,7 @@ export function init() {
         conn.lastPong = Date.now();
         conn.created = Date.now();
         
-        window.util.log(`✅ [P2P] 连接: ${pid.slice(0, 15)}`);
+        if(window.monitor) window.monitor.info('P2P', `连接建立: ${pid.slice(0, 8)}`);
         window.state.conns[pid] = conn;
         
         const list = Object.keys(window.state.conns);
@@ -183,7 +158,6 @@ export function init() {
         if (window.ui) { window.ui.renderList(); window.ui.updateSelf(); }
       });
 
-      // === 关键修改：支持二进制流路由 ===
       conn.on('data', d => this.handleData(d, conn));
       
       const onGone = () => {
@@ -200,7 +174,6 @@ export function init() {
     handleData(d, conn) {
       conn.lastPong = Date.now();
       
-      // === 1. 拦截二进制数据 (ArrayBuffer/Uint8Array) ===
       if (d instanceof ArrayBuffer || d instanceof Uint8Array || (d.buffer && d.buffer instanceof ArrayBuffer)) {
           if (window.smartCore && window.smartCore.handleBinary) {
               window.smartCore.handleBinary(d, conn.peer);
@@ -208,7 +181,6 @@ export function init() {
           return;
       }
       
-      // === 2. 常规 JSON 信令 ===
       if (!d || !d.t) return;
       
       if (d.t === MSG_TYPE.PING) { conn.send({ t: MSG_TYPE.PONG }); return; }
