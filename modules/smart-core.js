@@ -1,12 +1,12 @@
 import { MSG_TYPE, CHAT, NET_PARAMS } from './constants.js';
 
 /**
- * Smart Core v2.2.2 - Signaling Fix
- * 修复：即时发送信令因僵尸连接丢失的问题
+ * Smart Core v2.2.4 - Pure P2P Fix
+ * 回滚 MQTT，强化 P2P 广播可靠性
  */
 
 export function init() {
-  if (window.monitor) window.monitor.info('Core', 'Smart Core v2.2.2 (Targeting) 启动');
+  if (window.monitor) window.monitor.info('Core', 'Smart Core v2.2.4 (Pure P2P) 启动');
 
   window.virtualFiles = new Map(); 
   window.remoteFiles = new Map();  
@@ -361,8 +361,6 @@ function applyHooks() {
             const fileId = window.util.uuid();
             window.virtualFiles.set(fileId, file);
             
-            // === 修复：准确的 Target 设置 ===
-            // 如果是私聊，target 就是对方 ID；如果是群聊，target 是 Public
             const target = (window.state.activeChat && window.state.activeChat !== CHAT.PUBLIC_ID) 
                            ? window.state.activeChat 
                            : CHAT.PUBLIC_ID;
@@ -377,7 +375,7 @@ function applyHooks() {
                 senderId: window.state.myId,
                 n: window.state.myName,
                 ts: window.util.now(),
-                target: target,  // <--- 关键修改：不再强制 Public
+                target: target,  
                 ttl: NET_PARAMS.GOSSIP_SIZE
             };
             
@@ -401,7 +399,7 @@ function applyHooks() {
                 id: pkt.id || window.util.uuid(),
                 t: 'MSG', 
                 senderId: pkt.senderId,
-                target: pkt.target || CHAT.PUBLIC_ID, // 兼容旧版
+                target: pkt.target || CHAT.PUBLIC_ID, 
                 kind: 'SMART_FILE_UI', 
                 ts: pkt.ts,
                 n: pkt.n,
