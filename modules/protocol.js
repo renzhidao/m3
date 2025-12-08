@@ -1,12 +1,13 @@
 import { MSG_TYPE, NET_PARAMS, CHAT } from './constants.js';
 
 export function init() {
-  console.log('📦 加载模块: Protocol (Safe Mode)');
+  console.log('📦 加载模块: Protocol (Direct Mode)');
   
   window.protocol = {
     async sendMsg(txt, kind = CHAT.KIND_TEXT, fileInfo = null) {
       const now = window.util.now();
       
+      // 这里的 1秒5条 是为了防UI刷屏卡死，不是网络限速，保留
       if (now - window.state.lastMsgTime < 1000) {
         window.state.msgCount++;
         if (window.state.msgCount > 5) {
@@ -45,7 +46,6 @@ export function init() {
       if (!pkt || !pkt.id) return;
       
       if (pkt.t === 'SMART_GET') {
-           // Debug: 仅用于监控，不处理逻辑
            if(window.monitor) window.monitor.info('Proto', `📨 收到原始 GET 包: Offset ${pkt.offset}`, {from: fromPeerId ? fromPeerId.slice(0,4) : '?'});
       }
 
@@ -93,25 +93,10 @@ export function init() {
       
       Object.values(window.state.conns).forEach(conn => {
         if (conn.open && conn.peer !== excludePeerId) {
-          this.safeSend(conn, pkt);
+          // === 改回暴力直发，不做任何检查 ===
+          try { conn.send(pkt); } catch(e) {}
         }
       });
-    },
-
-    // === 新增：安全发送（带流控保护） ===
-    safeSend(conn, pkt) {
-        try {
-            const dc = conn.dataChannel;
-            // 如果缓冲区太满 (>2MB)，暂缓发送文本（直接丢弃或排队）
-            // 这里选择丢弃非关键包，防止阻塞文件流
-            if (dc && dc.bufferedAmount > 2 * 1024 * 1024) {
-                if (window.monitor) window.monitor.warn('Proto', `⚠️ 通道拥塞，跳过文本广播`, {to: conn.peer.slice(0,4)});
-                return;
-            }
-            conn.send(pkt);
-        } catch(e) {
-            // console.error(e);
-        }
     },
 
     async retryPending() {
@@ -130,14 +115,14 @@ export function init() {
           
           if (conn && conn.open) {
             try {
-                this.safeSend(conn, pkt);
+                // === 改回暴力直发 ===
+                conn.send(pkt);
                 sent = true;
                 if(window.monitor) window.monitor.info('Proto', `➡️ 直连发送: ${pkt.target.slice(0,4)}`);
             } catch(e) {
                 if(window.monitor) window.monitor.error('Proto', `发送失败`, e);
             }
           } else {
-            // if(window.monitor) window.monitor.warn('Proto', `⏳ 目标断开，等待重连: ${pkt.target.slice(0,4)}`);
             if (window.p2p) window.p2p.connectTo(pkt.target);
           }
         }

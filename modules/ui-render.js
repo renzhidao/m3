@@ -1,7 +1,7 @@
 import { CHAT, UI_CONFIG } from './constants.js';
 
 export function init() {
-  console.log('📦 加载模块: UI Render (Audio + SafeCheck)');
+  console.log('📦 加载模块: UI Render (Video Fix)');
   window.ui = window.ui || {};
   
   const style = document.createElement('style');
@@ -25,6 +25,9 @@ export function init() {
     .file-expired {
         opacity: 0.6; font-style: italic; font-size: 12px; color: #aaa;
         background: rgba(255,0,0,0.1); padding: 8px; border-radius: 4px;
+    }
+    .video-error {
+        color: #ff3b30; font-size: 11px; padding: 10px; text-align: center; border: 1px dashed #ff3b30; border-radius: 4px;
     }
   `;
   document.head.appendChild(style);
@@ -126,31 +129,39 @@ export function init() {
          const isImg = meta.fileType.startsWith('image');
          
          // === 存活检查 ===
-         // 如果是我发的消息，且虚拟文件已不存在（页面刷新丢失），则显示过期提示
          if (isMe && !window.virtualFiles.has(meta.fileId)) {
              content = `
              <div class="file-expired">
                  <div style="font-weight:bold">⚠️ ${window.util.escape(meta.fileName)}</div>
                  <div>文件句柄已丢失 (页面已刷新/后台释放)</div>
-                 <div style="font-size:10px;margin-top:4px">请重新选择文件发送</div>
              </div>`;
              style = 'background:transparent;padding:0;border:none';
          } else {
              const streamUrl = window.smartCore.play(meta.fileId, meta.fileName);
              
              if (isVideo) {
+                 // === 修复：增加 onerror 捕获 ===
+                 const errScript = `this.style.display='none';this.nextElementSibling.style.display='block';console.error('Video Error:', this.error)`;
+                 
                  content = `
                  <div class="stream-card">
                      <div style="font-weight:bold;color:#4ea8ff">🎬 ${window.util.escape(meta.fileName)}</div>
                      <div style="font-size:11px;color:#aaa;margin-bottom:8px">${sizeStr} (流式直连)</div>
-                     <video controls src="${streamUrl}" style="width:100%;max-width:300px;background:#000;border-radius:4px"></video>
+                     
+                     <video controls src="${streamUrl}" 
+                            style="width:100%;max-width:300px;background:#000;border-radius:4px"
+                            onerror="${errScript}"></video>
+                     
+                     <div class="video-error" style="display:none">
+                        ❌ 视频加载失败<br>可能原因: 文件损坏或编码不支持
+                     </div>
+
                      <div style="text-align:right;margin-top:4px">
                          <a href="javascript:void(0)" onclick="window.smartCore.download('${meta.fileId}','${window.util.escape(meta.fileName)}')" style="color:#aaa;font-size:10px;text-decoration:none">⬇ 保存本地</a>
                      </div>
                  </div>`;
                  style = 'background:transparent;padding:0;border:none';
              } else if (isAudio) {
-                 // === 新增：音频播放器 ===
                  content = `
                  <div class="stream-card">
                      <div style="font-weight:bold;color:#4ea8ff">🎵 ${window.util.escape(meta.fileName)}</div>

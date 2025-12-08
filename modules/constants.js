@@ -1,9 +1,9 @@
 /**
  * 全局常量与配置定义
- * P2P Stream Edition - Stable
+ * P2P Stream Edition - Unleashed
  */
 
-export const APP_VERSION = '2.5.0-Media'; // 更新版本号
+export const APP_VERSION = '2.5.2-Unleashed'; // 暴力直通版
 
 export const MSG_TYPE = {
   PING: 'PING',         

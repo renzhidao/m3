@@ -1,12 +1,12 @@
 import { MSG_TYPE, CHAT, NET_PARAMS } from './constants.js';
 
 /**
- * Smart Core v2.4.3 - Stable Download
- * 改进：小文件(<20MB)采用 Fetch+Blob 缓冲下载，避免断流
+ * Smart Core v2.4.6 - Agile Flow
+ * 改进：流控水位线降至 64KB，既保证视频满速，又允许文本随时插队
  */
 
 export function init() {
-  if (window.monitor) window.monitor.info('Core', 'Smart Core v2.4.3 (Stable) 启动');
+  if (window.monitor) window.monitor.info('Core', 'Smart Core v2.4.6 (Agile) 启动');
 
   window.virtualFiles = new Map(); 
   window.remoteFiles = new Map();  
@@ -26,14 +26,12 @@ export function init() {
       handleBinary: (data, fromPeerId) => handleIncomingBinary(data, fromPeerId),
       
       download: async (fileId, fileName) => {
-          // 1. 本地已有
           if (window.virtualFiles.has(fileId)) {
               if(window.monitor) window.monitor.info('UI', `[Local] 本地导出: ${fileName}`);
               const file = window.virtualFiles.get(fileId);
               if (window.ui && window.ui.downloadBlob) {
                   window.ui.downloadBlob(file, fileName);
               } else {
-                  // Fallback
                   const url = URL.createObjectURL(file);
                   const a = document.createElement('a'); a.href = url; a.download = fileName;
                   document.body.appendChild(a); a.click(); document.body.removeChild(a);
@@ -44,7 +42,6 @@ export function init() {
           const meta = window.smartMetaCache.get(fileId);
           const size = meta ? meta.fileSize : 0;
           
-          // 2. 小文件（< 20MB）：Fetch 缓冲模式
           if (size > 0 && size < 20 * 1024 * 1024) {
               if(window.monitor) window.monitor.info('UI', `[Smart] 正在缓冲小文件 (${(size/1024/1024).toFixed(1)}MB)...`);
               window.util.log(`⏳ 正在缓冲: ${fileName} ...`);
@@ -65,7 +62,6 @@ export function init() {
               return;
           }
           
-          // 3. 大文件：流式下载
           if(window.monitor) window.monitor.info('UI', `[Start] 启动流式下载: ${fileName}`);
           const url = `/virtual/file/${fileId}/${encodeURIComponent(fileName)}`;
           const a = document.createElement('a');
@@ -78,9 +74,11 @@ export function init() {
       
       play: (fileId, fileName) => {
           if (window.virtualFiles.has(fileId)) {
-              if(window.monitor) window.monitor.info('STEP', `[Local] 本地直接播放: ${fileName}`);
+              if(window.monitor) window.monitor.info('STEP', `[Local] 原生预览: ${fileName}`);
               const file = window.virtualFiles.get(fileId);
+              
               if (window.blobUrls.has(fileId)) return window.blobUrls.get(fileId);
+              
               const url = URL.createObjectURL(file);
               window.blobUrls.set(fileId, url);
               return url;
@@ -121,10 +119,11 @@ function flowSend(conn, data, callback) {
 
     const attempt = () => {
         if (!conn.open) return callback(new Error('Closed during send'));
-        if (dc.bufferedAmount < 1.5 * 1024 * 1024) {
+        // === 核心流控：保持极低水位 (64KB)，为文本消息留出空隙 ===
+        if (dc.bufferedAmount < 64 * 1024) {
             try { conn.send(data); callback(null); } catch(e) { callback(e); }
         } else {
-            setTimeout(attempt, 50);
+            setTimeout(attempt, 10);
         }
     };
     attempt();
@@ -377,9 +376,7 @@ function handleSmartGet(pkt, requesterId) {
     }
 
     const conn = window.state.conns[requesterId];
-    if (!conn || !conn.open) {
-        return;
-    }
+    if (!conn || !conn.open) return;
     
     if(window.monitor) {
         window.monitor.info('Serve', `📥 处理请求: Offset ${pkt.offset} (Size ${pkt.size})`, {to: requesterId.slice(0,4)});
@@ -403,9 +400,7 @@ function handleSmartGet(pkt, requesterId) {
         packet.set(new Uint8Array(raw), 1 + headerLen);
         
         flowSend(conn, packet, (err) => {
-            if (err) {
-                if (window.monitor) window.monitor.warn('Serve', `❌ 发送失败: ${err.message}`);
-            }
+            if (err && window.monitor) window.monitor.warn('Serve', `❌ 发送失败: ${err.message}`);
         });
     };
     reader.readAsArrayBuffer(blob);
@@ -465,7 +460,10 @@ function applyHooks() {
         if ((kind === CHAT.KIND_FILE || kind === CHAT.KIND_IMAGE) && fileInfo && fileInfo.fileObj) {
             const file = fileInfo.fileObj;
             const fileId = window.util.uuid();
+            
+            // Debug:
             window.virtualFiles.set(fileId, file);
+            if(window.monitor) window.monitor.info('Core', ` 内存注册文件: ${file.name}`, {fileId: fileId, size: file.size});
             
             const target = (window.state.activeChat && window.state.activeChat !== CHAT.PUBLIC_ID) 
                            ? window.state.activeChat 
