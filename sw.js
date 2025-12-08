@@ -1,4 +1,4 @@
-const CACHE_NAME = 'p1-stream-v1765180737'; // Auto-updated
+const CACHE_NAME = 'p1-stream-v1765197358'; // Auto-updated
 const CORE_ASSETS = [
   './',
   './index.html',

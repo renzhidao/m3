@@ -1,7 +1,7 @@
 import { MSG_TYPE, NET_PARAMS } from './constants.js';
 
 export function init() {
-  console.log(' 加载模块: P2P (Binary Mode)');
+  console.log(' 加载模块: P2P (Hybrid Mode)');
   const CFG = window.config;
 
   window.p2p = {
@@ -129,10 +129,9 @@ export function init() {
             delete window.state.conns[id];
         }
         
-        // === 关键修复：开启 binary 模式 ===
+        // === 修复：移除 serialization: 'binary'，使用默认混合模式 ===
         const conn = window.state.peer.connect(id, { 
-            reliable: true,
-            serialization: 'binary' 
+            reliable: true 
         });
         
         conn.created = window.util.now();

@@ -1,12 +1,12 @@
 import { MSG_TYPE, CHAT, NET_PARAMS } from './constants.js';
 
 /**
- * Smart Core v2.3.0 - Backpressure Flow Control
- * 修复：通过背压机制(Backpressure)解决视频传输丢包问题
+ * Smart Core v2.3.1 - Hybrid Flow Control
+ * 修复：信令走快速通道，文件流走背压通道
  */
 
 export function init() {
-  if (window.monitor) window.monitor.info('Core', 'Smart Core v2.3.0 (FlowControl) 启动');
+  if (window.monitor) window.monitor.info('Core', 'Smart Core v2.3.1 (Hybrid) 启动');
 
   window.virtualFiles = new Map(); 
   window.remoteFiles = new Map();  
@@ -53,31 +53,32 @@ export function init() {
   applyHooks();
 }
 
-// === 核心修复：流控发送函数 ===
+// === 修正版：混合流控发送函数 ===
 function flowSend(conn, data, callback) {
     if (!conn || !conn.open) return callback(new Error('Connection Closed'));
     
-    // 兼容普通对象发送
+    // 1. 如果是 JSON 信令，直接放行 (快速通道)
     if (!(data instanceof ArrayBuffer || data instanceof Uint8Array)) {
         try { conn.send(data); callback(null); } catch(e) { callback(e); }
         return;
     }
 
+    // 2. 如果是文件流 (二进制)，走背压检查
     const dc = conn.dataChannel;
-    // 如果没有 DataChannel (例如某些奇怪的兼容模式)，直接发
-    if (!dc) {
+    
+    // 容错：如果没有底层通道，或者 PeerJS 封装层屏蔽了 bufferedAmount
+    if (!dc || typeof dc.bufferedAmount !== 'number') {
         try { conn.send(data); callback(null); } catch(e) { callback(e); }
         return;
     }
 
-    // 1.5MB 水位线，参考高性能方案
+    // 1.5MB 水位线
     if (dc.bufferedAmount < 1.5 * 1024 * 1024) {
         try { conn.send(data); callback(null); } catch(e) { callback(e); }
         return;
     }
 
-    // === 堵塞时等待 ===
-    // 5秒熔断机制，防止死锁
+    // === 堵塞时等待 (5秒熔断) ===
     const timeout = setTimeout(() => {
         cleanup();
         callback(new Error('FlowControl Timeout (5s)'));
@@ -85,8 +86,7 @@ function flowSend(conn, data, callback) {
 
     const onLow = () => {
         cleanup();
-        // 递归重试
-        flowSend(conn, data, callback);
+        flowSend(conn, data, callback); // 递归重试
     };
 
     function cleanup() {
@@ -95,10 +95,13 @@ function flowSend(conn, data, callback) {
     }
 
     try {
-        dc.bufferedAmountLowThreshold = 64 * 1024; // 64KB 复位
+        // 尝试设置低水位阈值
+        if (dc.bufferedAmountLowThreshold === 0) {
+            dc.bufferedAmountLowThreshold = 64 * 1024;
+        }
         dc.addEventListener('bufferedamountlow', onLow);
     } catch(e) {
-        // 如果不支持事件，降级为延时重试
+        // 降级：轮询重试
         cleanup();
         setTimeout(() => flowSend(conn, data, callback), 50);
     }
@@ -127,8 +130,8 @@ function handleSWMessage(event) {
     else if (d.type === 'STREAM_CANCEL') stopStreamTask(d.requestId);
 }
 
-const CHUNK_SIZE = 32 * 1024; // 增加块大小到 32KB
-const MAX_INFLIGHT = 64;      // 减少并发数以配合流控
+const CHUNK_SIZE = 32 * 1024; 
+const MAX_INFLIGHT = 64; 
 const TIMEOUT_MS = 5000;
 const HIGH_WATER_MARK = 50 * 1024 * 1024; 
 
@@ -193,7 +196,7 @@ function startStreamTask(req) {
     window.activeStreams.set(requestId, task);
     
     if (task.peers.length === 0) {
-        if(window.monitor) window.monitor.warn('Swarm', '📡 无可用节点，广播搜寻...');
+        if(window.monitor) window.monitor.warn('Swarm', ' 无可用节点，广播搜寻...');
         window.protocol.flood({ t: 'SMART_WHO_HAS', fileId });
     } else {
         pumpStream(task);
@@ -256,7 +259,6 @@ function pumpStream(task) {
         const conn = window.state.conns[peerId];
         
         if (conn && conn.open) {
-            // === 修复：不再暴力检查 buf，交给发送端的 flowSend ===
             try {
                 conn.send({
                     t: 'SMART_GET',
@@ -338,17 +340,11 @@ function handleIncomingBinary(rawBuffer, fromPeerId) {
 
 function handleSmartGet(pkt, requesterId) {
     const file = window.virtualFiles.get(pkt.fileId);
-    if (!file) {
-        // 尝试从 input 恢复? 暂不支持
-        return;
-    }
+    if (!file) return;
 
     const conn = window.state.conns[requesterId];
     if (!conn || !conn.open) return;
     
-    // === 关键修复：移除暴力 return，改为流控发送 ===
-    // const buf = ... if (buf > 4M) return; // 删除了这行自杀代码
-
     const blob = file.slice(pkt.offset, pkt.offset + pkt.size);
     const reader = new FileReader();
     
@@ -366,7 +362,7 @@ function handleSmartGet(pkt, requesterId) {
         packet.set(headerBytes, 1);
         packet.set(new Uint8Array(raw), 1 + headerLen);
         
-        // 使用流控发送
+        // 使用流控发送 (这里 packet 是 Uint8Array，会触发 flowSend 的流控逻辑)
         flowSend(conn, packet, (err) => {
             if (err && window.monitor) {
                 window.monitor.warn('Serve', `流控发送失败: ${err.message}`);
