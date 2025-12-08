@@ -1,13 +1,12 @@
 import { MSG_TYPE, CHAT, NET_PARAMS } from './constants.js';
 
 /**
- * Smart Core v2.5.5 - Lossless Repair
- * 修复：1. 弱网丢包问题 (receivedOffsets)
- *       2. 重启后历史文件无法加载问题 (getRecentFiles)
+ * Smart Core v2.5.3 - Turbo Mode
+ * 改进：水位线恢复至 1.5MB，块大小翻倍，追求极致速度
  */
 
 export function init() {
-  if (window.monitor) window.monitor.info('Core', 'Smart Core v2.5.5 (Lossless) 启动');
+  if (window.monitor) window.monitor.info('Core', 'Smart Core v2.5.3 (Turbo) 启动');
 
   window.virtualFiles = new Map(); 
   window.remoteFiles = new Map();  
@@ -118,7 +117,7 @@ function flowSend(conn, data, callback) {
 
     const attempt = () => {
         if (!conn.open) return callback(new Error('Closed during send'));
-        // 维持高水位：1.5MB
+        // === 恢复高水位：1.5MB，让数据跑满 ===
         if (dc.bufferedAmount < 1.5 * 1024 * 1024) {
             try { conn.send(data); callback(null); } catch(e) { callback(e); }
         } else {
@@ -128,11 +127,9 @@ function flowSend(conn, data, callback) {
     attempt();
 }
 
-// 修复：使用专门的 getRecentFiles 接口，扫描范围扩大到200条
 async function restoreMetaFromDB() {
     try {
-        const msgs = await window.db.getRecentFiles(200);
-        let count = 0;
+        const msgs = await window.db.getRecent(50, 'all');
         msgs.forEach(m => {
             if (m.kind === 'SMART_FILE_UI' && m.meta) {
                 window.smartMetaCache.set(m.meta.fileId, m.meta);
@@ -140,13 +137,9 @@ async function restoreMetaFromDB() {
                    if (!window.remoteFiles.has(m.meta.fileId)) window.remoteFiles.set(m.meta.fileId, new Set());
                    window.remoteFiles.get(m.meta.fileId).add(m.senderId);
                 }
-                count++;
             }
         });
-        if(window.monitor && count > 0) window.monitor.info('Core', `⚡ 已恢复 ${count} 个历史文件元数据`);
-    } catch(e) {
-        console.error('Restore Meta Failed', e);
-    }
+    } catch(e) {}
 }
 
 function handleSWMessage(event) {
@@ -160,6 +153,7 @@ function handleSWMessage(event) {
     else if (d.type === 'STREAM_CANCEL') stopStreamTask(d.requestId);
 }
 
+// === 增大块大小：64KB，提升吞吐量 ===
 const CHUNK_SIZE = 64 * 1024; 
 const MAX_INFLIGHT = 64; 
 const TIMEOUT_MS = 5000;
@@ -176,7 +170,7 @@ function startStreamTask(req) {
 
     const meta = window.smartMetaCache.get(fileId);
     if (!meta) {
-        if(window.monitor) window.monitor.error('STEP', `❌ [STEP 4 Fail] 元数据丢失 (请确认发送方在线)`, {fileId});
+        if(window.monitor) window.monitor.error('STEP', `❌ [STEP 4 Fail] 元数据丢失`, {fileId});
         sendToSW({ type: 'STREAM_ERROR', requestId, msg: 'Meta Not Found' });
         return;
     }
@@ -215,8 +209,7 @@ function startStreamTask(req) {
         peers: Array.from(window.remoteFiles.get(fileId) || []),
         buffer: new Map(),     
         bufferBytes: 0,        
-        inflight: new Map(),
-        receivedOffsets: new Set(), // 新增：已接收偏移量记录 (防丢包)
+        inflight: new Map(),   
         missing: new Set(),    
         finished: false,
         stalledCount: 0
@@ -283,10 +276,6 @@ function pumpStream(task) {
         }
         
         if (offset > task.end) continue;
-        
-        // 双重检查：如果已经收到了，就不用请求了
-        if (task.receivedOffsets.has(offset)) continue;
-
         const size = Math.min(CHUNK_SIZE, task.end - offset + 1);
         
         const peerId = task.peers[Math.floor(offset / CHUNK_SIZE) % task.peers.length];
@@ -332,9 +321,8 @@ function watchdog() {
         if (needsPump) pumpStream(task); 
     });
     
-    // 只在超时严重时报警
-    if (timeoutCount > 5 && window.monitor) {
-        window.monitor.warn('Timeout', `⚠️ 正在重试 ${timeoutCount} 个超时块...`);
+    if (timeoutCount > 0 && window.monitor) {
+        window.monitor.warn('Timeout', `⚠️ 有 ${timeoutCount} 个数据块请求超时 (正在重试)`);
     }
     
     window.pendingAcks.forEach((meta, id) => {
@@ -368,12 +356,8 @@ function handleIncomingBinary(rawBuffer, fromPeerId) {
             const body = buffer.slice(1 + headerLen);
             const offset = header.offset; 
             
-            // 修复核心：只要是我还没收到的，统统收下！
-            // 不再判断 inflight.has(offset)，彻底解决迟到丢包问题
-            if (!task.receivedOffsets.has(offset)) {
-                task.receivedOffsets.add(offset); // 标记为已接收
-                task.inflight.delete(offset);     // 如果在等待列表里，移除它
-                
+            if (task.inflight.has(offset)) {
+                task.inflight.delete(offset);
                 task.buffer.set(offset, body);
                 task.bufferBytes += body.byteLength;
                 pumpStream(task);
@@ -394,10 +378,7 @@ function handleSmartGet(pkt, requesterId) {
     if (!conn || !conn.open) return;
     
     if(window.monitor) {
-        // 降低日志频率，每10个请求打一条
-        if (Math.random() < 0.1) {
-             window.monitor.info('Serve', `📥 正在上传...`, {to: requesterId.slice(0,4)});
-        }
+        window.monitor.info('Serve', `📥 处理请求: Offset ${pkt.offset} (Size ${pkt.size})`, {to: requesterId.slice(0,4)});
     }
     
     const blob = file.slice(pkt.offset, pkt.offset + pkt.size);
