@@ -1,12 +1,12 @@
 import { MSG_TYPE, CHAT } from './constants.js';
 
 /**
- * Smart Core v25 - Loop Fix
- * 修复：泛洪死循环、去重逻辑增强
+ * Smart Core v26 - Loop Fix Final
+ * 修复：发送方回环刷屏、自我识别漏洞
  */
 
 export function init() {
-  if (window.monitor) window.monitor.info('Core', 'Smart Core v25 (LoopFix) 启动');
+  if (window.monitor) window.monitor.info('Core', 'Smart Core v26 (FixSelfLoop) 启动');
 
   window.virtualFiles = new Map(); 
   window.remoteFiles = new Map();  
@@ -44,7 +44,6 @@ async function restoreMetaFromDB() {
         let restored = 0;
         msgs.forEach(m => {
             if (m.kind === 'SMART_FILE_UI' && m.meta) {
-                // 恢复时不触发泛洪
                 window.smartMetaCache.set(m.meta.fileId, m.meta);
                 if (m.senderId !== window.state.myId) {
                    if (!window.remoteFiles.has(m.meta.fileId)) window.remoteFiles.set(m.meta.fileId, new Set());
@@ -344,7 +343,7 @@ function applyHooks() {
                 ts: window.util.now()
             };
             
-            // 发送前先缓存自己，防止被回环处理
+            // === 修复1：发送时立即缓存 ===
             window.smartMetaCache.set(fileId, meta);
             
             window.protocol.flood(meta);
@@ -357,21 +356,20 @@ function applyHooks() {
     const originalProcess = window.protocol.processIncoming;
     window.protocol.processIncoming = function(pkt, fromPeerId) {
         if (pkt.t === 'SMART_META') {
-            // === 核心修复：严格去重与防回环 ===
+            // === 修复2：过滤自己发回来的包 ===
+            if (pkt.senderId === window.state.myId) return;
+            
             if (window.smartMetaCache.has(pkt.fileId)) {
-                // 已存在（无论是自己发的还是收过的），直接更新源列表，不转发，不显示UI
                 if (!window.remoteFiles.has(pkt.fileId)) window.remoteFiles.set(pkt.fileId, new Set());
                 window.remoteFiles.get(pkt.fileId).add(pkt.senderId);
                 return;
             }
             
-            // 首次收到
             window.smartMetaCache.set(pkt.fileId, pkt);
             
             if (!window.remoteFiles.has(pkt.fileId)) window.remoteFiles.set(pkt.fileId, new Set());
             window.remoteFiles.get(pkt.fileId).add(pkt.senderId);
             
-            // 唤醒任务
             window.activeStreams.forEach(task => {
                 if (task.fileId === pkt.fileId && !task.peers.includes(pkt.senderId)) {
                     task.peers.push(pkt.senderId);
