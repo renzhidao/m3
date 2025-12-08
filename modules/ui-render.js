@@ -1,7 +1,7 @@
 import { CHAT, UI_CONFIG } from './constants.js';
 
 export function init() {
-  console.log('📦 加载模块: UI Render (Loose Check)');
+  console.log('📦 加载模块: UI Render (Safe Guard)');
   window.ui = window.ui || {};
   
   const style = document.createElement('style');
@@ -119,6 +119,7 @@ export function init() {
       if (!box || !m) return;
       if (document.getElementById('msg-' + m.id)) return;
 
+      // === 修复：Try-Catch 保护，防止一条坏消息渲染失败导致白屏 ===
       try {
           const isMe = m.senderId === window.state.myId;
           let content = '', style = '';
@@ -130,32 +131,23 @@ export function init() {
              const isAudio = meta.fileType.startsWith('audio');
              const isImg = meta.fileType.startsWith('image');
              
-             // === 修复：宽容检查 ===
-             // 只有是自己发的，才检查本地内存
-             // 别人发的，默认认为是活的（依赖P2P）
-             let streamUrl = window.smartCore.play(meta.fileId, meta.fileName);
+             // === 修复：存活检查 ===
+             // 即使是自己发的消息，如果浏览器内存回收了 File 对象，smartCore.play 会返回 null
+             const streamUrl = window.smartCore.play(meta.fileId, meta.fileName);
              
-             // 检查是否已标记过期
-             const isExpired = (window.smartCore && window.smartCore.expiredFiles && window.smartCore.expiredFiles.has(meta.fileId));
-             
-             if (isExpired || (isMe && !streamUrl)) {
-                 // 已过期或本地丢失
+             if (isMe && !streamUrl) {
                  content = `
                  <div class="file-expired">
                      <div style="font-weight:bold">❌ ${window.util.escape(meta.fileName)}</div>
-                     <div>${isExpired ? '发送方不在线或已过期' : '文件引用已失效 (请重新发送)'}</div>
+                     <div>文件引用已失效 (请重新发送)</div>
                  </div>`;
                  style = 'background:transparent;padding:0;border:none';
              } else {
-                 // 接收方 或者 本地存活 -> 正常渲染
-                 // 如果 streamUrl 为 null (理论上 smartCore.play 对非本地文件会返回 path)，这里兜底
-                 if (!streamUrl) streamUrl = `/virtual/file/${meta.fileId}/${encodeURIComponent(meta.fileName)}`;
-
                  if (isVideo) {
                      const errScript = `this.style.display='none';this.nextElementSibling.style.display='block';`;
                      
                      content = `
-                     <div class="stream-card" data-file-id="${meta.fileId}">
+                     <div class="stream-card">
                          <div style="font-weight:bold;color:#4ea8ff">🎬 ${window.util.escape(meta.fileName)}</div>
                          <div style="font-size:11px;color:#aaa;margin-bottom:8px">${sizeStr} (流式直连)</div>
                          
@@ -174,7 +166,7 @@ export function init() {
                      style = 'background:transparent;padding:0;border:none';
                  } else if (isAudio) {
                      content = `
-                     <div class="stream-card" data-file-id="${meta.fileId}">
+                     <div class="stream-card">
                          <div style="font-weight:bold;color:#4ea8ff">🎵 ${window.util.escape(meta.fileName)}</div>
                          <div style="font-size:11px;color:#aaa;margin-bottom:8px">${sizeStr} (流式音频)</div>
                          <audio controls src="${streamUrl}" style="width:100%;max-width:260px;height:40px;margin-top:4px"></audio>
@@ -185,14 +177,14 @@ export function init() {
                      style = 'background:transparent;padding:0;border:none';
                  } else if (isImg) {
                      content = `
-                     <div class="stream-card" data-file-id="${meta.fileId}">
+                     <div class="stream-card">
                          <img src="${streamUrl}" class="chat-img" style="max-width:200px;border-radius:4px;display:block">
                          <div style="font-size:10px;color:#aaa;margin-top:4px">${sizeStr}</div>
                      </div>`;
                      style = 'background:transparent;padding:0;border:none';
                  } else {
                      content = `
-                     <div class="stream-card" data-file-id="${meta.fileId}">
+                     <div class="stream-card">
                          <div style="font-weight:bold;color:#fff">📄 ${window.util.escape(meta.fileName)}</div>
                          <div style="font-size:11px;color:#aaa;margin:4px 0">${sizeStr}</div>
                          <a href="javascript:void(0)" onclick="window.smartCore.download('${meta.fileId}','${window.util.escape(meta.fileName)}')"
@@ -228,29 +220,11 @@ export function init() {
       }
     },
     
-    markExpired(fileId) {
-        // 查找所有关联该文件的卡片（包括视频、音频、文件）
-        const cards = document.querySelectorAll(`.stream-card[data-file-id="${fileId}"]`);
-        cards.forEach(card => {
-            const parent = card.closest('.msg-bubble');
-            if (parent) {
-                parent.style.background = 'transparent';
-                parent.style.padding = '0';
-                parent.style.border = 'none';
-                parent.innerHTML = `
-                  <div class="file-expired">
-                      <div style="font-weight:bold">❌ 文件已过期</div>
-                      <div>发送方不在线或已清除 (超时)</div>
-                  </div>`;
-            }
-        });
-    },
-
     downloadBlob(data, name) {
         try {
             let url;
             if (typeof data === 'string') {
-                if (data.startsWith('data:')) {
+                if (data.startsWith('')) {
                      const a = document.createElement('a');
                      a.href = data;
                      a.download = name;
