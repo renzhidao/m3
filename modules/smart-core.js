@@ -1,13 +1,12 @@
 import { MSG_TYPE, CHAT, NET_PARAMS } from './constants.js';
 
 /**
- * Smart Core v2.1.0 - MaxSpeed Edition
- * 修复：信令可靠化
- * 优化：移除所有人工限速，并发窗口最大化
+ * Smart Core v2.1.1 - Connection Trust
+ * 修复：发送文件时触发重连导致断网
  */
 
 export function init() {
-  if (window.monitor) window.monitor.info('Core', 'Smart Core v2.1.0 (MaxSpeed) 启动');
+  if (window.monitor) window.monitor.info('Core', 'Smart Core v2.1.1 (Trust) 启动');
 
   window.virtualFiles = new Map(); 
   window.remoteFiles = new Map();  
@@ -66,10 +65,10 @@ function handleSWMessage(event) {
 }
 
 // === 极致性能配置 ===
-const CHUNK_SIZE = 16 * 1024; // 16KB (物理稳定基石，不可改大)
-const MAX_INFLIGHT = 256;     // 并发 256 * 16KB = 4MB 在途数据，跑满带宽
+const CHUNK_SIZE = 16 * 1024; // 16KB
+const MAX_INFLIGHT = 256;     // 并发 256
 const TIMEOUT_MS = 5000;
-const HIGH_WATER_MARK = 50 * 1024 * 1024; // 50MB 缓冲水位
+const HIGH_WATER_MARK = 50 * 1024 * 1024; // 50MB
 
 function startStreamTask(req) {
     const { requestId, fileId, range } = req;
@@ -190,12 +189,14 @@ function pumpStream(task) {
         const size = Math.min(CHUNK_SIZE, task.end - offset + 1);
         
         const peerId = task.peers[Math.floor(offset / CHUNK_SIZE) % task.peers.length];
+        
+        // === 修复：直接信任现有连接，绝不触发 connectTo ===
         const conn = window.state.conns[peerId];
         
         if (conn && conn.open) {
-            // === 极限流控：只要缓冲区不满 1MB 就猛发 ===
             const buf = (conn.dataChannel && conn.dataChannel.bufferedAmount) || 0;
             if (buf > 1024 * 1024) { 
+                // 只是稍后重试，不重连！
                 task.missing.add(offset); 
                 break; 
             }
@@ -210,6 +211,10 @@ function pumpStream(task) {
             
             task.inflight.set(offset, Date.now());
         } else {
+            // 如果没连接，说明节点真的断了。
+            // 这里我们只标记缺失，让系统去 flood 寻找新节点，
+            // 或者等待 p2p.js 自动重连（如果它觉得需要的话）
+            // 绝对不要在这里手动调用 p2p.connectTo，防止死循环
             task.missing.add(offset);
         }
     }
@@ -266,7 +271,7 @@ function handleSmartGet(pkt, requesterId) {
     const conn = window.state.conns[requesterId];
     if (!conn || !conn.open) return;
     
-    // === 极限流控：发送端允许 4MB 积压 ===
+    // === 极限流控 ===
     const buf = (conn.dataChannel && conn.dataChannel.bufferedAmount) || 0;
     if (buf > 4 * 1024 * 1024) return; 
 
@@ -292,7 +297,6 @@ function handleSmartGet(pkt, requesterId) {
     reader.readAsArrayBuffer(blob);
 }
 
-// === 修复：本地全速读取 + 智能中断 ===
 function serveLocalFile(req) {
     const file = window.virtualFiles.get(req.fileId);
     const range = req.range;
@@ -307,13 +311,11 @@ function serveLocalFile(req) {
     sendToSW({ type: 'STREAM_META', requestId: req.requestId, fileSize: file.size, fileType: file.type, start, end });
 
     let offset = start;
-    const CHUNK = 1024 * 1024; // 本地读取仍保持 1MB 大块，效率最高
+    const CHUNK = 1024 * 1024; 
     
-    // 注册到 activeStreams 以便能被监测到取消
     window.activeStreams.set(req.requestId, { finished: false });
 
     function readLoop() {
-        // 智能中断检查：如果任务已被 cancel (从 activeStreams 中移除)，立即停止
         if (!window.activeStreams.has(req.requestId)) return;
 
         if (offset > end) {
@@ -325,14 +327,10 @@ function serveLocalFile(req) {
         const sliceEnd = Math.min(offset + CHUNK, end + 1);
         const reader = new FileReader();
         reader.onload = () => {
-             // 双重检查，防止异步期间被取消
              if (!window.activeStreams.has(req.requestId)) return;
              
              sendToSW({ type: 'STREAM_DATA', requestId: req.requestId, chunk: reader.result });
              offset += CHUNK;
-             
-             // === 移除延迟，全速递归 ===
-             // 使用 microtask 避免调用栈溢出，同时保持最高优先级
              queueMicrotask(readLoop);
         };
         reader.readAsArrayBuffer(file.slice(offset, sliceEnd));

@@ -1,7 +1,7 @@
 import { MSG_TYPE, NET_PARAMS, CHAT } from './constants.js';
 
 export function init() {
-  console.log('📦 加载模块: Protocol');
+  console.log(' 加载模块: Protocol (Strict-Conn)');
   
   window.protocol = {
     // 生成并发送消息
@@ -125,11 +125,15 @@ export function init() {
         } else {
           // 私聊消息：检查直连
           const conn = window.state.conns[pkt.target];
+          
+          // === 修复：互斥逻辑 ===
           if (conn && conn.open) {
+            // 只要连着，直接发，不 BB
             conn.send(pkt);
             sent = true;
           } else {
-            // 尝试建立连接（由 P2P 模块处理）
+            // 没连着，才去连
+            // 此时 p2p.js 的 connectTo 也会有防抖，但这里也加上判断
             if (window.p2p) window.p2p.connectTo(pkt.target);
           }
         }

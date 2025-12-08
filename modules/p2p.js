@@ -1,7 +1,7 @@
 import { MSG_TYPE, NET_PARAMS } from './constants.js';
 
 export function init() {
-  console.log('📦 加载模块: P2P (Quiet)');
+  console.log('📦 加载模块: P2P (Hard-Kill & Anti-Suicide)');
   const CFG = window.config;
 
   window.p2p = {
@@ -9,29 +9,42 @@ export function init() {
     _waitLogShown: false,
     _connecting: new Set(),
 
+    // === 修复：暴力端口释放 ===
     _hardClose(conn) {
       if (!conn) return;
+      
       const p = window.state.peer;
+      const pid = conn.peer;
+
+      // 1. 移除所有JS监听器，防止回调诈尸
       try { conn.removeAllListeners(); } catch(e){}
+      
+      // 2. 强制关闭 DataChannel
       try { conn.close(); } catch(e){}
+      
+      // 3. 深入底层：直接销毁 RTCPeerConnection，释放 UDP 端口
       try {
           if (conn.peerConnection) {
             conn.peerConnection.onnegotiationneeded = null;
             conn.peerConnection.onicecandidate = null;
             conn.peerConnection.ondatachannel = null;
-            conn.peerConnection.close();
+            conn.peerConnection.close(); // 这是释放端口的关键
+            conn.peerConnection = null;
          }
       } catch(e){}
       
-      if (p && p._connections && conn.peer) {
-          const list = p._connections.get(conn.peer);
+      // 4. 从 PeerJS 内部缓存中剔除
+      if (p && p._connections && pid) {
+          const list = p._connections.get(pid);
           if (list) {
               const idx = list.indexOf(conn);
               if (idx > -1) list.splice(idx, 1);
-              if (list.length === 0) p._connections.delete(conn.peer);
+              if (list.length === 0) p._connections.delete(pid);
           }
       }
-      conn.peerConnection = null;
+      
+      // 5. 显式 GC 标记
+      conn = null;
     },
 
     start() {
@@ -57,10 +70,9 @@ export function init() {
         p.on('connection', conn => this.setupConn(conn));
         
         p.on('error', e => {
-          // === Fix: 降噪处理 ===
           if (e.type === 'peer-unavailable') {
-              // 仅记录 info，不报错，不弹窗
-              if(window.monitor) window.monitor.info('P2P', `节点离线: ${e.message}`);
+              // 仅记录 info，不报错
+              // if(window.monitor) window.monitor.info('P2P', `节点离线: ${e.message}`);
               
               const deadId = e.message.replace('Could not connect to peer ', '');
               if (deadId && window.state.conns[deadId]) {
@@ -106,13 +118,20 @@ export function init() {
     connectTo(id) {
       if (!id || id === window.state.myId) return;
       if (!window.state.peer || window.state.peer.destroyed) return;
-      if (window.state.conns[id] && window.state.conns[id].open) return;
-      if (this._connecting.has(id)) return;
       
+      // === 修复：铁闸机制 ===
+      // 如果已经有活着的连接，绝对不要发起新的！防止自杀式重连
+      const existing = window.state.conns[id];
+      if (existing && existing.open) {
+          return;
+      }
+      
+      if (this._connecting.has(id)) return;
       this._connecting.add(id);
       
       setTimeout(() => {
           this._connecting.delete(id);
+          // 超时没连上，清理残骸
           const c = window.state.conns[id];
           if (c && !c.open) {
               this._hardClose(c);
@@ -121,9 +140,10 @@ export function init() {
       }, NET_PARAMS.CONN_TIMEOUT);
 
       try {
-        const oldConn = window.state.conns[id];
-        if (oldConn) {
-            this._hardClose(oldConn);
+        // === 修复：连接前先清理僵尸 ===
+        // 既然决定要连，说明旧连接肯定不行了（或者不存在），先杀干净
+        if (existing) {
+            this._hardClose(existing);
             delete window.state.conns[id];
         }
         
@@ -152,6 +172,11 @@ export function init() {
         conn.created = Date.now();
         
         if(window.monitor) window.monitor.info('P2P', `连接建立: ${pid.slice(0, 8)}`);
+        
+        // 覆盖旧连接（如果有）
+        if (window.state.conns[pid] && window.state.conns[pid] !== conn) {
+            this._hardClose(window.state.conns[pid]);
+        }
         window.state.conns[pid] = conn;
         
         const list = Object.keys(window.state.conns);
@@ -175,9 +200,12 @@ export function init() {
       
       const onGone = () => {
         this._connecting.delete(pid);
-        this._hardClose(conn);
-        delete window.state.conns[pid];
-        if (window.ui) { window.ui.renderList(); window.ui.updateSelf(); }
+        // 只有当这个 conn 确实是当前记录的 conn 时才清理，防止误删新连接
+        if (window.state.conns[pid] === conn) {
+            this._hardClose(conn);
+            delete window.state.conns[pid];
+            if (window.ui) { window.ui.renderList(); window.ui.updateSelf(); }
+        }
       };
       
       conn.on('close', onGone);
