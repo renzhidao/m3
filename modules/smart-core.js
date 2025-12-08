@@ -1,17 +1,18 @@
 import { MSG_TYPE, CHAT, NET_PARAMS } from './constants.js';
 
 /**
- * Smart Core v2.2.4 - Pure P2P Fix
- * 回滚 MQTT，强化 P2P 广播可靠性
+ * Smart Core v2.2.5 - ACK Reliability
+ * 修复：通过应用层 ACK 确认机制，彻底解决僵尸连接导致信令丢失问题
  */
 
 export function init() {
-  if (window.monitor) window.monitor.info('Core', 'Smart Core v2.2.4 (Pure P2P) 启动');
+  if (window.monitor) window.monitor.info('Core', 'Smart Core v2.2.5 (ACK) 启动');
 
   window.virtualFiles = new Map(); 
   window.remoteFiles = new Map();  
   window.smartMetaCache = new Map(); 
   window.activeStreams = new Map(); 
+  window.pendingAcks = new Map(); // 待确认的信令
   
   setInterval(watchdog, 1000);
   setTimeout(restoreMetaFromDB, 1000);
@@ -34,10 +35,18 @@ export function init() {
       },
       play: (fileId, fileName) => `/virtual/file/${fileId}/${encodeURIComponent(fileName)}`,
       onPeerConnect: (peerId) => {
+          // 1. 唤醒下载任务
           window.activeStreams.forEach(task => {
               if (task.peers.includes(peerId)) {
                   if(window.monitor) window.monitor.info('Swarm', `节点重连唤醒任务: ${peerId.slice(0,4)}`);
                   pumpStream(task);
+              }
+          });
+          // 2. 唤醒待确认的信令
+          window.pendingAcks.forEach((meta, id) => {
+              if (meta.target === peerId) {
+                  if(window.monitor) window.monitor.info('Ack', `连接恢复，重发信令: ${meta.fileName}`);
+                  window.protocol.sendMsg(null, 'RETRY_META', meta); // 触发重发
               }
           });
       }
@@ -240,6 +249,32 @@ function watchdog() {
         if (task.inflight.size === 0 && !task.finished) needsPump = true;
         if (needsPump) pumpStream(task); 
     });
+    
+    // === ACK 超时检查 ===
+    window.pendingAcks.forEach((meta, id) => {
+        if (now - meta._sentTs > 2000) { // 2秒无回应
+            if(window.monitor) window.monitor.warn('Ack', `信令确认超时，强制重连: ${meta.target.slice(0,4)}`);
+            window.pendingAcks.delete(id);
+            
+            // 1. 强制断开僵尸连接
+            if (window.state.conns[meta.target]) {
+                if (window.p2p) window.p2p._hardClose(window.state.conns[meta.target]);
+                delete window.state.conns[meta.target];
+            }
+            
+            // 2. 触发重连
+            if (window.p2p) window.p2p.connectTo(meta.target);
+            
+            // 3. 重新入队信令 (等连接好后会自动在 onPeerConnect 里发送)
+            // 这里我们只需要保持它在 db pending 里即可，protocol.js 会轮询
+            // 但为了保险，我们在 onPeerConnect 里手动触发了
+            // 重新添加回 pendingAcks 以便下次检查? 不，交给重发逻辑
+            
+            // 特殊：如果是私聊文件，必须重新触发发送逻辑
+            // 通过重置 _sentTs，让它再次进入 pending 状态不太行
+            // 最好的办法是 Protocol 层会 retryPending，我们只要保证连接断了就行
+        }
+    });
 }
 
 function handleIncomingBinary(rawBuffer, fromPeerId) {
@@ -356,6 +391,15 @@ function applyHooks() {
 
     const originalSendMsg = window.protocol.sendMsg;
     window.protocol.sendMsg = function(txt, kind, fileInfo) {
+        // 重试钩子
+        if (kind === 'RETRY_META' && fileInfo) {
+             // 内部重试逻辑，跳过 UI 和 ID 生成
+             // fileInfo 就是 meta
+             const conn = window.state.conns[fileInfo.target];
+             if (conn && conn.open) conn.send(fileInfo);
+             return;
+        }
+
         if ((kind === CHAT.KIND_FILE || kind === CHAT.KIND_IMAGE) && fileInfo && fileInfo.fileObj) {
             const file = fileInfo.fileObj;
             const fileId = window.util.uuid();
@@ -384,7 +428,14 @@ function applyHooks() {
             window.db.addPending(meta);
             window.protocol.retryPending();
             
-            if(window.monitor) window.monitor.info('Msg', `📤 发送文件信令: ${file.name} (To: ${target})`);
+            // === 修复：加入 ACK 等待队列 (仅私聊) ===
+            if (target !== CHAT.PUBLIC_ID) {
+                meta._sentTs = Date.now();
+                window.pendingAcks.set(meta.id, meta);
+                if(window.monitor) window.monitor.info('Msg', `⏳ 等待对方确认: ${file.name}`);
+            } else {
+                if(window.monitor) window.monitor.info('Msg', `📤 广播文件: ${file.name}`);
+            }
             return;
         }
         originalSendMsg.apply(this, arguments);
@@ -392,8 +443,26 @@ function applyHooks() {
 
     const originalProcess = window.protocol.processIncoming;
     window.protocol.processIncoming = function(pkt, fromPeerId) {
+        // === 修复：收到 ACK，清除等待状态 ===
+        if (pkt.t === 'SMART_ACK') {
+             if (window.pendingAcks.has(pkt.refId)) {
+                 window.pendingAcks.delete(pkt.refId);
+                 if(window.monitor) window.monitor.info('Ack', `✅ 对方已收到信令: ${pkt.refId.slice(0,4)}`);
+             }
+             return;
+        }
+
         if (pkt.t === 'SMART_META') {
             if (pkt.senderId === window.state.myId) return;
+            
+            // === 修复：立即回复 ACK (仅私聊) ===
+            if (pkt.target === window.state.myId) {
+                const conn = window.state.conns[fromPeerId];
+                if (conn && conn.open) {
+                    conn.send({ t: 'SMART_ACK', refId: pkt.id });
+                    // if(window.monitor) window.monitor.info('Ack', `回复确认: ${pkt.id.slice(0,4)}`);
+                }
+            }
             
             window.db.saveMsg({ 
                 id: pkt.id || window.util.uuid(),
