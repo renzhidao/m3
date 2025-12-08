@@ -1,12 +1,12 @@
 import { MSG_TYPE, CHAT, NET_PARAMS } from './constants.js';
 
 /**
- * Smart Core v2.4.6 - Agile Flow
- * 改进：流控水位线降至 64KB，既保证视频满速，又允许文本随时插队
+ * Smart Core v2.5.3 - Turbo Mode
+ * 改进：水位线恢复至 1.5MB，块大小翻倍，追求极致速度
  */
 
 export function init() {
-  if (window.monitor) window.monitor.info('Core', 'Smart Core v2.4.6 (Agile) 启动');
+  if (window.monitor) window.monitor.info('Core', 'Smart Core v2.5.3 (Turbo) 启动');
 
   window.virtualFiles = new Map(); 
   window.remoteFiles = new Map();  
@@ -76,9 +76,7 @@ export function init() {
           if (window.virtualFiles.has(fileId)) {
               if(window.monitor) window.monitor.info('STEP', `[Local] 原生预览: ${fileName}`);
               const file = window.virtualFiles.get(fileId);
-              
               if (window.blobUrls.has(fileId)) return window.blobUrls.get(fileId);
-              
               const url = URL.createObjectURL(file);
               window.blobUrls.set(fileId, url);
               return url;
@@ -119,8 +117,8 @@ function flowSend(conn, data, callback) {
 
     const attempt = () => {
         if (!conn.open) return callback(new Error('Closed during send'));
-        // === 核心流控：保持极低水位 (64KB)，为文本消息留出空隙 ===
-        if (dc.bufferedAmount < 64 * 1024) {
+        // === 恢复高水位：1.5MB，让数据跑满 ===
+        if (dc.bufferedAmount < 1.5 * 1024 * 1024) {
             try { conn.send(data); callback(null); } catch(e) { callback(e); }
         } else {
             setTimeout(attempt, 10);
@@ -155,7 +153,8 @@ function handleSWMessage(event) {
     else if (d.type === 'STREAM_CANCEL') stopStreamTask(d.requestId);
 }
 
-const CHUNK_SIZE = 32 * 1024; 
+// === 增大块大小：64KB，提升吞吐量 ===
+const CHUNK_SIZE = 64 * 1024; 
 const MAX_INFLIGHT = 64; 
 const TIMEOUT_MS = 5000;
 const HIGH_WATER_MARK = 50 * 1024 * 1024; 
@@ -461,7 +460,6 @@ function applyHooks() {
             const file = fileInfo.fileObj;
             const fileId = window.util.uuid();
             
-            // Debug:
             window.virtualFiles.set(fileId, file);
             if(window.monitor) window.monitor.info('Core', ` 内存注册文件: ${file.name}`, {fileId: fileId, size: file.size});
             

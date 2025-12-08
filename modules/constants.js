@@ -1,9 +1,9 @@
 /**
  * 全局常量与配置定义
- * P2P Stream Edition - Unleashed
+ * P2P Stream Edition - Turbo
  */
 
-export const APP_VERSION = '2.5.2-Unleashed'; // 暴力直通版
+export const APP_VERSION = '2.5.3-Turbo'; // 极致速度版
 
 export const MSG_TYPE = {
   PING: 'PING',         
