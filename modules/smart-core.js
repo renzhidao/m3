@@ -1,12 +1,12 @@
 import { MSG_TYPE, CHAT, NET_PARAMS } from './constants.js';
 
 /**
- * Smart Core v2.2.0 - Log & Auto-Heal
- * 增强：全链路日志 + 僵尸连接自动重连
+ * Smart Core v2.2.2 - Signaling Fix
+ * 修复：即时发送信令因僵尸连接丢失的问题
  */
 
 export function init() {
-  if (window.monitor) window.monitor.info('Core', 'Smart Core v2.2.0 (Healer) 启动');
+  if (window.monitor) window.monitor.info('Core', 'Smart Core v2.2.2 (Targeting) 启动');
 
   window.virtualFiles = new Map(); 
   window.remoteFiles = new Map();  
@@ -32,7 +32,15 @@ export function init() {
           a.click();
           document.body.removeChild(a);
       },
-      play: (fileId, fileName) => `/virtual/file/${fileId}/${encodeURIComponent(fileName)}`
+      play: (fileId, fileName) => `/virtual/file/${fileId}/${encodeURIComponent(fileName)}`,
+      onPeerConnect: (peerId) => {
+          window.activeStreams.forEach(task => {
+              if (task.peers.includes(peerId)) {
+                  if(window.monitor) window.monitor.info('Swarm', `节点重连唤醒任务: ${peerId.slice(0,4)}`);
+                  pumpStream(task);
+              }
+          });
+      }
   };
   
   applyHooks();
@@ -116,15 +124,12 @@ function startStreamTask(req) {
         cursor: start, 
         nextReq: start, 
         peers: Array.from(window.remoteFiles.get(fileId) || []),
-        
         buffer: new Map(),     
         bufferBytes: 0,        
-        
         inflight: new Map(),   
         missing: new Set(),    
-        
         finished: false,
-        stalledCount: 0 // 卡顿计数器
+        stalledCount: 0
     };
     
     window.activeStreams.set(requestId, task);
@@ -150,7 +155,6 @@ function sendToSW(msg) {
 function pumpStream(task) {
     if (task.finished || !window.activeStreams.has(task.requestId)) return;
     
-    // 1. 提交缓冲区数据
     while (task.buffer.has(task.cursor)) {
         const chunk = task.buffer.get(task.cursor);
         task.buffer.delete(task.cursor); 
@@ -158,7 +162,7 @@ function pumpStream(task) {
         
         sendToSW({ type: 'STREAM_DATA', requestId: task.requestId, chunk });
         task.cursor += chunk.byteLength;
-        task.stalledCount = 0; // 重置卡顿
+        task.stalledCount = 0; 
         
         if (task.cursor > task.end) {
             sendToSW({ type: 'STREAM_END', requestId: task.requestId });
@@ -170,12 +174,8 @@ function pumpStream(task) {
     }
 
     const isHighWater = task.bufferBytes > HIGH_WATER_MARK;
-    if (isHighWater) {
-        // if(window.monitor) window.monitor.warn('Flow', '🌊 高水位暂停');
-        return;
-    }
+    if (isHighWater) return;
 
-    // 2. 发起新请求
     while (task.inflight.size < MAX_INFLIGHT) {
         if (task.peers.length === 0) break;
         
@@ -194,19 +194,15 @@ function pumpStream(task) {
         if (offset > task.end) continue;
         const size = Math.min(CHUNK_SIZE, task.end - offset + 1);
         
-        // 轮询选择节点
         const peerId = task.peers[Math.floor(offset / CHUNK_SIZE) % task.peers.length];
         const conn = window.state.conns[peerId];
         
         if (conn && conn.open) {
             const buf = (conn.dataChannel && conn.dataChannel.bufferedAmount) || 0;
-            
             if (buf > 1024 * 1024) { 
-                // 缓冲区满，但不报错，只重试
                 task.missing.add(offset); 
                 break; 
             }
-            
             try {
                 conn.send({
                     t: 'SMART_GET',
@@ -219,16 +215,10 @@ function pumpStream(task) {
             } catch(e) {
                 if(window.monitor) window.monitor.error('Net', `发送GET失败: ${peerId}`, e);
                 task.missing.add(offset);
-                // 这里可能需要重连
             }
         } else {
-            // 连接不可用
             task.missing.add(offset);
-            
-            // === 自动救活机制 ===
-            // 如果这个节点在列表里，但没连接，尝试去连
             if (peerId && window.p2p) {
-                // if(window.monitor) window.monitor.warn('Heal', `尝试重连源: ${peerId}`);
                 window.p2p.connectTo(peerId);
             }
         }
@@ -238,31 +228,17 @@ function pumpStream(task) {
 function watchdog() {
     const now = Date.now();
     window.activeStreams.forEach(task => {
-        let hasTimeout = false;
-        
-        // 检查卡顿
-        if (task.inflight.size > 0) {
-            task.stalledCount++;
-            if (task.stalledCount > 5) { // 5秒没动静
-                if(window.monitor) window.monitor.warn('Stall', `⚠️ 任务卡顿，正在重置 inflight...`);
-                // 强制重置所有 inflight
-                task.inflight.forEach((_, off) => task.missing.add(off));
-                task.inflight.clear();
-                task.stalledCount = 0;
-                hasTimeout = true;
-            }
-        }
-
+        let needsPump = false;
         task.inflight.forEach((ts, offset) => {
             if (now - ts > TIMEOUT_MS) {
                 task.inflight.delete(offset);
                 task.missing.add(offset);
-                hasTimeout = true;
+                needsPump = true;
                 if(window.monitor) window.monitor.warn('Timeout', `⏱️ 块超时: ${offset}`);
             }
         });
-        
-        if (hasTimeout) pumpStream(task); 
+        if (task.inflight.size === 0 && !task.finished) needsPump = true;
+        if (needsPump) pumpStream(task); 
     });
 }
 
@@ -285,9 +261,6 @@ function handleIncomingBinary(rawBuffer, fromPeerId) {
             const body = buffer.slice(1 + headerLen);
             const offset = header.offset; 
             
-            // 收到数据，日志确认
-            // if(window.monitor && Math.random() < 0.05) window.monitor.info('Data', `收到块: ${offset}`);
-
             if (task.inflight.has(offset)) {
                 task.inflight.delete(offset);
                 task.buffer.set(offset, body);
@@ -303,8 +276,6 @@ function handleSmartGet(pkt, requesterId) {
     if (!file) return;
 
     const conn = window.state.conns[requesterId];
-    
-    // === 修复：如果连接断了，也打个日志 ===
     if (!conn || !conn.open) {
         if(window.monitor) window.monitor.warn('Serve', `请求者 ${requesterId.slice(0,4)} 连接断开`);
         return;
@@ -390,6 +361,12 @@ function applyHooks() {
             const fileId = window.util.uuid();
             window.virtualFiles.set(fileId, file);
             
+            // === 修复：准确的 Target 设置 ===
+            // 如果是私聊，target 就是对方 ID；如果是群聊，target 是 Public
+            const target = (window.state.activeChat && window.state.activeChat !== CHAT.PUBLIC_ID) 
+                           ? window.state.activeChat 
+                           : CHAT.PUBLIC_ID;
+
             const meta = {
                 t: 'SMART_META',
                 id: window.util.uuid(),
@@ -400,7 +377,7 @@ function applyHooks() {
                 senderId: window.state.myId,
                 n: window.state.myName,
                 ts: window.util.now(),
-                target: CHAT.PUBLIC_ID,  
+                target: target,  // <--- 关键修改：不再强制 Public
                 ttl: NET_PARAMS.GOSSIP_SIZE
             };
             
@@ -409,7 +386,7 @@ function applyHooks() {
             window.db.addPending(meta);
             window.protocol.retryPending();
             
-            if(window.monitor) window.monitor.info('Msg', `📤 发送文件信令: ${file.name}`);
+            if(window.monitor) window.monitor.info('Msg', `📤 发送文件信令: ${file.name} (To: ${target})`);
             return;
         }
         originalSendMsg.apply(this, arguments);
@@ -424,14 +401,14 @@ function applyHooks() {
                 id: pkt.id || window.util.uuid(),
                 t: 'MSG', 
                 senderId: pkt.senderId,
-                target: CHAT.PUBLIC_ID,
+                target: pkt.target || CHAT.PUBLIC_ID, // 兼容旧版
                 kind: 'SMART_FILE_UI', 
                 ts: pkt.ts,
                 n: pkt.n,
                 meta: pkt
             });
 
-            if(window.monitor) window.monitor.info('Msg', ` 收到文件信令: ${pkt.fileName}`);
+            if(window.monitor) window.monitor.info('Msg', `📥 收到文件信令: ${pkt.fileName}`);
 
             if (window.smartMetaCache.has(pkt.fileId)) {
                 if (!window.remoteFiles.has(pkt.fileId)) window.remoteFiles.set(pkt.fileId, new Set());
