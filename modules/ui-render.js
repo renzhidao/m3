@@ -1,7 +1,7 @@
 import { CHAT, UI_CONFIG } from './constants.js';
 
 export function init() {
-  console.log('📦 加载模块: UI Render (Stream Link)');
+  console.log('📦 加载模块: UI Render (Fixed DL)');
   window.ui = window.ui || {};
   
   const style = document.createElement('style');
@@ -112,7 +112,6 @@ export function init() {
       let content = '', style = '';
 
       if (m.kind === 'SMART_FILE_UI') {
-         // === 核心渲染：流式文件卡片 ===
          const meta = m.meta;
          const sizeStr = (meta.fileSize / (1024*1024)).toFixed(2) + ' MB';
          const isVideo = meta.fileType.startsWith('video');
@@ -151,7 +150,6 @@ export function init() {
          }
 
       } else if (m.kind === CHAT.KIND_IMAGE) {
-         // 兼容旧图片（如果有）
          content = `<img src="${m.txt}" class="chat-img" style="min-height:50px; background:#222;">`;
          style = 'background:transparent;padding:0';
       } else {
@@ -172,7 +170,40 @@ export function init() {
       if (window.uiEvents && window.uiEvents.bindMsgEvents) window.uiEvents.bindMsgEvents();
     },
     
-    downloadBlob(data, name) { /* 旧下载器，留空 */ }
+    // === 修复：通用下载器 ===
+    downloadBlob(data, name) {
+        try {
+            // 支持 base64 string 或普通 string
+            let url;
+            if (typeof data === 'string') {
+                // 如果是 base64
+                if (data.startsWith('data:')) {
+                     const a = document.createElement('a');
+                     a.href = data;
+                     a.download = name;
+                     a.click();
+                     return;
+                }
+                // 纯文本 -> Blob
+                const blob = new Blob([data], {type: 'text/plain'});
+                url = URL.createObjectURL(blob);
+            } else {
+                // Blob 对象
+                url = URL.createObjectURL(data);
+            }
+            
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = name;
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
+            setTimeout(() => URL.revokeObjectURL(url), 1000);
+        } catch(e) {
+            console.error('Download failed', e);
+            alert('下载失败: ' + e.message);
+        }
+    }
   };
   Object.assign(window.ui, render);
 }

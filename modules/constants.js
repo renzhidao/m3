@@ -1,11 +1,10 @@
 /**
  * 全局常量与配置定义
- * 目的：将所有硬编码的变量集中管理，方便后续修改
+ * P2P Stream Edition
  */
 
-export const APP_VERSION = '1.0.34-Smart-v2'; // m1 fix network
+export const APP_VERSION = '2.0.0-Stream-Final';
 
-// 1. 网络消息协议类型
 export const MSG_TYPE = {
   PING: 'PING',         
   PONG: 'PONG',         
@@ -17,20 +16,18 @@ export const MSG_TYPE = {
   HUB_PULSE: 'HUB_PULSE' 
 };
 
-// 2. 网络参数配置
 export const NET_PARAMS = {
   GOSSIP_SIZE: 20,          
   MAX_PEERS_NORMAL: 350,    
   MAX_PEERS_HUB: 500,       
-  CONN_TIMEOUT: 15000,      // [修正] 延长至15秒，防止握手超时
-  PING_TIMEOUT: 15000,      // [修正] 延长至15秒，防止误判掉线
+  CONN_TIMEOUT: 15000,
+  PING_TIMEOUT: 15000,
   LOOP_INTERVAL: 1000,      
   RETRY_DELAY: 3000,        
   HUB_PREFIX: 'p1-hub-v3-', 
   HUB_COUNT: 5              
 };
 
-// 3. 聊天相关
 export const CHAT = {
   PUBLIC_ID: 'all',         
   PUBLIC_NAME: '公共频道',   
@@ -40,7 +37,6 @@ export const CHAT = {
   TTL_DEFAULT: 16           
 };
 
-// 4. UI 配置
 export const UI_CONFIG = {
   COLOR_ONLINE: '#22c55e',     
   COLOR_OFFLINE: '#666666',    
@@ -51,7 +47,6 @@ export const UI_CONFIG = {
   IMG_QUALITY: 0.7             
 };
 
-// 5. 本地存储键名
 export const STORAGE_KEYS = {
   MY_ID: 'p1_my_id',
   NICKNAME: 'nickname',
