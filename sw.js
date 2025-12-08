@@ -1,4 +1,4 @@
-const CACHE_NAME = 'p1-stream-v1765197358'; // Auto-updated
+const CACHE_NAME = 'p1-stream-v1765198281'; // Auto-updated
 const CORE_ASSETS = [
   './',
   './index.html',
@@ -33,9 +33,7 @@ self.addEventListener('message', event => {
         case 'STREAM_DATA':
             try {
                 if (data.chunk) controller.enqueue(new Uint8Array(data.chunk));
-            } catch(e) { 
-                // 如果队列满了，可能报错。此处应有复杂的流控反馈，简化版忽略错误
-            }
+            } catch(e) { }
             break;
         case 'STREAM_END':
             try { controller.close(); } catch(e) {}
@@ -52,6 +50,7 @@ self.addEventListener('fetch', event => {
   const url = new URL(event.request.url);
 
   if (url.pathname.includes('/virtual/file/')) {
+    // console.log('[SW] [STEP 4a] 拦截虚拟请求', url.pathname);
     event.respondWith(handleVirtualStream(event));
     return;
   }
@@ -125,7 +124,6 @@ async function handleVirtualStream(event) {
 
         self.addEventListener('message', metaHandler);
 
-        // Fix: 延长超时至 10s，应对 P2P 握手慢
         setTimeout(() => {
             self.removeEventListener('message', metaHandler);
             if (streamControllers.has(requestId)) {

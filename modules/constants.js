@@ -3,7 +3,7 @@
  * P2P Stream Edition - MaxSpeed
  */
 
-export const APP_VERSION = '2.1.0-MaxSpeed';
+export const APP_VERSION = '2.4.0-Trace'; // 更新版本号
 
 export const MSG_TYPE = {
   PING: 'PING',         
