@@ -14,9 +14,9 @@ export function init() {
       if (window.ui && window.ui.init) window.ui.init();
       if (window.uiEvents && window.uiEvents.init) window.uiEvents.init();
       
-      this.loadHistory(20);
+      // === 修改：提升历史记录加载量至 500 条 ===
+      this.loadHistory(500);
 
-      // 启动时并发：P2P 和 MQTT 同时开始连接，不互相等待
       if (window.p2p) window.p2p.start();
       if (window.mqtt) window.mqtt.start();
 
