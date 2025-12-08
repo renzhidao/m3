@@ -1,7 +1,7 @@
 import { CHAT, UI_CONFIG } from './constants.js';
 
 export function init() {
-  console.log('📦 加载模块: UI Events (交互优化版)');
+  console.log('📦 加载模块: UI Events (Stream Select)');
   
   window.uiEvents = {
     init() {
@@ -55,11 +55,8 @@ export function init() {
         const el = document.getElementById('logContent');
         if (!el) return;
         const text = (window.logSystem && window.logSystem.fullHistory) ? window.logSystem.fullHistory.join('\n') : 'Log Error';
-        // 使用新修好的下载器
         if (window.ui && window.ui.downloadBlob) {
             window.ui.downloadBlob(btoa(unescape(encodeURIComponent(text))), 'p1_log.txt');
-        } else {
-            alert('下载模块未就绪');
         }
       });
 
@@ -80,56 +77,31 @@ export function init() {
         document.getElementById('settings-panel').style.display = 'none';
       });
 
-      // === 核心修复：文件/图片上传逻辑 (带进度提示) ===
+      // === 核心修改：文件选择逻辑 (Stream Select) ===
       bind('btnFile', () => document.getElementById('fileInput').click());
       const fi = document.getElementById('fileInput');
       if (fi) {
-        fi.onchange = async (e) => {
+        fi.onchange = (e) => {
           const file = e.target.files[0];
           if (!file) return;
 
-          // 1. 立即给用户反馈
+          // 1. 立即反馈
           const editor = document.getElementById('editor');
-          const oldText = editor ? editor.innerText : '';
-          if (editor) editor.innerText = `⏳ 正在读取: ${file.name}...`;
-          window.util.log(`⏳ 开始处理文件: ${file.name} (${(file.size/1024).toFixed(0)}KB)`);
+          if (editor) editor.innerText = `⏳ 准备发送: ${file.name}`;
 
-          try {
-              const isBigImage = file.type.startsWith('image/') && file.size > 1024 * 1024; // 1MB以上算大图
-              
-              if (file.type.startsWith('image/') && !isBigImage) {
-                // 小图：压缩发送
-                window.util.log('图片压缩中...');
-                const b64 = await window.util.compressImage(file);
-                window.protocol.sendMsg(b64, CHAT.KIND_IMAGE);
-                if (editor) editor.innerText = ''; 
-              } else {
-                // 大图 或 普通文件
-                const reader = new FileReader();
-                reader.readAsDataURL(file);
-                
-                reader.onload = () => {
-                   const b64 = reader.result;
-                   const type = file.type.startsWith('image/') ? CHAT.KIND_IMAGE : CHAT.KIND_FILE;
-                   
-                   window.protocol.sendMsg(b64, type, {
-                     name: file.name,
-                     size: file.size,
-                     type: file.type
-                   });
-                   window.util.log('✅ 读取完成，发送中...');
-                   if (editor) editor.innerText = ''; // 清空提示
-                };
-                
-                reader.onerror = () => {
-                    window.util.log('❌ 读取文件失败');
-                    if (editor) editor.innerText = '❌ 读取失败';
-                };
-              }
-          } catch(err) {
-              window.util.log('❌ 处理错误: ' + err.message);
-              if (editor) editor.innerText = '';
-          }
+          // 2. 直接发送元数据 (不读取内容)
+          // 传递 fileObj 给 protocol.sendMsg，由 hooks 拦截
+          const kind = file.type.startsWith('image/') ? CHAT.KIND_IMAGE : CHAT.KIND_FILE;
+          
+          window.protocol.sendMsg(null, kind, {
+              fileObj: file, // 传递原生 File 对象
+              name: file.name,
+              size: file.size,
+              type: file.type
+          });
+          
+          if (editor) editor.innerText = '';
+          window.util.log(`🚀 已分享文件: ${file.name} (流式)`);
           
           e.target.value = '';
         };

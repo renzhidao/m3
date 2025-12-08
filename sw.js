@@ -1,63 +1,137 @@
-const CACHE_NAME = 'p1-v1765142127'; // 升级版本号
+const CACHE_NAME = 'p1-stream-v3'; // 升级版本
 const CORE_ASSETS = [
   './',
   './index.html',
   './manifest.json',
-  './style.css'
+  './style.css',
+  './loader.js'
 ];
 
-// 安装阶段：跳过等待，立即接管
 self.addEventListener('install', event => {
-  self.skipWaiting(); // <-- 关键：强制新 SW 立即生效
-  
-  event.waitUntil((async () => {
-    const cache = await caches.open(CACHE_NAME);
-    for (const url of CORE_ASSETS) {
-      try {
-        await cache.add(url);
-      } catch (e) {
-        console.warn('[SW] Failed to cache', url, e);
-      }
-    }
-  })());
+  self.skipWaiting();
+  event.waitUntil(caches.open(CACHE_NAME).then(c => c.addAll(CORE_ASSETS).catch(()=>{})));
 });
 
-// 激活阶段：立即清理旧缓存并控制所有客户端
 self.addEventListener('activate', event => {
   event.waitUntil(
     caches.keys().then(keys => Promise.all(
       keys.map(k => k !== CACHE_NAME ? caches.delete(k) : Promise.resolve())
-    ))
-    .then(() => self.clients.claim()) // <-- 关键：立即控制当前页面，无需刷新两次
+    )).then(() => self.clients.claim())
   );
 });
 
-self.addEventListener('fetch', event => {
-  const req = event.request;
-  const url = new URL(req.url);
+const streamControllers = new Map();
 
-  // 调试模式：注册表和加载器永远网络优先，防止死循环
-  if (url.pathname.endsWith('registry.txt') || url.pathname.endsWith('loader.js') || url.pathname.endsWith('app.js')) {
-    event.respondWith(fetch(req).catch(() => caches.match(req)));
-    return;
-  }
+self.addEventListener('message', event => {
+    const data = event.data;
+    if (!data || !data.requestId) return;
 
-  if (req.mode === 'navigate') {
-    event.respondWith(fetch(req).catch(() => caches.match('./index.html')));
-    return;
-  }
+    const controller = streamControllers.get(data.requestId);
+    if (!controller) return;
 
-  if (req.method === 'GET') {
-    event.respondWith(
-      caches.match(req).then(cached => {
-        const networkFetch = fetch(req).then(res => {
-          const resClone = res.clone();
-          caches.open(CACHE_NAME).then(cache => cache.put(req, resClone));
-          return res;
-        });
-        // 缓存优先，但会在后台更新
-        return cached || networkFetch;
-      })
-    );
-  }
+    switch (data.type) {
+        case 'STREAM_DATA':
+            try {
+                if (data.chunk) controller.enqueue(new Uint8Array(data.chunk));
+            } catch(e) { 
+                // 如果队列满了，可能报错。此处应有复杂的流控反馈，简化版忽略错误
+            }
+            break;
+        case 'STREAM_END':
+            try { controller.close(); } catch(e) {}
+            streamControllers.delete(data.requestId);
+            break;
+        case 'STREAM_ERROR':
+            try { controller.error(new Error(data.msg)); } catch(e) {}
+            streamControllers.delete(data.requestId);
+            break;
+    }
 });
+
+self.addEventListener('fetch', event => {
+  const url = new URL(event.request.url);
+
+  if (url.pathname.includes('/virtual/file/')) {
+    event.respondWith(handleVirtualStream(event));
+    return;
+  }
+
+  if (url.pathname.endsWith('registry.txt') || url.pathname.endsWith('.js')) {
+    event.respondWith(
+      fetch(event.request).catch(() => caches.match(event.request))
+    );
+    return;
+  }
+
+  event.respondWith(
+    caches.match(event.request).then(cached => {
+      const netFetch = fetch(event.request).then(res => {
+         if (event.request.method === 'GET' && url.protocol.startsWith('http')) {
+             const clone = res.clone();
+             caches.open(CACHE_NAME).then(c => c.put(event.request, clone));
+         }
+         return res;
+      }).catch(() => null);
+      return cached || netFetch;
+    })
+  );
+});
+
+async function handleVirtualStream(event) {
+    const clientId = event.clientId;
+    const client = await self.clients.get(clientId) || (await self.clients.matchAll({type:'window'}))[0];
+    
+    if (!client) return new Response("Service Worker: No Client Active", { status: 503 });
+
+    const parts = new URL(event.request.url).pathname.split('/');
+    const fileId = parts[3];
+    const range = event.request.headers.get('Range');
+    const requestId = Math.random().toString(36).slice(2) + Date.now();
+
+    const stream = new ReadableStream({
+        start(controller) {
+            streamControllers.set(requestId, controller);
+            client.postMessage({ type: 'STREAM_OPEN', requestId, fileId, range });
+        },
+        cancel() {
+            streamControllers.delete(requestId);
+            client.postMessage({ type: 'STREAM_CANCEL', requestId });
+        }
+    });
+
+    return new Promise(resolve => {
+        const metaHandler = (e) => {
+            const d = e.data;
+            if (d && d.requestId === requestId) {
+                if (d.type === 'STREAM_META') {
+                    self.removeEventListener('message', metaHandler);
+                    const headers = new Headers();
+                    headers.set('Content-Type', d.fileType || 'application/octet-stream');
+                    headers.set('Accept-Ranges', 'bytes');
+                    const total = d.fileSize;
+                    const start = d.start;
+                    const end = d.end;
+                    headers.set('Content-Length', end - start + 1);
+                    headers.set('Content-Range', `bytes ${start}-${end}/${total}`);
+                    resolve(new Response(stream, { status: 206, headers }));
+                } 
+                else if (d.type === 'STREAM_ERROR') {
+                    self.removeEventListener('message', metaHandler);
+                    streamControllers.delete(requestId);
+                    resolve(new Response(d.msg || 'File Not Found', { status: 404 }));
+                }
+            }
+        };
+
+        self.addEventListener('message', metaHandler);
+
+        // Fix: 延长超时至 10s，应对 P2P 握手慢
+        setTimeout(() => {
+            self.removeEventListener('message', metaHandler);
+            if (streamControllers.has(requestId)) {
+                streamControllers.delete(requestId);
+                resolve(new Response("Gateway Timeout (Metadata Wait)", { status: 504 }));
+            }
+        }, 10000);
+    });
+}

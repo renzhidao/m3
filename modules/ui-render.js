@@ -1,7 +1,7 @@
 import { CHAT, UI_CONFIG } from './constants.js';
 
 export function init() {
-  console.log('📦 加载模块: UI Render (Click-Close Fix)');
+  console.log('📦 加载模块: UI Render (Stream Link)');
   window.ui = window.ui || {};
   
   const style = document.createElement('style');
@@ -10,23 +10,15 @@ export function init() {
         position: fixed; top: 0; left: 0; width: 100%; height: 100%;
         background: rgba(0,0,0,0.95); z-index: 9999;
         display: flex; flex-direction: column; align-items: center; justify-content: center;
-        animation: fadeIn 0.2s ease;
-        cursor: zoom-out; /* 提示可关闭 */
+        cursor: zoom-out;
     }
     .img-preview-content {
         max-width: 100%; max-height: 80%;
         object-fit: contain;
-        transition: transform 0.2s;
     }
-    .preview-actions {
-        margin-top: 20px; display: flex; gap: 20px;
-        z-index: 10000;
+    .stream-card {
+        background: rgba(0,0,0,0.3); padding: 10px; border-radius: 8px; min-width: 220px;
     }
-    .preview-btn {
-        background: #333; color: white; border: 1px solid #555;
-        padding: 8px 20px; border-radius: 20px; font-size: 14px; cursor: pointer;
-    }
-    @keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
   `;
   document.head.appendChild(style);
   
@@ -111,63 +103,6 @@ export function init() {
       if (box) box.innerHTML = '';
     },
 
-    downloadBlob(urlOrData, fileName) {
-        try {
-            window.util.log('⬇️ 准备下载: ' + fileName);
-            let url = urlOrData;
-            if (typeof urlOrData === 'string' && urlOrData.startsWith('data:')) {
-                 fetch(urlOrData).then(res => res.blob()).then(blob => {
-                     const u = URL.createObjectURL(blob);
-                     this.downloadBlob(u, fileName);
-                 });
-                 return;
-            }
-            const a = document.createElement('a');
-            a.href = url;
-            a.download = fileName;
-            document.body.appendChild(a);
-            a.click();
-            setTimeout(() => {
-                document.body.removeChild(a);
-                window.util.log('✅ 已调起系统下载');
-            }, 500);
-        } catch(e) {
-            window.util.log('❌ 下载失败: ' + e.message);
-        }
-    },
-
-    previewImage(src) {
-        const div = document.createElement('div');
-        div.className = 'img-preview-overlay';
-        div.innerHTML = `
-            <img src="${src}" class="img-preview-content">
-            <div class="preview-actions">
-                <button class="preview-btn" id="pv-close">关闭</button>
-                <button class="preview-btn" id="pv-save" style="background:#2a7cff;border-color:#2a7cff">保存原图</button>
-            </div>
-        `;
-        
-        // === 修复：点击任意地方（包括图片本身）都关闭 ===
-        const close = () => {
-             if(document.body.contains(div)) document.body.removeChild(div);
-        };
-
-        div.onclick = (e) => {
-            // 如果点击的是保存按钮，不关闭
-            if (e.target.id === 'pv-save') return;
-            close();
-        };
-
-        const btnSave = div.querySelector('#pv-save');
-        btnSave.onclick = (e) => {
-            e.stopPropagation(); // 阻止冒泡到 div 关闭
-            const ts = new Date().getTime();
-            this.downloadBlob(src, `p1_img_${ts}.jpg`);
-        };
-
-        document.body.appendChild(div);
-    },
-
     appendMsg(m) {
       const box = document.getElementById('msgList');
       if (!box || !m) return;
@@ -176,20 +111,49 @@ export function init() {
       const isMe = m.senderId === window.state.myId;
       let content = '', style = '';
 
-      if (m.kind === CHAT.KIND_IMAGE) {
+      if (m.kind === 'SMART_FILE_UI') {
+         // === 核心渲染：流式文件卡片 ===
+         const meta = m.meta;
+         const sizeStr = (meta.fileSize / (1024*1024)).toFixed(2) + ' MB';
+         const isVideo = meta.fileType.startsWith('video');
+         const isImg = meta.fileType.startsWith('image');
+         const streamUrl = window.smartCore.play(meta.fileId, meta.fileName);
+         
+         if (isVideo) {
+             content = `
+             <div class="stream-card">
+                 <div style="font-weight:bold;color:#4ea8ff">🎬 ${window.util.escape(meta.fileName)}</div>
+                 <div style="font-size:11px;color:#aaa;margin-bottom:8px">${sizeStr} (流式直连)</div>
+                 <video controls src="${streamUrl}" style="width:100%;max-width:300px;background:#000;border-radius:4px"></video>
+                 <div style="text-align:right;margin-top:4px">
+                     <a href="${streamUrl}" download="${meta.fileName}" style="color:#aaa;font-size:10px">⬇ 保存本地</a>
+                 </div>
+             </div>`;
+             style = 'background:transparent;padding:0;border:none';
+         } else if (isImg) {
+             content = `
+             <div class="stream-card">
+                 <img src="${streamUrl}" style="max-width:200px;border-radius:4px;display:block">
+                 <div style="font-size:10px;color:#aaa;margin-top:4px">${sizeStr}</div>
+             </div>`;
+             style = 'background:transparent;padding:0;border:none';
+         } else {
+             content = `
+             <div class="stream-card">
+                 <div style="font-weight:bold;color:#fff">📄 ${window.util.escape(meta.fileName)}</div>
+                 <div style="font-size:11px;color:#aaa;margin:4px 0">${sizeStr}</div>
+                 <a href="${streamUrl}" download="${meta.fileName}" 
+                    style="display:inline-block;background:#2a7cff;color:white;padding:6px 12px;border-radius:4px;text-decoration:none;font-size:12px">
+                    ⚡ 极速下载
+                 </a>
+             </div>`;
+             style = 'background:transparent;padding:0;border:none';
+         }
+
+      } else if (m.kind === CHAT.KIND_IMAGE) {
+         // 兼容旧图片（如果有）
          content = `<img src="${m.txt}" class="chat-img" style="min-height:50px; background:#222;">`;
          style = 'background:transparent;padding:0';
-      } else if (m.kind === CHAT.KIND_FILE) {
-         const sizeStr = m.fileSize ? (m.fileSize / 1024).toFixed(1) + 'KB' : '未知';
-         content = `
-           <div class="file-card">
-             <div class="file-icon">📄</div>
-             <div class="file-info">
-               <div class="file-name">${window.util.escape(m.fileName || '未命名文件')}</div>
-               <div class="file-size">${sizeStr}</div>
-             </div>
-             <div class="file-dl-btn" style="cursor:pointer">⬇</div>
-           </div>`;
       } else {
          content = window.util.escape(m.txt);
       }
@@ -205,18 +169,10 @@ export function init() {
       box.insertAdjacentHTML('beforeend', html);
       box.scrollTop = box.scrollHeight;
       
-      const el = document.getElementById('msg-' + m.id);
-      if (m.kind === CHAT.KIND_IMAGE) {
-          const img = el.querySelector('img');
-          if (img) img.onclick = () => this.previewImage(m.txt);
-      }
-      if (m.kind === CHAT.KIND_FILE) {
-          const btn = el.querySelector('.file-dl-btn');
-          if (btn) btn.onclick = () => this.downloadBlob(m.txt, m.fileName || 'file.dat');
-      }
-
       if (window.uiEvents && window.uiEvents.bindMsgEvents) window.uiEvents.bindMsgEvents();
-    }
+    },
+    
+    downloadBlob(data, name) { /* 旧下载器，留空 */ }
   };
   Object.assign(window.ui, render);
 }

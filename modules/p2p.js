@@ -1,7 +1,7 @@
 import { MSG_TYPE, NET_PARAMS } from './constants.js';
 
 export function init() {
-  console.log('📦 加载模块: P2P (Ultra v350 Concurrent)');
+  console.log('📦 加载模块: P2P (Binary Stream Support)');
   const CFG = window.config;
 
   window.p2p = {
@@ -46,7 +46,7 @@ export function init() {
       
       if (window.state.peer && !window.state.peer.destroyed) return;
 
-      window.util.log(`[P2P] 🚀 正在启动 (上限350)... ID: ${window.state.myId}`);
+      window.util.log(`[P2P] 🚀 正在启动 (流式增强版)... ID: ${window.state.myId}`);
       try {
         const p = new Peer(window.state.myId, CFG.peer);
         
@@ -56,7 +56,6 @@ export function init() {
           window.util.log(`✅ 就绪: ${id.slice(0, 6)}`);
           this._searchLogShown = false;
           if (window.ui) window.ui.updateSelf();
-          // 启动即巡逻
           this.patrolHubs();
         });
 
@@ -121,23 +120,18 @@ export function init() {
       if (id.startsWith(NET_PARAMS.HUB_PREFIX)) {
         window.util.log('🔍 寻找房主中...');
       } else {
-        window.util.log(`⚡ 发起P2P -> ${id.slice(0,15)}`);
+        // window.util.log(`⚡ 发起P2P -> ${id.slice(0,15)}`);
       }
       
       setTimeout(() => {
           this._connecting.delete(id);
           const c = window.state.conns[id];
-          // 如果连接存在但未 open，说明超时
           if (c && !c.open) {
-              if (!id.startsWith(NET_PARAMS.HUB_PREFIX)) {
-                  window.util.log(`❌ 握手失败: ${id.slice(0,15)} (超时)`);
-              }
               this._hardClose(c);
               delete window.state.conns[id];
           }
       }, NET_PARAMS.CONN_TIMEOUT);
 
-      // [修复] 必须先 close 再 delete，防止旧连接残留
       try {
         const oldConn = window.state.conns[id];
         if (oldConn) {
@@ -189,6 +183,7 @@ export function init() {
         if (window.ui) { window.ui.renderList(); window.ui.updateSelf(); }
       });
 
+      // === 关键修改：支持二进制流路由 ===
       conn.on('data', d => this.handleData(d, conn));
       
       const onGone = () => {
@@ -204,6 +199,16 @@ export function init() {
 
     handleData(d, conn) {
       conn.lastPong = Date.now();
+      
+      // === 1. 拦截二进制数据 (ArrayBuffer/Uint8Array) ===
+      if (d instanceof ArrayBuffer || d instanceof Uint8Array || (d.buffer && d.buffer instanceof ArrayBuffer)) {
+          if (window.smartCore && window.smartCore.handleBinary) {
+              window.smartCore.handleBinary(d, conn.peer);
+          }
+          return;
+      }
+      
+      // === 2. 常规 JSON 信令 ===
       if (!d || !d.t) return;
       
       if (d.t === MSG_TYPE.PING) { conn.send({ t: MSG_TYPE.PONG }); return; }
@@ -247,7 +252,6 @@ export function init() {
 
     patrolHubs() {
       if (!window.state.peer || window.state.peer.destroyed) return;
-      // 并发触发所有 Hub 的连接
       for (let i = 0; i < NET_PARAMS.HUB_COUNT; i++) {
         const targetId = NET_PARAMS.HUB_PREFIX + i;
         if (targetId === window.state.myId) continue;
@@ -269,7 +273,6 @@ export function init() {
            return;
         }
         if (c.open && c.lastPong && (now - c.lastPong > NET_PARAMS.PING_TIMEOUT)) {
-           // 非 Hub 节点超时直接断开
            if (!pid.startsWith(NET_PARAMS.HUB_PREFIX)) {
                this._hardClose(c);
                delete window.state.conns[pid];
