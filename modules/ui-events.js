@@ -1,12 +1,12 @@
 import { CHAT, UI_CONFIG } from './constants.js';
 
 export function init() {
-  console.log('📦 加载模块: UI Events (Preview Enabled)');
+  console.log('📦 加载模块: UI Events (Delegation Fix)');
   
   window.uiEvents = {
     init() {
       this.bindClicks();
-      this.bindMsgEvents(); 
+      this.bindDelegation(); // 新增：全局委托
       this.injectStyles();
       this.addMonitorBtn();
     },
@@ -36,6 +36,31 @@ export function init() {
       const style = document.createElement('style');
       style.textContent = css;
       document.head.appendChild(style);
+    },
+
+    // === 核心修复：事件委托，一劳永逸 ===
+    bindDelegation() {
+        const list = document.getElementById('msgList');
+        if (!list) return;
+
+        list.addEventListener('click', (e) => {
+            // 1. 图片预览
+            if (e.target.classList.contains('chat-img')) {
+                e.stopPropagation();
+                this.showImagePreview(e.target.src);
+            }
+        });
+        
+        list.addEventListener('contextmenu', (e) => {
+            const bubble = e.target.closest('.msg-bubble');
+            if (bubble) {
+                const selection = window.getSelection();
+                const range = document.createRange();
+                range.selectNodeContents(bubble);
+                selection.removeAllRanges();
+                selection.addRange(range);
+            }
+        });
     },
 
     bindClicks() {
@@ -148,30 +173,7 @@ export function init() {
     },
 
     bindMsgEvents() {
-      // 1. 消息气泡右键菜单
-      document.querySelectorAll('.msg-bubble').forEach(el => {
-         if (el.dataset.bound) return;
-         el.dataset.bound = 'true';
-         el.addEventListener('contextmenu', (e) => {
-            const selection = window.getSelection();
-            const range = document.createRange();
-            range.selectNodeContents(el);
-            selection.removeAllRanges();
-            selection.addRange(range);
-         });
-      });
-      
-      // 2. === 修复：图片点击全屏预览 ===
-      document.querySelectorAll('.chat-img').forEach(img => {
-          if (img.dataset.previewBound) return;
-          img.dataset.previewBound = 'true';
-          img.style.cursor = 'zoom-in';
-          
-          img.onclick = (e) => {
-              e.stopPropagation();
-              this.showImagePreview(img.src);
-          };
-      });
+        // 空函数：已通过 bindDelegation 替代，保留此函数为了兼容旧调用
     },
     
     showImagePreview(src) {

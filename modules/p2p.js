@@ -1,7 +1,7 @@
 import { MSG_TYPE, NET_PARAMS } from './constants.js';
 
 export function init() {
-  console.log('📦 加载模块: P2P (Wake-Up)');
+  console.log(' 加载模块: P2P (Binary Mode)');
   const CFG = window.config;
 
   window.p2p = {
@@ -129,7 +129,12 @@ export function init() {
             delete window.state.conns[id];
         }
         
-        const conn = window.state.peer.connect(id, { reliable: true });
+        // === 关键修复：开启 binary 模式 ===
+        const conn = window.state.peer.connect(id, { 
+            reliable: true,
+            serialization: 'binary' 
+        });
+        
         conn.created = window.util.now();
         conn._targetId = id; 
         this.setupConn(conn);
@@ -160,7 +165,6 @@ export function init() {
         }
         window.state.conns[pid] = conn;
         
-        // === 修复：唤醒可能在等待的下载任务 ===
         if (window.smartCore && window.smartCore.onPeerConnect) {
             window.smartCore.onPeerConnect(pid);
         }
@@ -200,6 +204,7 @@ export function init() {
     handleData(d, conn) {
       conn.lastPong = Date.now();
       
+      // Binary Pack 兼容处理
       if (d instanceof ArrayBuffer || d instanceof Uint8Array || (d.buffer && d.buffer instanceof ArrayBuffer)) {
           if (window.smartCore && window.smartCore.handleBinary) {
               window.smartCore.handleBinary(d, conn.peer);
