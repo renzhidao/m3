@@ -1,13 +1,13 @@
 import { MSG_TYPE, CHAT, NET_PARAMS } from './constants.js';
 
 /**
- * Smart Core v2.5.5 - Lossless Repair Edition
- * 修复：1. 传输丢包逻辑(解决文件损坏) 2. 元数据恢复(解决重启失效)
- * 策略：无损流式，大文件不占内存
+ * Smart Core v2.5.5 - Lossless Repair
+ * 修复：1. 弱网丢包问题 (receivedOffsets)
+ *       2. 重启后历史文件无法加载问题 (getRecentFiles)
  */
 
 export function init() {
-  if (window.monitor) window.monitor.info('Core', 'Smart Core v2.5.5 (Lossless Fix) 启动');
+  if (window.monitor) window.monitor.info('Core', 'Smart Core v2.5.5 (Lossless) 启动');
 
   window.virtualFiles = new Map(); 
   window.remoteFiles = new Map();  
@@ -43,7 +43,6 @@ export function init() {
           const meta = window.smartMetaCache.get(fileId);
           const size = meta ? meta.fileSize : 0;
           
-          // 小文件(<20MB)保留原有逻辑：缓冲到内存，方便快速分发（不影响大文件安全）
           if (size > 0 && size < 20 * 1024 * 1024) {
               if(window.monitor) window.monitor.info('UI', `[Smart] 正在缓冲小文件 (${(size/1024/1024).toFixed(1)}MB)...`);
               window.util.log(`⏳ 正在缓冲: ${fileName} ...`);
@@ -54,10 +53,6 @@ export function init() {
                   if (!res.ok) throw new Error(`Stream Error ${res.status}`);
                   const blob = await res.blob();
                   window.util.log(`✅ 缓冲完成，开始保存`);
-                  
-                  // 只有小文件才进入内存缓存(Safe)
-                  window.virtualFiles.set(fileId, blob);
-                  
                   if (window.ui && window.ui.downloadBlob) {
                       window.ui.downloadBlob(blob, fileName);
                   }
@@ -68,7 +63,6 @@ export function init() {
               return;
           }
           
-          // 大文件：严格流式，不进内存，浏览器接管下载
           if(window.monitor) window.monitor.info('UI', `[Start] 启动流式下载: ${fileName}`);
           const url = `/virtual/file/${fileId}/${encodeURIComponent(fileName)}`;
           const a = document.createElement('a');
@@ -92,7 +86,6 @@ export function init() {
       },
       
       onPeerConnect: (peerId) => {
-          // 连接建立时，唤醒相关任务
           window.activeStreams.forEach(task => {
               if (task.peers.includes(peerId)) {
                   pumpStream(task);
@@ -125,6 +118,7 @@ function flowSend(conn, data, callback) {
 
     const attempt = () => {
         if (!conn.open) return callback(new Error('Closed during send'));
+        // 维持高水位：1.5MB
         if (dc.bufferedAmount < 1.5 * 1024 * 1024) {
             try { conn.send(data); callback(null); } catch(e) { callback(e); }
         } else {
@@ -134,10 +128,10 @@ function flowSend(conn, data, callback) {
     attempt();
 }
 
+// 修复：使用专门的 getRecentFiles 接口，扫描范围扩大到200条
 async function restoreMetaFromDB() {
     try {
-        // === 修复：扩大扫描范围到200条，确保能找回私聊和较早的文件 ===
-        const msgs = await window.db.getRecent(200, 'all');
+        const msgs = await window.db.getRecentFiles(200);
         let count = 0;
         msgs.forEach(m => {
             if (m.kind === 'SMART_FILE_UI' && m.meta) {
@@ -149,8 +143,10 @@ async function restoreMetaFromDB() {
                 count++;
             }
         });
-        if(count > 0 && window.monitor) window.monitor.info('Core', `已恢复 ${count} 个历史文件记录`);
-    } catch(e) {}
+        if(window.monitor && count > 0) window.monitor.info('Core', `⚡ 已恢复 ${count} 个历史文件元数据`);
+    } catch(e) {
+        console.error('Restore Meta Failed', e);
+    }
 }
 
 function handleSWMessage(event) {
@@ -180,7 +176,7 @@ function startStreamTask(req) {
 
     const meta = window.smartMetaCache.get(fileId);
     if (!meta) {
-        if(window.monitor) window.monitor.error('STEP', `❌ [STEP 4 Fail] 元数据丢失`, {fileId});
+        if(window.monitor) window.monitor.error('STEP', `❌ [STEP 4 Fail] 元数据丢失 (请确认发送方在线)`, {fileId});
         sendToSW({ type: 'STREAM_ERROR', requestId, msg: 'Meta Not Found' });
         return;
     }
@@ -219,12 +215,11 @@ function startStreamTask(req) {
         peers: Array.from(window.remoteFiles.get(fileId) || []),
         buffer: new Map(),     
         bufferBytes: 0,        
-        inflight: new Map(),   
+        inflight: new Map(),
+        receivedOffsets: new Set(), // 新增：已接收偏移量记录 (防丢包)
         missing: new Set(),    
         finished: false,
-        stalledCount: 0,
-        // === 核心修复：记录已接收的offset，防止重复请求或丢弃迟到包 ===
-        receivedOffsets: new Set() 
+        stalledCount: 0
     };
     
     window.activeStreams.set(requestId, task);
@@ -289,7 +284,7 @@ function pumpStream(task) {
         
         if (offset > task.end) continue;
         
-        // === 修复：如果这个块已经收到过，跳过 ===
+        // 双重检查：如果已经收到了，就不用请求了
         if (task.receivedOffsets.has(offset)) continue;
 
         const size = Math.min(CHUNK_SIZE, task.end - offset + 1);
@@ -328,13 +323,7 @@ function watchdog() {
         task.inflight.forEach((ts, offset) => {
             if (now - ts > TIMEOUT_MS) {
                 task.inflight.delete(offset);
-                
-                // === 修复：只有当这个块 真的没收到 时，才加入missing重试 ===
-                // 防止迟到的数据包被重新放入请求队列，浪费流量或造成混乱
-                if (!task.receivedOffsets.has(offset)) {
-                    task.missing.add(offset);
-                }
-                
+                task.missing.add(offset);
                 needsPump = true;
                 timeoutCount++; 
             }
@@ -343,9 +332,9 @@ function watchdog() {
         if (needsPump) pumpStream(task); 
     });
     
-    if (timeoutCount > 0 && window.monitor) {
-        // 降级日志级别，因为超时重试是正常的P2P行为
-        // window.monitor.warn('Timeout', `⚠️ 有 ${timeoutCount} 个数据块请求超时`);
+    // 只在超时严重时报警
+    if (timeoutCount > 5 && window.monitor) {
+        window.monitor.warn('Timeout', `⚠️ 正在重试 ${timeoutCount} 个超时块...`);
     }
     
     window.pendingAcks.forEach((meta, id) => {
@@ -379,15 +368,11 @@ function handleIncomingBinary(rawBuffer, fromPeerId) {
             const body = buffer.slice(1 + headerLen);
             const offset = header.offset; 
             
-            // === 核心无损修复 ===
-            // 旧逻辑：if (task.inflight.has(offset)) { ... } 
-            // 问题：网络抖动导致包迟到（超时后才到），旧逻辑会丢弃该包，导致文件空洞。
-            // 新逻辑：只要这个offset我还没收录，就接收它！不管是否超时。
+            // 修复核心：只要是我还没收到的，统统收下！
+            // 不再判断 inflight.has(offset)，彻底解决迟到丢包问题
             if (!task.receivedOffsets.has(offset)) {
-                task.receivedOffsets.add(offset);
-                
-                task.inflight.delete(offset); // 无论是否在inflight，都清理
-                task.missing.delete(offset);  // 无论是否在missing，都清理
+                task.receivedOffsets.add(offset); // 标记为已接收
+                task.inflight.delete(offset);     // 如果在等待列表里，移除它
                 
                 task.buffer.set(offset, body);
                 task.bufferBytes += body.byteLength;
@@ -401,12 +386,19 @@ function handleSmartGet(pkt, requesterId) {
     const file = window.virtualFiles.get(pkt.fileId);
     
     if (!file) {
-        // if(window.monitor) window.monitor.warn('Serve', `❌ 拒绝请求: 无此文件`, {fileId: pkt.fileId.slice(0,6)});
+        if(window.monitor) window.monitor.warn('Serve', `❌ 拒绝请求: 无此文件`, {fileId: pkt.fileId.slice(0,6)});
         return;
     }
 
     const conn = window.state.conns[requesterId];
     if (!conn || !conn.open) return;
+    
+    if(window.monitor) {
+        // 降低日志频率，每10个请求打一条
+        if (Math.random() < 0.1) {
+             window.monitor.info('Serve', `📥 正在上传...`, {to: requesterId.slice(0,4)});
+        }
+    }
     
     const blob = file.slice(pkt.offset, pkt.offset + pkt.size);
     const reader = new FileReader();
@@ -524,4 +516,88 @@ function applyHooks() {
             return;
         }
         originalSendMsg.apply(this, arguments);
-    };\n\n    const originalProcess = window.protocol.processIncoming;\n    window.protocol.processIncoming = function(pkt, fromPeerId) {\n        if (pkt.t === 'SMART_ACK') {\n             if (window.pendingAcks.has(pkt.refId)) {\n                 window.pendingAcks.delete(pkt.refId);\n                 if(window.monitor) window.monitor.info('Ack', `✅ 对方已收到信令: ${pkt.refId.slice(0,4)}`);\n             }\n             return;\n        }\n\n        if (pkt.t === 'SMART_META') {\n            if (pkt.senderId === window.state.myId) return;\n            \n            if (pkt.target === window.state.myId) {\n                const conn = window.state.conns[fromPeerId];\n                if (conn && conn.open) {\n                    conn.send({ t: 'SMART_ACK', refId: pkt.id });\n                }\n            }\n            \n            window.db.saveMsg({ \n                id: pkt.id || window.util.uuid(),\n                t: 'MSG', \n                senderId: pkt.senderId,\n                target: pkt.target || CHAT.PUBLIC_ID, \n                kind: 'SMART_FILE_UI', \n                ts: pkt.ts,\n                n: pkt.n,\n                meta: pkt\n            });\n\n            if(window.monitor) window.monitor.info('STEP', `[STEP 3] 收到 Meta: ${pkt.fileName}`);\n\n            if (window.smartMetaCache.has(pkt.fileId)) {\n                if (!window.remoteFiles.has(pkt.fileId)) window.remoteFiles.set(pkt.fileId, new Set());\n                window.remoteFiles.get(pkt.fileId).add(pkt.senderId);\n                return;\n            }\n            \n            window.smartMetaCache.set(pkt.fileId, pkt);\n            \n            if (!window.remoteFiles.has(pkt.fileId)) window.remoteFiles.set(pkt.fileId, new Set());\n            window.remoteFiles.get(pkt.fileId).add(pkt.senderId);\n            \n            window.activeStreams.forEach(task => {\n                if (task.fileId === pkt.fileId && !task.peers.includes(pkt.senderId)) {\n                    task.peers.push(pkt.senderId);\n                    pumpStream(task);\n                }\n            });\n            \n            window.ui.appendMsg({ id: pkt.id || window.util.uuid(), senderId: pkt.senderId, n: pkt.n, ts: pkt.ts, kind: 'SMART_FILE_UI', meta: pkt });\n            window.protocol.flood(pkt, fromPeerId);\n            return;\n        }\n        \n        if (pkt.t === 'SMART_GET') { handleSmartGet(pkt, fromPeerId); return; }\n        \n        if (pkt.t === 'SMART_WHO_HAS') {\n            if (window.virtualFiles.has(pkt.fileId)) {\n                const conn = window.state.conns[fromPeerId];\n                if (conn) conn.send({ t: 'SMART_I_HAVE', fileId: pkt.fileId });\n            }\n            window.protocol.flood(pkt, fromPeerId);\n            return;\n        }\n        \n        if (pkt.t === 'SMART_I_HAVE') {\n            if (!window.remoteFiles.has(pkt.fileId)) window.remoteFiles.set(pkt.fileId, new Set());\n            window.remoteFiles.get(pkt.fileId).add(fromPeerId);\n            \n            window.activeStreams.forEach(task => {\n                if (task.fileId === pkt.fileId && !task.peers.includes(fromPeerId)) {\n                    task.peers.push(fromPeerId);\n                    pumpStream(task);\n                }\n            });\n            return;\n        }\n\n        originalProcess.apply(this, arguments);\n    };\n}\n
+    };
+
+    const originalProcess = window.protocol.processIncoming;
+    window.protocol.processIncoming = function(pkt, fromPeerId) {
+        if (pkt.t === 'SMART_ACK') {
+             if (window.pendingAcks.has(pkt.refId)) {
+                 window.pendingAcks.delete(pkt.refId);
+                 if(window.monitor) window.monitor.info('Ack', `✅ 对方已收到信令: ${pkt.refId.slice(0,4)}`);
+             }
+             return;
+        }
+
+        if (pkt.t === 'SMART_META') {
+            if (pkt.senderId === window.state.myId) return;
+            
+            if (pkt.target === window.state.myId) {
+                const conn = window.state.conns[fromPeerId];
+                if (conn && conn.open) {
+                    conn.send({ t: 'SMART_ACK', refId: pkt.id });
+                }
+            }
+            
+            window.db.saveMsg({ 
+                id: pkt.id || window.util.uuid(),
+                t: 'MSG', 
+                senderId: pkt.senderId,
+                target: pkt.target || CHAT.PUBLIC_ID, 
+                kind: 'SMART_FILE_UI', 
+                ts: pkt.ts,
+                n: pkt.n,
+                meta: pkt
+            });
+
+            if(window.monitor) window.monitor.info('STEP', `[STEP 3] 收到 Meta: ${pkt.fileName}`);
+
+            if (window.smartMetaCache.has(pkt.fileId)) {
+                if (!window.remoteFiles.has(pkt.fileId)) window.remoteFiles.set(pkt.fileId, new Set());
+                window.remoteFiles.get(pkt.fileId).add(pkt.senderId);
+                return;
+            }
+            
+            window.smartMetaCache.set(pkt.fileId, pkt);
+            
+            if (!window.remoteFiles.has(pkt.fileId)) window.remoteFiles.set(pkt.fileId, new Set());
+            window.remoteFiles.get(pkt.fileId).add(pkt.senderId);
+            
+            window.activeStreams.forEach(task => {
+                if (task.fileId === pkt.fileId && !task.peers.includes(pkt.senderId)) {
+                    task.peers.push(pkt.senderId);
+                    pumpStream(task);
+                }
+            });
+            
+            window.ui.appendMsg({ id: pkt.id || window.util.uuid(), senderId: pkt.senderId, n: pkt.n, ts: pkt.ts, kind: 'SMART_FILE_UI', meta: pkt });
+            window.protocol.flood(pkt, fromPeerId);
+            return;
+        }
+        
+        if (pkt.t === 'SMART_GET') { handleSmartGet(pkt, fromPeerId); return; }
+        
+        if (pkt.t === 'SMART_WHO_HAS') {
+            if (window.virtualFiles.has(pkt.fileId)) {
+                const conn = window.state.conns[fromPeerId];
+                if (conn) conn.send({ t: 'SMART_I_HAVE', fileId: pkt.fileId });
+            }
+            window.protocol.flood(pkt, fromPeerId);
+            return;
+        }
+        
+        if (pkt.t === 'SMART_I_HAVE') {
+            if (!window.remoteFiles.has(pkt.fileId)) window.remoteFiles.set(pkt.fileId, new Set());
+            window.remoteFiles.get(pkt.fileId).add(fromPeerId);
+            
+            window.activeStreams.forEach(task => {
+                if (task.fileId === pkt.fileId && !task.peers.includes(fromPeerId)) {
+                    task.peers.push(fromPeerId);
+                    pumpStream(task);
+                }
+            });
+            return;
+        }
+
+        originalProcess.apply(this, arguments);
+    };
+}
