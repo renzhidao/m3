@@ -1,14 +1,13 @@
 import { MSG_TYPE, CHAT, NET_PARAMS } from './constants.js';
 
 /**
- * Smart Core v2.5.7 - Robust FS & Stream
- * 修复：1. 保存无反应 (强制流式下载)
- *       2. 设备卡死 (降频增效 + 暴力GC)
- *       3. 坏文件导致白屏 (配合UI层容错)
+ * Smart Core v2.5.8 - History & Playback Fix
+ * 修复：1. 视频无法播放 (SW区分下载/播放)
+ *       2. 下载逻辑优化 (显式参数)
  */
 
 export function init() {
-  if (window.monitor) window.monitor.info('Core', 'Smart Core v2.5.7 (Robust) 启动');
+  if (window.monitor) window.monitor.info('Core', 'Smart Core v2.5.8 (Playback) 启动');
 
   window.virtualFiles = new Map(); 
   window.remoteFiles = new Map();  
@@ -27,27 +26,24 @@ export function init() {
   window.smartCore = {
       handleBinary: (data, fromPeerId) => handleIncomingBinary(data, fromPeerId),
       
-      // === 修复1：统一流式下载，解决点击无反应 ===
+      // === 修复：显式增加下载参数 ===
       download: async (fileId, fileName) => {
-          // 无论本地还是远程，统统走 SW 虚拟链接下载，利用浏览器原生下载管理器
           if(window.monitor) window.monitor.info('UI', `[Download] 启动流式下载: ${fileName}`);
           
-          const url = `/virtual/file/${fileId}/${encodeURIComponent(fileName)}`;
+          // 添加 ?download=1 参数，通知 SW 强制添加附件头
+          const url = `/virtual/file/${fileId}/${encodeURIComponent(fileName)}?download=1`;
           
-          // 创建隐藏链接触发下载
           const a = document.createElement('a');
           a.href = url;
           a.download = fileName; 
           document.body.appendChild(a);
           a.click();
           
-          // 延时清理 DOM，不阻塞主线程
           setTimeout(() => document.body.removeChild(a), 100);
       },
       
       play: (fileId, fileName) => {
           if (window.virtualFiles.has(fileId)) {
-              // 存活检查：如果文件对象虽然在Map里，但size为0或不可读，降级处理
               const file = window.virtualFiles.get(fileId);
               try {
                   if (file.size === 0) throw new Error('File Empty');
@@ -57,10 +53,11 @@ export function init() {
                   return url;
               } catch(e) {
                   console.warn('Local file invalidated:', fileId);
-                  window.virtualFiles.delete(fileId); // 移除坏引用
-                  return null; // 返回 null 让 UI 处理
+                  window.virtualFiles.delete(fileId); 
+                  return null; 
               }
           }
+          // 播放链接不带参数，允许内联播放
           return `/virtual/file/${fileId}/${encodeURIComponent(fileName)}`;
       },
       
@@ -97,7 +94,6 @@ function flowSend(conn, data, callback) {
 
     const attempt = () => {
         if (!conn.open) return callback(new Error('Closed during send'));
-        // 维持高水位：1.5MB
         if (dc.bufferedAmount < 1.5 * 1024 * 1024) {
             try { conn.send(data); callback(null); } catch(e) { callback(e); }
         } else {
@@ -137,11 +133,10 @@ function handleSWMessage(event) {
     else if (d.type === 'STREAM_CANCEL') stopStreamTask(d.requestId);
 }
 
-// === 修复2：降频增效 ===
-const CHUNK_SIZE = 512 * 1024;  // 64KB -> 512KB (减少8倍回调)
-const MAX_INFLIGHT = 8;         // 64 -> 8 (减少内存积压)
-const TIMEOUT_MS = 15000;       // 5s -> 15s (宽容弱网)
-const HIGH_WATER_MARK = 20 * 1024 * 1024; // 50MB -> 20MB (防OOM)
+const CHUNK_SIZE = 512 * 1024;  
+const MAX_INFLIGHT = 8;         
+const TIMEOUT_MS = 15000;       
+const HIGH_WATER_MARK = 20 * 1024 * 1024; 
 
 function startStreamTask(req) {
     const { requestId, fileId, range } = req;
@@ -207,7 +202,6 @@ function startStreamTask(req) {
     }
 }
 
-// === 修复3：暴力清理，防止内存泄漏 ===
 function stopStreamTask(requestId) {
     const task = window.activeStreams.get(requestId);
     if (task) {
@@ -241,7 +235,7 @@ function pumpStream(task) {
         if (task.cursor > task.end) {
             sendToSW({ type: 'STREAM_END', requestId: task.requestId });
             task.finished = true;
-            stopStreamTask(task.requestId); // 立即清理
+            stopStreamTask(task.requestId); 
             if(window.monitor) window.monitor.info('STEP', `✅ 传输完成`);
             return;
         }
@@ -396,7 +390,7 @@ function serveLocalFile(req) {
     sendToSW({ type: 'STREAM_META', requestId: req.requestId, fileSize: file.size, fileType: file.type, start, end });
 
     let offset = start;
-    const CHUNK = 512 * 1024; // 同样增大块大小
+    const CHUNK = 512 * 1024; 
     
     window.activeStreams.set(req.requestId, { finished: false });
 

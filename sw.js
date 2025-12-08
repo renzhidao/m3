@@ -1,4 +1,4 @@
-const CACHE_NAME = 'p1-stream-v1765199401'; // Bump Version
+const CACHE_NAME = 'p1-stream-v1765199502'; // Version Bump
 const CORE_ASSETS = [
   './',
   './index.html',
@@ -81,10 +81,15 @@ async function handleVirtualStream(event) {
     
     if (!client) return new Response("Service Worker: No Client Active", { status: 503 });
 
-    const parts = new URL(event.request.url).pathname.split('/');
+    const urlObj = new URL(event.request.url);
+    const parts = urlObj.pathname.split('/');
     const fileId = parts[3];
-    const fileName = decodeURIComponent(parts[4] || 'file'); // 获取文件名
+    const fileName = decodeURIComponent(parts[4] || 'file');
     const range = event.request.headers.get('Range');
+    
+    // === 修复：检查 URL 参数，决定是否强制下载 ===
+    const isDownload = urlObj.searchParams.has('download');
+    
     const requestId = Math.random().toString(36).slice(2) + Date.now();
 
     const stream = new ReadableStream({
@@ -108,8 +113,10 @@ async function handleVirtualStream(event) {
                     headers.set('Content-Type', d.fileType || 'application/octet-stream');
                     headers.set('Accept-Ranges', 'bytes');
                     
-                    // === 修复：强制下载，而不是预览 ===
-                    headers.set('Content-Disposition', `attachment; filename="${fileName}"`);
+                    // 仅当明确要求下载时，才添加 attachment
+                    if (isDownload) {
+                        headers.set('Content-Disposition', `attachment; filename="${fileName}"`);
+                    }
                     
                     const total = d.fileSize;
                     const start = d.start;
@@ -134,6 +141,6 @@ async function handleVirtualStream(event) {
                 streamControllers.delete(requestId);
                 resolve(new Response("Gateway Timeout (Metadata Wait)", { status: 504 }));
             }
-        }, 30000); // 10s -> 30s
+        }, 30000);
     });
 }

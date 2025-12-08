@@ -1,7 +1,7 @@
 import { CHAT, UI_CONFIG } from './constants.js';
 
 export function init() {
-  console.log('📦 加载模块: UI Render (Safe Guard)');
+  console.log('📦 加载模块: UI Render (Loose Check)');
   window.ui = window.ui || {};
   
   const style = document.createElement('style');
@@ -119,7 +119,6 @@ export function init() {
       if (!box || !m) return;
       if (document.getElementById('msg-' + m.id)) return;
 
-      // === 修复：Try-Catch 保护，防止一条坏消息渲染失败导致白屏 ===
       try {
           const isMe = m.senderId === window.state.myId;
           let content = '', style = '';
@@ -131,11 +130,13 @@ export function init() {
              const isAudio = meta.fileType.startsWith('audio');
              const isImg = meta.fileType.startsWith('image');
              
-             // === 修复：存活检查 ===
-             // 即使是自己发的消息，如果浏览器内存回收了 File 对象，smartCore.play 会返回 null
-             const streamUrl = window.smartCore.play(meta.fileId, meta.fileName);
+             // === 修复：宽容检查 ===
+             // 只有是自己发的，才检查本地内存
+             // 别人发的，默认认为是活的（依赖P2P）
+             let streamUrl = window.smartCore.play(meta.fileId, meta.fileName);
              
              if (isMe && !streamUrl) {
+                 // 本地发送方，且文件对象已死 -> 显示过期
                  content = `
                  <div class="file-expired">
                      <div style="font-weight:bold">❌ ${window.util.escape(meta.fileName)}</div>
@@ -143,6 +144,10 @@ export function init() {
                  </div>`;
                  style = 'background:transparent;padding:0;border:none';
              } else {
+                 // 接收方 或者 本地存活 -> 正常渲染
+                 // 如果 streamUrl 为 null (理论上 smartCore.play 对非本地文件会返回 path)，这里兜底
+                 if (!streamUrl) streamUrl = `/virtual/file/${meta.fileId}/${encodeURIComponent(meta.fileName)}`;
+
                  if (isVideo) {
                      const errScript = `this.style.display='none';this.nextElementSibling.style.display='block';`;
                      
@@ -224,7 +229,7 @@ export function init() {
         try {
             let url;
             if (typeof data === 'string') {
-                if (data.startsWith('')) {
+                if (data.startsWith('data:')) {
                      const a = document.createElement('a');
                      a.href = data;
                      a.download = name;
