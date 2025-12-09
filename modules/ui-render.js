@@ -1,7 +1,7 @@
 import { CHAT, UI_CONFIG } from './constants.js';
 
 export function init() {
-  console.log('📦 加载模块: UI Render (Diagnostic Mode)');
+  console.log('📦 加载模块: UI Render (Full Diagnostic + Env Check)');
   window.ui = window.ui || {};
   
   const style = document.createElement('style');
@@ -26,13 +26,16 @@ export function init() {
         opacity: 0.6; font-style: italic; font-size: 12px; color: #aaa;
         background: rgba(255,0,0,0.1); padding: 8px; border-radius: 4px;
     }
-    .video-error {
+    .video-error, .img-error-box {
         color: #ff3b30; font-size: 11px; padding: 10px; text-align: center; border: 1px dashed #ff3b30; border-radius: 4px;
+    }
+    .chat-img.error {
+        opacity: 0.3; border: 2px solid #ff3b30;
     }
   `;
   document.head.appendChild(style);
   
-  // === 注入全局错误处理函数，供 HTML 内联调用 ===
+  // === 视频错误处理 + 环境检测 ===
   window.handleVideoError = function(el, fileName) {
       el.style.display = 'none';
       const errDiv = el.parentElement.querySelector('.video-error');
@@ -50,9 +53,63 @@ export function init() {
               case 4: msg = '格式不支持 (MEDIA_ERR_SRC_NOT_SUPPORTED)'; break;
           }
       }
-      console.error('Video Error:', err);
       if (window.monitor) {
-          window.monitor.fatal('VIDEO', `❌ 播放失败 [Code:${code}]: ${fileName}`, {msg});
+          window.monitor.fatal('VIDEO', `❌ 视频挂了 [Code:${code}]: ${fileName}`, {msg});
+          
+          // === [Env Check] 环境体检 ===
+          if (code === 4 || code === 3) {
+              const checks = [
+                'video/mp4; codecs="avc1.42E01E"', // H.264 Baseline
+                'video/mp4; codecs="avc1.640028"', // H.264 High
+                'video/mp4; codecs="hev1.1.6.L93.B0"', // H.265 (HEVC)
+                'video/webm; codecs="vp9"'
+              ];
+              let supportMsg = [];
+              try {
+                  if ('MediaSource' in window) {
+                      checks.forEach(mime => {
+                          const res = MediaSource.isTypeSupported(mime);
+                          const name = mime.includes('avc')?'H264':mime.includes('hev')?'H265':'VP9';
+                          supportMsg.push(`${name}:${res?'✅':'❌'}`);
+                      });
+                      window.monitor.warn('ENV', `环境解码体检: ${supportMsg.join(', ')}`);
+                  } else {
+                      window.monitor.error('ENV', '⚠️ 当前浏览器不支持 MediaSource API (无法流式播放)');
+                  }
+              } catch(e) {}
+          }
+      }
+  };
+
+  window.handleImageError = function(el, fileName) {
+      if (el.dataset.errHandled) return;
+      el.dataset.errHandled = 'true';
+      el.classList.add('error');
+      const parent = el.parentElement;
+      if (parent) {
+          const div = document.createElement('div');
+          div.className = 'img-error-box';
+          div.innerHTML = '❌ 图片加载失败';
+          parent.appendChild(div);
+      }
+
+      const src = el.src;
+      let reason = '未知';
+      if (src.startsWith('blob:')) {
+          reason = 'Blob已失效';
+      } else if (src.includes('/virtual/file/')) {
+          fetch(src, {method: 'HEAD'}).then(res => {
+              reason = !res.ok ? `HTTP ${res.status}` : '数据损坏';
+              report(reason);
+          }).catch(e => report('网络探测失败'));
+          return;
+      } else {
+          reason = '资源无法访问';
+      }
+      report(reason);
+
+      function report(r) {
+          if (window.monitor) window.monitor.fatal('IMAGE', `❌ 图片挂了: ${fileName}`, {reason: r});
       }
   };
   
@@ -164,7 +221,6 @@ export function init() {
              const streamUrl = window.smartCore.play(meta.fileId, meta.fileName);
              
              if (isVideo) {
-                 // === 修改：调用全局 handleVideoError，上报 Monitor ===
                  content = `
                  <div class="stream-card">
                      <div style="font-weight:bold;color:#4ea8ff">🎬 ${safeName}</div>
@@ -175,7 +231,7 @@ export function init() {
                             onerror="window.handleVideoError(this, '${safeName}')"></video>
                      
                      <div class="video-error" style="display:none">
-                        ❌ 视频加载失败<br><span style="font-size:10px">请查看诊断面板(🐞)获取错误码</span>
+                        ❌ 视频加载失败<br><span style="font-size:10px">请查看诊断面板()获取错误码</span>
                      </div>
 
                      <div style="text-align:right;margin-top:4px">
@@ -200,7 +256,9 @@ export function init() {
              } else if (isImg) {
                  content = `
                  <div class="stream-card">
-                     <img src="${streamUrl}" class="chat-img" style="max-width:200px;border-radius:4px;display:block">
+                     <img src="${streamUrl}" class="chat-img" 
+                          style="max-width:200px;border-radius:4px;display:block"
+                          onerror="window.handleImageError(this, '${safeName}')">
                      <div style="font-size:10px;color:#aaa;margin-top:4px">${sizeStr}</div>
                  </div>`;
                  style = 'background:transparent;padding:0;border:none';
@@ -219,7 +277,7 @@ export function init() {
          }
 
       } else if (m.kind === CHAT.KIND_IMAGE) {
-         content = `<img src="${m.txt}" class="chat-img" style="min-height:50px; background:#222;">`;
+         content = `<img src="${m.txt}" class="chat-img" style="min-height:50px; background:#222;" onerror="window.handleImageError(this, '普通图片')">`;
          style = 'background:transparent;padding:0';
       } else {
          content = window.util.escape(m.txt);

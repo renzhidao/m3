@@ -1,15 +1,14 @@
 import { MSG_TYPE, CHAT, NET_PARAMS } from './constants.js';
 
 /**
- * Smart Core v2.5.7 - Safe Guard
+ * Smart Core v2.5.8 - Deep Probe (Moov Detector)
  */
 
 export function init() {
-  // 确保 Monitor 存在，如果不存在则给一个空实现，防止 crash
   if (!window.monitor) {
       window.monitor = { info:()=>{}, warn:()=>{}, error:()=>{}, log:()=>{} };
   }
-  window.monitor.info('Core', 'Smart Core v2.5.7 (Safe) 启动');
+  window.monitor.info('Core', 'Smart Core v2.5.8 (Deep Probe) 启动');
 
   window.virtualFiles = new Map(); 
   window.remoteFiles = new Map();  
@@ -360,13 +359,9 @@ function handleIncomingBinary(rawBuffer, fromPeerId) {
     let header;
     try {
         header = JSON.parse(headerStr); 
-    } catch(e) {
-        // 如果 header 解析都失败了，说明包彻底废了，直接丢弃，不抛错
-        return; 
-    }
+    } catch(e) { return; }
 
-    // === [Safe Diagnostic] 诊断：文件头检查 ===
-    // 使用独立 try-catch 包裹，绝不让日志打印代码影响数据处理
+    // === [Deep Probe] 深度诊断：MP4 Box 结构扫描 ===
     try {
         if (header.offset === 0 && window.monitor) {
              const body = new Uint8Array(buffer.slice(1 + headerLen));
@@ -376,11 +371,45 @@ function handleIncomingBinary(rawBuffer, fromPeerId) {
                 hexArr.push(body[i].toString(16).padStart(2, '0').toUpperCase());
              }
              window.monitor.warn('PROBE', `🔍 收到文件头 (Offset 0): [${hexArr.join(' ')}]`, {from: fromPeerId.slice(0,4)});
+             
+             // MP4 Box 扫描
+             let pos = 0;
+             let foundFtyp = false;
+             let foundMoov = false;
+             let foundMdat = false;
+             
+             // 只扫描前 64KB (通常够了)
+             const scanLimit = Math.min(body.length, 65536);
+             
+             while (pos < scanLimit - 8) {
+                 const size = (body[pos] << 24) | (body[pos+1] << 16) | (body[pos+2] << 8) | body[pos+3];
+                 const typeArr = body.slice(pos+4, pos+8);
+                 const type = String.fromCharCode(...typeArr);
+                 
+                 if (type === 'ftyp') foundFtyp = true;
+                 if (type === 'moov') foundMoov = true;
+                 if (type === 'mdat') {
+                     foundMdat = true;
+                     break; // 遇到数据区了，停止扫描
+                 }
+                 
+                 if (size <= 0) break; // 异常
+                 pos += size;
+             }
+             
+             if (foundFtyp) {
+                 let msg = '>> MP4结构: ';
+                 if (foundMoov && !foundMdat) msg += '✅ 索引在头 (Moov First) - 适合流播放';
+                 else if (foundMdat && !foundMoov) msg += '⚠️ 索引在尾 (Moov Missing/Late) - 流播放大概率失败!';
+                 else if (foundMoov && foundMdat) msg += '✅ 索引在头 (Moov before Mdat)';
+                 else msg += '❓ 疑似索引缺失';
+                 window.monitor.warn('PROBE', msg);
+             }
         }
     } catch(diagErr) {
         // 忽略诊断错误
     }
-    // =====================================
+    // ===========================================
 
     const task = window.activeStreams.get(header.reqId);
     if (task) {
