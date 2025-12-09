@@ -1,14 +1,13 @@
 import { MSG_TYPE, CHAT, NET_PARAMS } from './constants.js';
 
 /**
- * Smart Core v2.5.8 - Deep Probe (Moov Detector)
+ * Smart Core v2.5.5 - Lossless Repair
+ * 修复：1. 弱网丢包问题 (receivedOffsets)
+ *       2. 重启后历史文件无法加载问题 (getRecentFiles)
  */
 
 export function init() {
-  if (!window.monitor) {
-      window.monitor = { info:()=>{}, warn:()=>{}, error:()=>{}, log:()=>{} };
-  }
-  window.monitor.info('Core', 'Smart Core v2.5.8 (Deep Probe) 启动');
+  if (window.monitor) window.monitor.info('Core', 'Smart Core v2.5.5 (Lossless) 启动');
 
   window.virtualFiles = new Map(); 
   window.remoteFiles = new Map();  
@@ -16,18 +15,15 @@ export function init() {
   window.activeStreams = new Map(); 
   window.pendingAcks = new Map(); 
   window.blobUrls = new Map();
-  window.metaResolvers = new Map();
   
   setInterval(watchdog, 1000);
-  // setTimeout(restoreMetaFromDB, 1000); // Moved to manual init
+  setTimeout(restoreMetaFromDB, 1000);
 
   if ('serviceWorker' in navigator) {
       navigator.serviceWorker.addEventListener('message', event => handleSWMessage(event));
   }
 
   window.smartCore = {
-      initMeta: async () => { await restoreMetaFromDB(); },
-
       handleBinary: (data, fromPeerId) => handleIncomingBinary(data, fromPeerId),
       
       download: async (fileId, fileName) => {
@@ -122,6 +118,7 @@ function flowSend(conn, data, callback) {
 
     const attempt = () => {
         if (!conn.open) return callback(new Error('Closed during send'));
+        // 维持高水位：1.5MB
         if (dc.bufferedAmount < 1.5 * 1024 * 1024) {
             try { conn.send(data); callback(null); } catch(e) { callback(e); }
         } else {
@@ -131,6 +128,7 @@ function flowSend(conn, data, callback) {
     attempt();
 }
 
+// 修复：使用专门的 getRecentFiles 接口，扫描范围扩大到200条
 async function restoreMetaFromDB() {
     try {
         const msgs = await window.db.getRecentFiles(200);
@@ -145,7 +143,7 @@ async function restoreMetaFromDB() {
                 count++;
             }
         });
-        if(window.monitor) window.monitor.info('Core', `⚡ 已恢复 ${count} 个历史文件元数据`);
+        if(window.monitor && count > 0) window.monitor.info('Core', `⚡ 已恢复 ${count} 个历史文件元数据`);
     } catch(e) {
         console.error('Restore Meta Failed', e);
     }
@@ -167,11 +165,7 @@ const MAX_INFLIGHT = 64;
 const TIMEOUT_MS = 5000;
 const HIGH_WATER_MARK = 50 * 1024 * 1024; 
 
-
-
-
-
-async function startStreamTask(req) {
+function startStreamTask(req) {
     const { requestId, fileId, range } = req;
     
     if (window.virtualFiles.has(fileId)) {
@@ -180,46 +174,13 @@ async function startStreamTask(req) {
         return;
     }
 
-    // === 阶段1: 等待 Meta (事件驱动 + 轮询双保底) ===
-    let meta = window.smartMetaCache.get(fileId);
+    const meta = window.smartMetaCache.get(fileId);
     if (!meta) {
-        if (window.monitor) window.monitor.warn('STEP', `⏳ Meta未就绪，挂起等待...`, {reqId: requestId.slice(-4)});
-        
-        meta = await new Promise(resolve => {
-            window.metaResolvers.set(fileId, resolve);
-            let attempt = 0;
-            const timer = setInterval(() => {
-                const m = window.smartMetaCache.get(fileId);
-                if (m) {
-                    clearInterval(timer);
-                    window.metaResolvers.delete(fileId);
-                    resolve(m);
-                } else if (++attempt > 40) { // 2s
-                    clearInterval(timer);
-                    window.metaResolvers.delete(fileId);
-                    resolve(null);
-                }
-            }, 50);
-        });
-    }
-    
-    if (!meta) {
-        if(window.monitor) window.monitor.error('STEP', `❌ Meta等待超时`, {fileId});
-        sendToSW({ type: 'STREAM_ERROR', requestId, msg: 'Meta Timeout' });
+        if(window.monitor) window.monitor.error('STEP', `❌ [STEP 4 Fail] 元数据丢失 (请确认发送方在线)`, {fileId});
+        sendToSW({ type: 'STREAM_ERROR', requestId, msg: 'Meta Not Found' });
         return;
     }
 
-    // === [Trace] 关键诊断日志 ===
-    const peers = Array.from(window.remoteFiles.get(fileId) || []);
-    if (window.monitor) {
-        window.monitor.info('Trace', `🚀 任务初始化`, {
-            req: requestId.slice(-4),
-            file: meta.fileName,
-            peers: peers.length > 0 ? peers : "❌无节点(等待WHO_HAS)"
-        });
-    }
-
-    // === 阶段2: 任务初始化 ===
     let start = 0;
     let end = meta.fileSize - 1;
     if (range && range.startsWith('bytes=')) {
@@ -236,54 +197,6 @@ async function startStreamTask(req) {
     if (start < 0) start = 0;
     if (end >= meta.fileSize) end = meta.fileSize - 1;
 
-    const task = {
-        requestId,
-        fileId,
-        start,
-        end,
-        cursor: start, 
-        nextReq: start, 
-        peers: peers,
-        buffer: new Map(),     
-        bufferBytes: 0,        
-        inflight: new Map(),
-        receivedOffsets: new Set(),
-        missing: new Set(),    
-        finished: false,
-        stalledCount: 0
-    };
-    window.activeStreams.set(requestId, task);
-
-    if (task.peers.length === 0) {
-        window.protocol.flood({ t: 'SMART_WHO_HAS', fileId });
-    } else {
-        pumpStream(task);
-    }
-
-    // === 阶段3: 首帧预缓冲 (Pre-Buffer Offset 0) ===
-    if (start === 0 && !task.receivedOffsets.has(0)) {
-        if(window.monitor) window.monitor.info('Trace', `⏳ 等待首帧(Offset 0)...`);
-        const t0 = performance.now();
-        
-        await new Promise(resolve => {
-            const check = setInterval(() => {
-                if (task.receivedOffsets.has(0) || task.finished || !window.activeStreams.has(requestId)) {
-                    clearInterval(check);
-                    resolve(true);
-                }
-            }, 50);
-            setTimeout(() => { clearInterval(check); resolve(false); }, 3000);
-        });
-        
-        const cost = Math.round(performance.now() - t0);
-        const success = task.receivedOffsets.has(0);
-        if(window.monitor) {
-            if(success) window.monitor.info('Trace', `✅ 首帧就绪 (耗时${cost}ms)`);
-            else window.monitor.warn('Trace', `⚠️ 首帧等待超时 (耗时${cost}ms) - 强制响应SW`);
-        }
-    }
-
-    // === 阶段4: 响应 SW ===
     sendToSW({
         type: 'STREAM_META',
         requestId,
@@ -291,9 +204,33 @@ async function startStreamTask(req) {
         fileType: meta.fileType,
         start, end
     });
-    if(window.monitor) window.monitor.info('Trace', `📤 已发送 Meta 给 SW (Ready to Stream)`);
-}
 
+    const task = {
+        requestId,
+        fileId,
+        start,
+        end,
+        cursor: start, 
+        nextReq: start, 
+        peers: Array.from(window.remoteFiles.get(fileId) || []),
+        buffer: new Map(),     
+        bufferBytes: 0,        
+        inflight: new Map(),
+        receivedOffsets: new Set(), // 新增：已接收偏移量记录 (防丢包)
+        missing: new Set(),    
+        finished: false,
+        stalledCount: 0
+    };
+    
+    window.activeStreams.set(requestId, task);
+    
+    if (task.peers.length === 0) {
+        if(window.monitor) window.monitor.warn('STEP', `[STEP 5 Fail] 无可用节点`);
+        window.protocol.flood({ t: 'SMART_WHO_HAS', fileId });
+    } else {
+        pumpStream(task);
+    }
+}
 
 function stopStreamTask(requestId) {
     window.activeStreams.delete(requestId);
@@ -346,9 +283,12 @@ function pumpStream(task) {
         }
         
         if (offset > task.end) continue;
+        
+        // 双重检查：如果已经收到了，就不用请求了
         if (task.receivedOffsets.has(offset)) continue;
 
         const size = Math.min(CHUNK_SIZE, task.end - offset + 1);
+        
         const peerId = task.peers[Math.floor(offset / CHUNK_SIZE) % task.peers.length];
         const conn = window.state.conns[peerId];
         
@@ -392,6 +332,7 @@ function watchdog() {
         if (needsPump) pumpStream(task); 
     });
     
+    // 只在超时严重时报警
     if (timeoutCount > 5 && window.monitor) {
         window.monitor.warn('Timeout', `⚠️ 正在重试 ${timeoutCount} 个超时块...`);
     }
@@ -420,75 +361,25 @@ function handleIncomingBinary(rawBuffer, fromPeerId) {
     const decoder = new TextDecoder();
     const headerStr = decoder.decode(buffer.slice(1, 1 + headerLen));
     
-    let header;
     try {
-        header = JSON.parse(headerStr); 
-    } catch(e) { return; }
-
-    // === [Deep Probe] 深度诊断：MP4 Box 结构扫描 ===
-    try {
-        if (header.offset === 0 && window.monitor) {
-             const body = new Uint8Array(buffer.slice(1 + headerLen));
-             const checkLen = Math.min(body.length, 16);
-             const hexArr = [];
-             for(let i=0; i<checkLen; i++) {
-                hexArr.push(body[i].toString(16).padStart(2, '0').toUpperCase());
-             }
-             window.monitor.warn('PROBE', `🔍 收到文件头 (Offset 0): [${hexArr.join(' ')}]`, {from: fromPeerId.slice(0,4)});
-             
-             // MP4 Box 扫描
-             let pos = 0;
-             let foundFtyp = false;
-             let foundMoov = false;
-             let foundMdat = false;
-             
-             // 只扫描前 64KB (通常够了)
-             const scanLimit = Math.min(body.length, 65536);
-             
-             while (pos < scanLimit - 8) {
-                 const size = (body[pos] << 24) | (body[pos+1] << 16) | (body[pos+2] << 8) | body[pos+3];
-                 const typeArr = body.slice(pos+4, pos+8);
-                 const type = String.fromCharCode(...typeArr);
-                 
-                 if (type === 'ftyp') foundFtyp = true;
-                 if (type === 'moov') foundMoov = true;
-                 if (type === 'mdat') {
-                     foundMdat = true;
-                     break; // 遇到数据区了，停止扫描
-                 }
-                 
-                 if (size <= 0) break; // 异常
-                 pos += size;
-             }
-             
-             if (foundFtyp) {
-                 let msg = '>> MP4结构: ';
-                 if (foundMoov && !foundMdat) msg += '✅ 索引在头 (Moov First) - 适合流播放';
-                 else if (foundMdat && !foundMoov) msg += '⚠️ 索引在尾 (Moov Missing/Late) - 流播放大概率失败!';
-                 else if (foundMoov && foundMdat) msg += '✅ 索引在头 (Moov before Mdat)';
-                 else msg += '❓ 疑似索引缺失';
-                 window.monitor.warn('PROBE', msg);
-             }
-        }
-    } catch(diagErr) {
-        // 忽略诊断错误
-    }
-    // ===========================================
-
-    const task = window.activeStreams.get(header.reqId);
-    if (task) {
-        const body = buffer.slice(1 + headerLen);
-        const offset = header.offset; 
-        
-        if (!task.receivedOffsets.has(offset)) {
-            task.receivedOffsets.add(offset); 
-            task.inflight.delete(offset);     
+        const header = JSON.parse(headerStr); 
+        const task = window.activeStreams.get(header.reqId);
+        if (task) {
+            const body = buffer.slice(1 + headerLen);
+            const offset = header.offset; 
             
-            task.buffer.set(offset, body);
-            task.bufferBytes += body.byteLength;
-            pumpStream(task);
+            // 修复核心：只要是我还没收到的，统统收下！
+            // 不再判断 inflight.has(offset)，彻底解决迟到丢包问题
+            if (!task.receivedOffsets.has(offset)) {
+                task.receivedOffsets.add(offset); // 标记为已接收
+                task.inflight.delete(offset);     // 如果在等待列表里，移除它
+                
+                task.buffer.set(offset, body);
+                task.bufferBytes += body.byteLength;
+                pumpStream(task);
+            }
         }
-    }
+    } catch(e) {}
 }
 
 function handleSmartGet(pkt, requesterId) {
@@ -503,6 +394,7 @@ function handleSmartGet(pkt, requesterId) {
     if (!conn || !conn.open) return;
     
     if(window.monitor) {
+        // 降低日志频率，每10个请求打一条
         if (Math.random() < 0.1) {
              window.monitor.info('Serve', `📥 正在上传...`, {to: requesterId.slice(0,4)});
         }
@@ -665,14 +557,7 @@ function applyHooks() {
                 return;
             }
             
-            
             window.smartMetaCache.set(pkt.fileId, pkt);
-            if (window.metaResolvers.has(pkt.fileId)) {
-                const resolve = window.metaResolvers.get(pkt.fileId);
-                resolve(pkt);
-                window.metaResolvers.delete(pkt.fileId);
-            }
-
             
             if (!window.remoteFiles.has(pkt.fileId)) window.remoteFiles.set(pkt.fileId, new Set());
             window.remoteFiles.get(pkt.fileId).add(pkt.senderId);

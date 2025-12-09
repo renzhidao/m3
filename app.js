@@ -4,22 +4,6 @@ export function init() {
   console.log(`🚀 启动主程序: App Core v${APP_VERSION}`);
   
   window.app = {
-    
-    async waitForSW() {
-        if (!('serviceWorker' in navigator)) return;
-        if (navigator.serviceWorker.controller) return;
-        
-        window.util.log('⏳ 等待 SW 接管页面...');
-        return new Promise(resolve => {
-            navigator.serviceWorker.addEventListener('controllerchange', () => {
-                window.util.log('✅ SW 已接管，继续启动');
-                resolve();
-            });
-            // 最多等 3秒，防止死锁
-            setTimeout(resolve, 3000);
-        });
-    },
-
     async init() {
       window.util.log(`正在启动 P1 v${APP_VERSION}...`);
       
@@ -30,22 +14,11 @@ export function init() {
       if (window.ui && window.ui.init) window.ui.init();
       if (window.uiEvents && window.uiEvents.init) window.uiEvents.init();
       
-      // 修复：必须先恢复文件元数据，再渲染UI，防止历史图片/视频报404
-      if (window.smartCore && window.smartCore.initMeta) await window.smartCore.initMeta();
-      await this.waitForSW();
-      
       this.loadHistory(20);
 
       // 启动时并发：P2P 和 MQTT 同时开始连接，不互相等待
       if (window.p2p) window.p2p.start();
-      
       if (window.mqtt) window.mqtt.start();
-      
-      // === 修复：主动握手 SW，防止老设备连接丢失 ===
-      if (navigator.serviceWorker && navigator.serviceWorker.controller) {
-          navigator.serviceWorker.controller.postMessage({ type: 'PING' });
-      }
-
 
       this.loopTimer = setInterval(() => this.loop(), NET_PARAMS.LOOP_INTERVAL);
       this.bindLifecycle();
