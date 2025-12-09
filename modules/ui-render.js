@@ -1,7 +1,7 @@
 import { CHAT, UI_CONFIG } from './constants.js';
 
 export function init() {
-  console.log('📦 加载模块: UI Render (Video Fix)');
+  console.log('📦 加载模块: UI Render (Safe Guard)');
   window.ui = window.ui || {};
   
   const style = document.createElement('style');
@@ -23,8 +23,9 @@ export function init() {
         background: rgba(0,0,0,0.3); padding: 10px; border-radius: 8px; min-width: 220px;
     }
     .file-expired {
-        opacity: 0.6; font-style: italic; font-size: 12px; color: #aaa;
+        opacity: 0.6; font-style: italic; font-size: 12px; color: #ff3b30;
         background: rgba(255,0,0,0.1); padding: 8px; border-radius: 4px;
+        border: 1px dashed #ff3b30;
     }
     .video-error {
         color: #ff3b30; font-size: 11px; padding: 10px; text-align: center; border: 1px dashed #ff3b30; border-radius: 4px;
@@ -118,107 +119,112 @@ export function init() {
       if (!box || !m) return;
       if (document.getElementById('msg-' + m.id)) return;
 
-      const isMe = m.senderId === window.state.myId;
-      let content = '', style = '';
-
-      if (m.kind === 'SMART_FILE_UI') {
-         const meta = m.meta;
-         const sizeStr = (meta.fileSize / (1024*1024)).toFixed(2) + ' MB';
-         const isVideo = meta.fileType.startsWith('video');
-         const isAudio = meta.fileType.startsWith('audio');
-         const isImg = meta.fileType.startsWith('image');
-         
-         // === 存活检查 ===
-         if (isMe && !window.virtualFiles.has(meta.fileId)) {
-             content = `
-             <div class="file-expired">
-                 <div style="font-weight:bold">⚠️ ${window.util.escape(meta.fileName)}</div>
-                 <div>文件句柄已丢失 (页面已刷新/后台释放)</div>
-             </div>`;
-             style = 'background:transparent;padding:0;border:none';
-         } else {
+      // === 修复：Try-Catch 保护，防止一条坏消息渲染失败导致白屏 ===
+      try {
+          const isMe = m.senderId === window.state.myId;
+          let content = '', style = '';
+    
+          if (m.kind === 'SMART_FILE_UI') {
+             const meta = m.meta;
+             const sizeStr = (meta.fileSize / (1024*1024)).toFixed(2) + ' MB';
+             const isVideo = meta.fileType.startsWith('video');
+             const isAudio = meta.fileType.startsWith('audio');
+             const isImg = meta.fileType.startsWith('image');
+             
+             // === 修复：存活检查 ===
+             // 即使是自己发的消息，如果浏览器内存回收了 File 对象，smartCore.play 会返回 null
              const streamUrl = window.smartCore.play(meta.fileId, meta.fileName);
              
-             if (isVideo) {
-                 // === 修复：增加 onerror 捕获 ===
-                 const errScript = `this.style.display='none';this.nextElementSibling.style.display='block';console.error('Video Error:', this.error)`;
-                 
+             if (isMe && !streamUrl) {
                  content = `
-                 <div class="stream-card">
-                     <div style="font-weight:bold;color:#4ea8ff">🎬 ${window.util.escape(meta.fileName)}</div>
-                     <div style="font-size:11px;color:#aaa;margin-bottom:8px">${sizeStr} (流式直连)</div>
-                     
-                     <video controls src="${streamUrl}" 
-                            style="width:100%;max-width:300px;background:#000;border-radius:4px"
-                            onerror="${errScript}"></video>
-                     
-                     <div class="video-error" style="display:none">
-                        ❌ 视频加载失败<br>可能原因: 文件损坏或编码不支持
-                     </div>
-
-                     <div style="text-align:right;margin-top:4px">
-                         <a href="javascript:void(0)" onclick="window.smartCore.download('${meta.fileId}','${window.util.escape(meta.fileName)}')" style="color:#aaa;font-size:10px;text-decoration:none">⬇ 保存本地</a>
-                     </div>
-                 </div>`;
-                 style = 'background:transparent;padding:0;border:none';
-             } else if (isAudio) {
-                 content = `
-                 <div class="stream-card">
-                     <div style="font-weight:bold;color:#4ea8ff">🎵 ${window.util.escape(meta.fileName)}</div>
-                     <div style="font-size:11px;color:#aaa;margin-bottom:8px">${sizeStr} (流式音频)</div>
-                     <audio controls src="${streamUrl}" style="width:100%;max-width:260px;height:40px;margin-top:4px"></audio>
-                     <div style="text-align:right;margin-top:4px">
-                         <a href="javascript:void(0)" onclick="window.smartCore.download('${meta.fileId}','${window.util.escape(meta.fileName)}')" style="color:#aaa;font-size:10px;text-decoration:none">⬇ 保存本地</a>
-                     </div>
-                 </div>`;
-                 style = 'background:transparent;padding:0;border:none';
-             } else if (isImg) {
-                 content = `
-                 <div class="stream-card">
-                     <img src="${streamUrl}" class="chat-img" style="max-width:200px;border-radius:4px;display:block">
-                     <div style="font-size:10px;color:#aaa;margin-top:4px">${sizeStr}</div>
+                 <div class="file-expired">
+                     <div style="font-weight:bold">❌ ${window.util.escape(meta.fileName)}</div>
+                     <div>文件引用已失效 (请重新发送)</div>
                  </div>`;
                  style = 'background:transparent;padding:0;border:none';
              } else {
-                 content = `
-                 <div class="stream-card">
-                     <div style="font-weight:bold;color:#fff">📄 ${window.util.escape(meta.fileName)}</div>
-                     <div style="font-size:11px;color:#aaa;margin:4px 0">${sizeStr}</div>
-                     <a href="javascript:void(0)" onclick="window.smartCore.download('${meta.fileId}','${window.util.escape(meta.fileName)}')"
-                        style="display:inline-block;background:#2a7cff;color:white;padding:6px 12px;border-radius:4px;text-decoration:none;font-size:12px;cursor:pointer">
-                        ⚡ 极速下载
-                     </a>
-                 </div>`;
-                 style = 'background:transparent;padding:0;border:none';
+                 if (isVideo) {
+                     const errScript = `this.style.display='none';this.nextElementSibling.style.display='block';`;
+                     
+                     content = `
+                     <div class="stream-card">
+                         <div style="font-weight:bold;color:#4ea8ff">🎬 ${window.util.escape(meta.fileName)}</div>
+                         <div style="font-size:11px;color:#aaa;margin-bottom:8px">${sizeStr} (流式直连)</div>
+                         
+                         <video controls src="${streamUrl}" 
+                                style="width:100%;max-width:300px;background:#000;border-radius:4px"
+                                onerror="${errScript}"></video>
+                         
+                         <div class="video-error" style="display:none">
+                            ❌ 视频加载失败<br>可能原因: 文件损坏或编码不支持
+                         </div>
+    
+                         <div style="text-align:right;margin-top:4px">
+                             <a href="javascript:void(0)" onclick="window.smartCore.download('${meta.fileId}','${window.util.escape(meta.fileName)}')" style="color:#aaa;font-size:10px;text-decoration:none">⬇ 保存本地</a>
+                         </div>
+                     </div>`;
+                     style = 'background:transparent;padding:0;border:none';
+                 } else if (isAudio) {
+                     content = `
+                     <div class="stream-card">
+                         <div style="font-weight:bold;color:#4ea8ff">🎵 ${window.util.escape(meta.fileName)}</div>
+                         <div style="font-size:11px;color:#aaa;margin-bottom:8px">${sizeStr} (流式音频)</div>
+                         <audio controls src="${streamUrl}" style="width:100%;max-width:260px;height:40px;margin-top:4px"></audio>
+                         <div style="text-align:right;margin-top:4px">
+                             <a href="javascript:void(0)" onclick="window.smartCore.download('${meta.fileId}','${window.util.escape(meta.fileName)}')" style="color:#aaa;font-size:10px;text-decoration:none">⬇ 保存本地</a>
+                         </div>
+                     </div>`;
+                     style = 'background:transparent;padding:0;border:none';
+                 } else if (isImg) {
+                     content = `
+                     <div class="stream-card">
+                         <img src="${streamUrl}" class="chat-img" style="max-width:200px;border-radius:4px;display:block">
+                         <div style="font-size:10px;color:#aaa;margin-top:4px">${sizeStr}</div>
+                     </div>`;
+                     style = 'background:transparent;padding:0;border:none';
+                 } else {
+                     content = `
+                     <div class="stream-card">
+                         <div style="font-weight:bold;color:#fff">📄 ${window.util.escape(meta.fileName)}</div>
+                         <div style="font-size:11px;color:#aaa;margin:4px 0">${sizeStr}</div>
+                         <a href="javascript:void(0)" onclick="window.smartCore.download('${meta.fileId}','${window.util.escape(meta.fileName)}')"
+                            style="display:inline-block;background:#2a7cff;color:white;padding:6px 12px;border-radius:4px;text-decoration:none;font-size:12px;cursor:pointer">
+                            ⚡ 极速下载
+                         </a>
+                     </div>`;
+                     style = 'background:transparent;padding:0;border:none';
+                 }
              }
-         }
-
-      } else if (m.kind === CHAT.KIND_IMAGE) {
-         content = `<img src="${m.txt}" class="chat-img" style="min-height:50px; background:#222;">`;
-         style = 'background:transparent;padding:0';
-      } else {
-         content = window.util.escape(m.txt);
+    
+          } else if (m.kind === CHAT.KIND_IMAGE) {
+             content = `<img src="${m.txt}" class="chat-img" style="min-height:50px; background:#222;">`;
+             style = 'background:transparent;padding:0';
+          } else {
+             content = window.util.escape(m.txt);
+          }
+          
+          const html = `
+            <div class="msg-row ${isMe ? 'me' : 'other'}" id="msg-${m.id}">
+              <div>
+                <div class="msg-bubble" style="${style}">${content}</div>
+                <div class="msg-meta">${isMe ? '我' : window.util.escape(m.n)} ${new Date(m.ts).toLocaleTimeString()}</div>
+              </div>
+            </div>`;
+    
+          box.insertAdjacentHTML('beforeend', html);
+          box.scrollTop = box.scrollHeight;
+          
+          if (window.uiEvents && window.uiEvents.bindMsgEvents) window.uiEvents.bindMsgEvents();
+      } catch (err) {
+          console.error('Render Msg Error:', err);
       }
-      
-      const html = `
-        <div class="msg-row ${isMe ? 'me' : 'other'}" id="msg-${m.id}">
-          <div>
-            <div class="msg-bubble" style="${style}">${content}</div>
-            <div class="msg-meta">${isMe ? '我' : window.util.escape(m.n)} ${new Date(m.ts).toLocaleTimeString()}</div>
-          </div>
-        </div>`;
-
-      box.insertAdjacentHTML('beforeend', html);
-      box.scrollTop = box.scrollHeight;
-      
-      if (window.uiEvents && window.uiEvents.bindMsgEvents) window.uiEvents.bindMsgEvents();
     },
     
     downloadBlob(data, name) {
         try {
             let url;
             if (typeof data === 'string') {
-                if (data.startsWith('data:')) {
+                if (data.startsWith('')) {
                      const a = document.createElement('a');
                      a.href = data;
                      a.download = name;

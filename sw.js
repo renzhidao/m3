@@ -1,4 +1,4 @@
-const CACHE_NAME = 'p1-stream-v1765199302'; // Auto-updated
+const CACHE_NAME = 'p1-stream-v1765199401'; // Bump Version
 const CORE_ASSETS = [
   './',
   './index.html',
@@ -50,7 +50,6 @@ self.addEventListener('fetch', event => {
   const url = new URL(event.request.url);
 
   if (url.pathname.includes('/virtual/file/')) {
-    // console.log('[SW] [STEP 4a] 拦截虚拟请求', url.pathname);
     event.respondWith(handleVirtualStream(event));
     return;
   }
@@ -84,6 +83,7 @@ async function handleVirtualStream(event) {
 
     const parts = new URL(event.request.url).pathname.split('/');
     const fileId = parts[3];
+    const fileName = decodeURIComponent(parts[4] || 'file'); // 获取文件名
     const range = event.request.headers.get('Range');
     const requestId = Math.random().toString(36).slice(2) + Date.now();
 
@@ -107,6 +107,10 @@ async function handleVirtualStream(event) {
                     const headers = new Headers();
                     headers.set('Content-Type', d.fileType || 'application/octet-stream');
                     headers.set('Accept-Ranges', 'bytes');
+                    
+                    // === 修复：强制下载，而不是预览 ===
+                    headers.set('Content-Disposition', `attachment; filename="${fileName}"`);
+                    
                     const total = d.fileSize;
                     const start = d.start;
                     const end = d.end;
@@ -130,6 +134,6 @@ async function handleVirtualStream(event) {
                 streamControllers.delete(requestId);
                 resolve(new Response("Gateway Timeout (Metadata Wait)", { status: 504 }));
             }
-        }, 10000);
+        }, 30000); // 10s -> 30s
     });
 }
