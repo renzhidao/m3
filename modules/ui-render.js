@@ -1,7 +1,7 @@
 import { CHAT, UI_CONFIG } from './constants.js';
 
 export function init() {
-  console.log('📦 加载模块: UI Render (Video Fix)');
+  console.log('📦 加载模块: UI Render (Diagnostic Mode)');
   window.ui = window.ui || {};
   
   const style = document.createElement('style');
@@ -31,6 +31,30 @@ export function init() {
     }
   `;
   document.head.appendChild(style);
+  
+  // === 注入全局错误处理函数，供 HTML 内联调用 ===
+  window.handleVideoError = function(el, fileName) {
+      el.style.display = 'none';
+      const errDiv = el.parentElement.querySelector('.video-error');
+      if(errDiv) errDiv.style.display = 'block';
+      
+      const err = el.error;
+      let msg = '未知错误';
+      let code = 0;
+      if (err) {
+          code = err.code;
+          switch(err.code) {
+              case 1: msg = '用户中止 (MEDIA_ERR_ABORTED)'; break;
+              case 2: msg = '网络错误 (MEDIA_ERR_NETWORK)'; break;
+              case 3: msg = '解码错误 (MEDIA_ERR_DECODE)'; break;
+              case 4: msg = '格式不支持 (MEDIA_ERR_SRC_NOT_SUPPORTED)'; break;
+          }
+      }
+      console.error('Video Error:', err);
+      if (window.monitor) {
+          window.monitor.fatal('VIDEO', `❌ 播放失败 [Code:${code}]: ${fileName}`, {msg});
+      }
+  };
   
   const render = {
     init() { this.renderList(); this.updateSelf(); },
@@ -127,12 +151,12 @@ export function init() {
          const isVideo = meta.fileType.startsWith('video');
          const isAudio = meta.fileType.startsWith('audio');
          const isImg = meta.fileType.startsWith('image');
+         const safeName = window.util.escape(meta.fileName);
          
-         // === 存活检查 ===
          if (isMe && !window.virtualFiles.has(meta.fileId)) {
              content = `
              <div class="file-expired">
-                 <div style="font-weight:bold">⚠️ ${window.util.escape(meta.fileName)}</div>
+                 <div style="font-weight:bold">⚠️ ${safeName}</div>
                  <div>文件句柄已丢失 (页面已刷新/后台释放)</div>
              </div>`;
              style = 'background:transparent;padding:0;border:none';
@@ -140,35 +164,36 @@ export function init() {
              const streamUrl = window.smartCore.play(meta.fileId, meta.fileName);
              
              if (isVideo) {
-                 // === 修复：增加 onerror 捕获 ===
-                 const errScript = `this.style.display='none';this.nextElementSibling.style.display='block';console.error('Video Error:', this.error)`;
-                 
+                 // === 修改：调用全局 handleVideoError，上报 Monitor ===
                  content = `
                  <div class="stream-card">
-                     <div style="font-weight:bold;color:#4ea8ff">🎬 ${window.util.escape(meta.fileName)}</div>
+                     <div style="font-weight:bold;color:#4ea8ff">🎬 ${safeName}</div>
                      <div style="font-size:11px;color:#aaa;margin-bottom:8px">${sizeStr} (流式直连)</div>
                      
                      <video controls src="${streamUrl}" 
                             style="width:100%;max-width:300px;background:#000;border-radius:4px"
-                            onerror="${errScript}"></video>
+                            onerror="window.handleVideoError(this, '${safeName}')"></video>
                      
                      <div class="video-error" style="display:none">
-                        ❌ 视频加载失败<br>可能原因: 文件损坏或编码不支持
+                        ❌ 视频加载失败<br><span style="font-size:10px">请查看诊断面板(🐞)获取错误码</span>
                      </div>
 
                      <div style="text-align:right;margin-top:4px">
-                         <a href="javascript:void(0)" onclick="window.smartCore.download('${meta.fileId}','${window.util.escape(meta.fileName)}')" style="color:#aaa;font-size:10px;text-decoration:none">⬇ 保存本地</a>
+                         <a href="javascript:void(0)" onclick="window.smartCore.download('${meta.fileId}','${safeName}')" style="color:#aaa;font-size:10px;text-decoration:none">⬇ 保存本地</a>
                      </div>
                  </div>`;
                  style = 'background:transparent;padding:0;border:none';
              } else if (isAudio) {
                  content = `
                  <div class="stream-card">
-                     <div style="font-weight:bold;color:#4ea8ff">🎵 ${window.util.escape(meta.fileName)}</div>
+                     <div style="font-weight:bold;color:#4ea8ff">🎵 ${safeName}</div>
                      <div style="font-size:11px;color:#aaa;margin-bottom:8px">${sizeStr} (流式音频)</div>
-                     <audio controls src="${streamUrl}" style="width:100%;max-width:260px;height:40px;margin-top:4px"></audio>
+                     <audio controls src="${streamUrl}" 
+                            style="width:100%;max-width:260px;height:40px;margin-top:4px"
+                            onerror="window.handleVideoError(this, '${safeName}')"></audio>
+                     <div class="video-error" style="display:none">❌ 加载失败</div>
                      <div style="text-align:right;margin-top:4px">
-                         <a href="javascript:void(0)" onclick="window.smartCore.download('${meta.fileId}','${window.util.escape(meta.fileName)}')" style="color:#aaa;font-size:10px;text-decoration:none">⬇ 保存本地</a>
+                         <a href="javascript:void(0)" onclick="window.smartCore.download('${meta.fileId}','${safeName}')" style="color:#aaa;font-size:10px;text-decoration:none">⬇ 保存本地</a>
                      </div>
                  </div>`;
                  style = 'background:transparent;padding:0;border:none';
@@ -182,9 +207,9 @@ export function init() {
              } else {
                  content = `
                  <div class="stream-card">
-                     <div style="font-weight:bold;color:#fff">📄 ${window.util.escape(meta.fileName)}</div>
+                     <div style="font-weight:bold;color:#fff">📄 ${safeName}</div>
                      <div style="font-size:11px;color:#aaa;margin:4px 0">${sizeStr}</div>
-                     <a href="javascript:void(0)" onclick="window.smartCore.download('${meta.fileId}','${window.util.escape(meta.fileName)}')"
+                     <a href="javascript:void(0)" onclick="window.smartCore.download('${meta.fileId}','${safeName}')"
                         style="display:inline-block;background:#2a7cff;color:white;padding:6px 12px;border-radius:4px;text-decoration:none;font-size:12px;cursor:pointer">
                         ⚡ 极速下载
                      </a>

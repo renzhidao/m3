@@ -1,13 +1,15 @@
 import { MSG_TYPE, CHAT, NET_PARAMS } from './constants.js';
 
 /**
- * Smart Core v2.5.5 - Lossless Repair
- * 修复：1. 弱网丢包问题 (receivedOffsets)
- *       2. 重启后历史文件无法加载问题 (getRecentFiles)
+ * Smart Core v2.5.7 - Safe Guard
  */
 
 export function init() {
-  if (window.monitor) window.monitor.info('Core', 'Smart Core v2.5.5 (Lossless) 启动');
+  // 确保 Monitor 存在，如果不存在则给一个空实现，防止 crash
+  if (!window.monitor) {
+      window.monitor = { info:()=>{}, warn:()=>{}, error:()=>{}, log:()=>{} };
+  }
+  window.monitor.info('Core', 'Smart Core v2.5.7 (Safe) 启动');
 
   window.virtualFiles = new Map(); 
   window.remoteFiles = new Map();  
@@ -118,7 +120,6 @@ function flowSend(conn, data, callback) {
 
     const attempt = () => {
         if (!conn.open) return callback(new Error('Closed during send'));
-        // 维持高水位：1.5MB
         if (dc.bufferedAmount < 1.5 * 1024 * 1024) {
             try { conn.send(data); callback(null); } catch(e) { callback(e); }
         } else {
@@ -128,7 +129,6 @@ function flowSend(conn, data, callback) {
     attempt();
 }
 
-// 修复：使用专门的 getRecentFiles 接口，扫描范围扩大到200条
 async function restoreMetaFromDB() {
     try {
         const msgs = await window.db.getRecentFiles(200);
@@ -143,7 +143,7 @@ async function restoreMetaFromDB() {
                 count++;
             }
         });
-        if(window.monitor && count > 0) window.monitor.info('Core', `⚡ 已恢复 ${count} 个历史文件元数据`);
+        if(window.monitor) window.monitor.info('Core', `⚡ 已恢复 ${count} 个历史文件元数据`);
     } catch(e) {
         console.error('Restore Meta Failed', e);
     }
@@ -216,7 +216,7 @@ function startStreamTask(req) {
         buffer: new Map(),     
         bufferBytes: 0,        
         inflight: new Map(),
-        receivedOffsets: new Set(), // 新增：已接收偏移量记录 (防丢包)
+        receivedOffsets: new Set(),
         missing: new Set(),    
         finished: false,
         stalledCount: 0
@@ -283,12 +283,9 @@ function pumpStream(task) {
         }
         
         if (offset > task.end) continue;
-        
-        // 双重检查：如果已经收到了，就不用请求了
         if (task.receivedOffsets.has(offset)) continue;
 
         const size = Math.min(CHUNK_SIZE, task.end - offset + 1);
-        
         const peerId = task.peers[Math.floor(offset / CHUNK_SIZE) % task.peers.length];
         const conn = window.state.conns[peerId];
         
@@ -332,7 +329,6 @@ function watchdog() {
         if (needsPump) pumpStream(task); 
     });
     
-    // 只在超时严重时报警
     if (timeoutCount > 5 && window.monitor) {
         window.monitor.warn('Timeout', `⚠️ 正在重试 ${timeoutCount} 个超时块...`);
     }
@@ -361,25 +357,45 @@ function handleIncomingBinary(rawBuffer, fromPeerId) {
     const decoder = new TextDecoder();
     const headerStr = decoder.decode(buffer.slice(1, 1 + headerLen));
     
+    let header;
     try {
-        const header = JSON.parse(headerStr); 
-        const task = window.activeStreams.get(header.reqId);
-        if (task) {
-            const body = buffer.slice(1 + headerLen);
-            const offset = header.offset; 
-            
-            // 修复核心：只要是我还没收到的，统统收下！
-            // 不再判断 inflight.has(offset)，彻底解决迟到丢包问题
-            if (!task.receivedOffsets.has(offset)) {
-                task.receivedOffsets.add(offset); // 标记为已接收
-                task.inflight.delete(offset);     // 如果在等待列表里，移除它
-                
-                task.buffer.set(offset, body);
-                task.bufferBytes += body.byteLength;
-                pumpStream(task);
-            }
+        header = JSON.parse(headerStr); 
+    } catch(e) {
+        // 如果 header 解析都失败了，说明包彻底废了，直接丢弃，不抛错
+        return; 
+    }
+
+    // === [Safe Diagnostic] 诊断：文件头检查 ===
+    // 使用独立 try-catch 包裹，绝不让日志打印代码影响数据处理
+    try {
+        if (header.offset === 0 && window.monitor) {
+             const body = new Uint8Array(buffer.slice(1 + headerLen));
+             const checkLen = Math.min(body.length, 16);
+             const hexArr = [];
+             for(let i=0; i<checkLen; i++) {
+                hexArr.push(body[i].toString(16).padStart(2, '0').toUpperCase());
+             }
+             window.monitor.warn('PROBE', `🔍 收到文件头 (Offset 0): [${hexArr.join(' ')}]`, {from: fromPeerId.slice(0,4)});
         }
-    } catch(e) {}
+    } catch(diagErr) {
+        // 忽略诊断错误
+    }
+    // =====================================
+
+    const task = window.activeStreams.get(header.reqId);
+    if (task) {
+        const body = buffer.slice(1 + headerLen);
+        const offset = header.offset; 
+        
+        if (!task.receivedOffsets.has(offset)) {
+            task.receivedOffsets.add(offset); 
+            task.inflight.delete(offset);     
+            
+            task.buffer.set(offset, body);
+            task.bufferBytes += body.byteLength;
+            pumpStream(task);
+        }
+    }
 }
 
 function handleSmartGet(pkt, requesterId) {
@@ -394,7 +410,6 @@ function handleSmartGet(pkt, requesterId) {
     if (!conn || !conn.open) return;
     
     if(window.monitor) {
-        // 降低日志频率，每10个请求打一条
         if (Math.random() < 0.1) {
              window.monitor.info('Serve', `📥 正在上传...`, {to: requesterId.slice(0,4)});
         }
