@@ -1,13 +1,12 @@
 import { MSG_TYPE, CHAT, NET_PARAMS } from './constants.js';
 
 /**
- * Smart Core v2.5.5 - Lossless Repair
- * 修复：1. 弱网丢包问题 (receivedOffsets)
- *       2. 重启后历史文件无法加载问题 (getRecentFiles)
+ * Smart Core v2.4.2 - Debug Trace Mode
+ * 增强：发送方日志全开，监控请求接收与处理状态
  */
 
 export function init() {
-  if (window.monitor) window.monitor.info('Core', 'Smart Core v2.5.5 (Lossless) 启动');
+  if (window.monitor) window.monitor.info('Core', 'Smart Core v2.4.2 (Debug) 启动');
 
   window.virtualFiles = new Map(); 
   window.remoteFiles = new Map();  
@@ -26,44 +25,22 @@ export function init() {
   window.smartCore = {
       handleBinary: (data, fromPeerId) => handleIncomingBinary(data, fromPeerId),
       
-      download: async (fileId, fileName) => {
+      download: (fileId, fileName) => {
           if (window.virtualFiles.has(fileId)) {
-              if(window.monitor) window.monitor.info('UI', `[Local] 本地导出: ${fileName}`);
+              if(window.monitor) window.monitor.info('STEP', `[Local] 本地直接下载: ${fileName}`);
               const file = window.virtualFiles.get(fileId);
-              if (window.ui && window.ui.downloadBlob) {
-                  window.ui.downloadBlob(file, fileName);
-              } else {
-                  const url = URL.createObjectURL(file);
-                  const a = document.createElement('a'); a.href = url; a.download = fileName;
-                  document.body.appendChild(a); a.click(); document.body.removeChild(a);
-              }
+              const url = URL.createObjectURL(file);
+              const a = document.createElement('a');
+              a.href = url;
+              a.download = fileName;
+              document.body.appendChild(a);
+              a.click();
+              document.body.removeChild(a);
+              setTimeout(() => URL.revokeObjectURL(url), 10000);
               return;
           }
           
-          const meta = window.smartMetaCache.get(fileId);
-          const size = meta ? meta.fileSize : 0;
-          
-          if (size > 0 && size < 20 * 1024 * 1024) {
-              if(window.monitor) window.monitor.info('UI', `[Smart] 正在缓冲小文件 (${(size/1024/1024).toFixed(1)}MB)...`);
-              window.util.log(`⏳ 正在缓冲: ${fileName} ...`);
-              
-              try {
-                  const url = `/virtual/file/${fileId}/${encodeURIComponent(fileName)}`;
-                  const res = await fetch(url);
-                  if (!res.ok) throw new Error(`Stream Error ${res.status}`);
-                  const blob = await res.blob();
-                  window.util.log(`✅ 缓冲完成，开始保存`);
-                  if (window.ui && window.ui.downloadBlob) {
-                      window.ui.downloadBlob(blob, fileName);
-                  }
-              } catch(e) {
-                  window.util.log(`❌ 下载失败: ${e.message}`);
-                  if(window.monitor) window.monitor.error('UI', `缓冲失败`, e);
-              }
-              return;
-          }
-          
-          if(window.monitor) window.monitor.info('UI', `[Start] 启动流式下载: ${fileName}`);
+          if(window.monitor) window.monitor.info('STEP', `[Start] 请求远程下载: ${fileName}`);
           const url = `/virtual/file/${fileId}/${encodeURIComponent(fileName)}`;
           const a = document.createElement('a');
           a.href = url;
@@ -75,7 +52,7 @@ export function init() {
       
       play: (fileId, fileName) => {
           if (window.virtualFiles.has(fileId)) {
-              if(window.monitor) window.monitor.info('STEP', `[Local] 原生预览: ${fileName}`);
+              if(window.monitor) window.monitor.info('STEP', `[Local] 本地直接播放: ${fileName}`);
               const file = window.virtualFiles.get(fileId);
               if (window.blobUrls.has(fileId)) return window.blobUrls.get(fileId);
               const url = URL.createObjectURL(file);
@@ -105,34 +82,43 @@ export function init() {
 function flowSend(conn, data, callback) {
     if (!conn || !conn.open) return callback(new Error('Connection Closed'));
     
+    // JSON 信令直通
     if (!(data instanceof ArrayBuffer || data instanceof Uint8Array)) {
         try { conn.send(data); callback(null); } catch(e) { callback(e); }
         return;
     }
 
     const dc = conn.dataChannel;
+    // 如果拿不到底层通道，硬发
     if (!dc || typeof dc.bufferedAmount !== 'number') {
         try { conn.send(data); callback(null); } catch(e) { callback(e); }
         return;
     }
 
+    // 轮询检查函数
     const attempt = () => {
         if (!conn.open) return callback(new Error('Closed during send'));
-        // 维持高水位：1.5MB
+        
+        // 1.5MB 水位线
         if (dc.bufferedAmount < 1.5 * 1024 * 1024) {
-            try { conn.send(data); callback(null); } catch(e) { callback(e); }
+            try { 
+                conn.send(data); 
+                callback(null); 
+            } catch(e) { 
+                callback(e); 
+            }
         } else {
-            setTimeout(attempt, 10);
+            // 堵了，过 50ms 再看
+            setTimeout(attempt, 50);
         }
     };
+
     attempt();
 }
 
-// 修复：使用专门的 getRecentFiles 接口，扫描范围扩大到200条
 async function restoreMetaFromDB() {
     try {
-        const msgs = await window.db.getRecentFiles(200);
-        let count = 0;
+        const msgs = await window.db.getRecent(50, 'all');
         msgs.forEach(m => {
             if (m.kind === 'SMART_FILE_UI' && m.meta) {
                 window.smartMetaCache.set(m.meta.fileId, m.meta);
@@ -140,13 +126,9 @@ async function restoreMetaFromDB() {
                    if (!window.remoteFiles.has(m.meta.fileId)) window.remoteFiles.set(m.meta.fileId, new Set());
                    window.remoteFiles.get(m.meta.fileId).add(m.senderId);
                 }
-                count++;
             }
         });
-        if(window.monitor && count > 0) window.monitor.info('Core', `⚡ 已恢复 ${count} 个历史文件元数据`);
-    } catch(e) {
-        console.error('Restore Meta Failed', e);
-    }
+    } catch(e) {}
 }
 
 function handleSWMessage(event) {
@@ -160,7 +142,7 @@ function handleSWMessage(event) {
     else if (d.type === 'STREAM_CANCEL') stopStreamTask(d.requestId);
 }
 
-const CHUNK_SIZE = 64 * 1024; 
+const CHUNK_SIZE = 32 * 1024; 
 const MAX_INFLIGHT = 64; 
 const TIMEOUT_MS = 5000;
 const HIGH_WATER_MARK = 50 * 1024 * 1024; 
@@ -176,7 +158,7 @@ function startStreamTask(req) {
 
     const meta = window.smartMetaCache.get(fileId);
     if (!meta) {
-        if(window.monitor) window.monitor.error('STEP', `❌ [STEP 4 Fail] 元数据丢失 (请确认发送方在线)`, {fileId});
+        if(window.monitor) window.monitor.error('STEP', `❌ [STEP 4 Fail] 元数据丢失`, {fileId});
         sendToSW({ type: 'STREAM_ERROR', requestId, msg: 'Meta Not Found' });
         return;
     }
@@ -215,8 +197,7 @@ function startStreamTask(req) {
         peers: Array.from(window.remoteFiles.get(fileId) || []),
         buffer: new Map(),     
         bufferBytes: 0,        
-        inflight: new Map(),
-        receivedOffsets: new Set(), // 新增：已接收偏移量记录 (防丢包)
+        inflight: new Map(),   
         missing: new Set(),    
         finished: false,
         stalledCount: 0
@@ -283,10 +264,6 @@ function pumpStream(task) {
         }
         
         if (offset > task.end) continue;
-        
-        // 双重检查：如果已经收到了，就不用请求了
-        if (task.receivedOffsets.has(offset)) continue;
-
         const size = Math.min(CHUNK_SIZE, task.end - offset + 1);
         
         const peerId = task.peers[Math.floor(offset / CHUNK_SIZE) % task.peers.length];
@@ -332,9 +309,8 @@ function watchdog() {
         if (needsPump) pumpStream(task); 
     });
     
-    // 只在超时严重时报警
-    if (timeoutCount > 5 && window.monitor) {
-        window.monitor.warn('Timeout', `⚠️ 正在重试 ${timeoutCount} 个超时块...`);
+    if (timeoutCount > 0 && window.monitor) {
+        window.monitor.warn('Timeout', `⚠️ 有 ${timeoutCount} 个数据块请求超时 (正在重试)`);
     }
     
     window.pendingAcks.forEach((meta, id) => {
@@ -368,12 +344,8 @@ function handleIncomingBinary(rawBuffer, fromPeerId) {
             const body = buffer.slice(1 + headerLen);
             const offset = header.offset; 
             
-            // 修复核心：只要是我还没收到的，统统收下！
-            // 不再判断 inflight.has(offset)，彻底解决迟到丢包问题
-            if (!task.receivedOffsets.has(offset)) {
-                task.receivedOffsets.add(offset); // 标记为已接收
-                task.inflight.delete(offset);     // 如果在等待列表里，移除它
-                
+            if (task.inflight.has(offset)) {
+                task.inflight.delete(offset);
                 task.buffer.set(offset, body);
                 task.bufferBytes += body.byteLength;
                 pumpStream(task);
@@ -382,22 +354,25 @@ function handleIncomingBinary(rawBuffer, fromPeerId) {
     } catch(e) {}
 }
 
+// === 修改：详细打印所有收到的请求 ===
 function handleSmartGet(pkt, requesterId) {
     const file = window.virtualFiles.get(pkt.fileId);
     
+    // 1. 文件校验报警
     if (!file) {
-        if(window.monitor) window.monitor.warn('Serve', `❌ 拒绝请求: 无此文件`, {fileId: pkt.fileId.slice(0,6)});
+        if(window.monitor) window.monitor.warn('Serve', `❌ 拒绝请求: 无此文件 (可能已刷新页面)`, {fileId: pkt.fileId.slice(0,6)});
         return;
     }
 
     const conn = window.state.conns[requesterId];
-    if (!conn || !conn.open) return;
+    if (!conn || !conn.open) {
+        if(window.monitor) window.monitor.warn('Serve', `❌ 无法响应: 目标连接已断开`, {target: requesterId.slice(0,4)});
+        return;
+    }
     
+    // 2. 打印每一个请求 (Debug模式全开)
     if(window.monitor) {
-        // 降低日志频率，每10个请求打一条
-        if (Math.random() < 0.1) {
-             window.monitor.info('Serve', `📥 正在上传...`, {to: requesterId.slice(0,4)});
-        }
+        window.monitor.info('Serve', `📥 处理请求: Offset ${pkt.offset} (Size ${pkt.size})`, {to: requesterId.slice(0,4)});
     }
     
     const blob = file.slice(pkt.offset, pkt.offset + pkt.size);
@@ -418,7 +393,10 @@ function handleSmartGet(pkt, requesterId) {
         packet.set(new Uint8Array(raw), 1 + headerLen);
         
         flowSend(conn, packet, (err) => {
-            if (err && window.monitor) window.monitor.warn('Serve', `❌ 发送失败: ${err.message}`);
+            if (err) {
+                if (window.monitor) window.monitor.warn('Serve', `❌ 发送失败: ${err.message}`);
+            }
+            // 成功时不打印，避免日志量翻倍 (请求日志已经证明开始处理了)
         });
     };
     reader.readAsArrayBuffer(blob);
@@ -478,9 +456,7 @@ function applyHooks() {
         if ((kind === CHAT.KIND_FILE || kind === CHAT.KIND_IMAGE) && fileInfo && fileInfo.fileObj) {
             const file = fileInfo.fileObj;
             const fileId = window.util.uuid();
-            
             window.virtualFiles.set(fileId, file);
-            if(window.monitor) window.monitor.info('Core', ` 内存注册文件: ${file.name}`, {fileId: fileId, size: file.size});
             
             const target = (window.state.activeChat && window.state.activeChat !== CHAT.PUBLIC_ID) 
                            ? window.state.activeChat 

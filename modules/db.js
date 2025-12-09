@@ -50,39 +50,14 @@ export function init() {
       });
     },
 
-    // 新增：专门查询文件元数据（不论频道，全量扫描最近的文件）
-    // 解决重启后无法加载历史文件的问题
-    async getRecentFiles(limit) {
-      if (!this._db) return [];
-      return new Promise(resolve => {
-        const tx = this._db.transaction(['msgs'], 'readonly');
-        const req = tx.objectStore('msgs').index('ts').openCursor(null, 'prev');
-        const res = [];
-        
-        req.onsuccess = e => {
-          const cursor = e.target.result;
-          if (cursor && res.length < limit) {
-             const m = cursor.value;
-             // 只提取带 Meta 的文件消息
-             if (m.kind === 'SMART_FILE_UI' && m.meta) {
-                 res.push(m);
-             }
-             cursor.continue();
-          } else {
-             resolve(res);
-          }
-        };
-        req.onerror = () => resolve([]);
-      });
-    },
-
+    // 新增：查询指定时间之后的公共消息（用于同步）
     async getPublicAfter(ts, limit=50) {
       if (!this._db) return [];
       return new Promise(r => {
         const tx = this._db.transaction(['msgs'], 'readonly');
-        // true 表示开区间，即 > ts
+        // true 表示开区间，即 > ts (不包含 ts 本身)
         const range = IDBKeyRange.lowerBound(ts, true);
-        const req = tx.objectStore('msgs').index('ts').openCursor(range);
+        const req = tx.objectStore('msgs').index('ts').openCursor(range); // 默认顺序是升序
         const res = [];
         
         req.onsuccess = e => {
