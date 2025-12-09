@@ -163,7 +163,7 @@ function handleSWMessage(event) {
 }
 
 const CHUNK_SIZE = 64 * 1024; 
-const MAX_INFLIGHT = 64; 
+const MAX_INFLIGHT = 16; // 降频保稳 
 const TIMEOUT_MS = 5000;
 const HIGH_WATER_MARK = 50 * 1024 * 1024; 
 
