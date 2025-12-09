@@ -16,6 +16,7 @@ export function init() {
   window.activeStreams = new Map(); 
   window.pendingAcks = new Map(); 
   window.blobUrls = new Map();
+  window.metaResolvers = new Map();
   
   setInterval(watchdog, 1000);
   // setTimeout(restoreMetaFromDB, 1000); // Moved to manual init
@@ -167,35 +168,6 @@ const TIMEOUT_MS = 5000;
 const HIGH_WATER_MARK = 50 * 1024 * 1024; 
 
 
-async function waitForMeta(fileId, requestId) {
-    const start = performance.now();
-    let attempt = 0;
-    
-    while (attempt < 40) { // Max 2s
-        const meta = window.smartMetaCache.get(fileId);
-        if (meta) {
-            const cost = (performance.now() - start).toFixed(3);
-            if (attempt > 0 && window.monitor) {
-                 window.monitor.warn('Core', `✅ [Race] 竞态消除! Meta追回成功`, {fileId, cost: cost + 'ms'});
-            }
-            return meta;
-        }
-        
-        // 纳米级日志：首次丢失时记录
-        if (attempt === 0 && window.monitor) {
-             const keys = Array.from(window.smartMetaCache.keys());
-             window.monitor.warn('Core', `⚠️ [Race] Meta未就绪，进入弹性等待...`, {
-                 req: requestId.slice(-4),
-                 target: fileId,
-                 existKeys: keys.length > 5 ? keys.length : keys // 仅列出少量，防止刷屏
-             });
-        }
-        
-        await new Promise(r => setTimeout(r, 50));
-        attempt++;
-    }
-    return null;
-}
 
 
 async function startStreamTask(req) {
@@ -207,13 +179,39 @@ async function startStreamTask(req) {
         return;
     }
 
-    const meta = window.smartMetaCache.get(fileId);
+    // === 阶段1: 等待 Meta (事件驱动 + 轮询双保底) ===
+    let meta = window.smartMetaCache.get(fileId);
     if (!meta) {
-        if(window.monitor) window.monitor.error('STEP', `❌ [STEP 4 Fail] 元数据丢失 (请确认发送方在线)`, {fileId});
-        sendToSW({ type: 'STREAM_ERROR', requestId, msg: 'Meta Not Found' });
+        if (window.monitor) window.monitor.warn('STEP', `⏳ Meta未就绪，挂起等待...`, {reqId: requestId.slice(-4)});
+        
+        meta = await new Promise(resolve => {
+            // 1. 注册一次性监听
+            window.metaResolvers.set(fileId, resolve);
+            
+            // 2. 启动超时轮询 (双保险)
+            let attempt = 0;
+            const timer = setInterval(() => {
+                const m = window.smartMetaCache.get(fileId);
+                if (m) {
+                    clearInterval(timer);
+                    window.metaResolvers.delete(fileId);
+                    resolve(m);
+                } else if (++attempt > 40) { // 2s Timeout
+                    clearInterval(timer);
+                    window.metaResolvers.delete(fileId);
+                    resolve(null);
+                }
+            }, 50);
+        });
+    }
+    
+    if (!meta) {
+        if(window.monitor) window.monitor.error('STEP', `❌ Meta等待超时`, {fileId});
+        sendToSW({ type: 'STREAM_ERROR', requestId, msg: 'Meta Timeout' });
         return;
     }
 
+    // === 阶段2: 任务初始化 ===
     let start = 0;
     let end = meta.fileSize - 1;
     if (range && range.startsWith('bytes=')) {
@@ -229,14 +227,6 @@ async function startStreamTask(req) {
     }
     if (start < 0) start = 0;
     if (end >= meta.fileSize) end = meta.fileSize - 1;
-
-    sendToSW({
-        type: 'STREAM_META',
-        requestId,
-        fileSize: meta.fileSize,
-        fileType: meta.fileType,
-        start, end
-    });
 
     const task = {
         requestId,
@@ -254,16 +244,44 @@ async function startStreamTask(req) {
         finished: false,
         stalledCount: 0
     };
-    
     window.activeStreams.set(requestId, task);
-    
+
+    // 立即启动 P2P 拉取 (不管 SW 还没回)
     if (task.peers.length === 0) {
-        if(window.monitor) window.monitor.warn('STEP', `[STEP 5 Fail] 无可用节点`);
         window.protocol.flood({ t: 'SMART_WHO_HAS', fileId });
     } else {
         pumpStream(task);
     }
+
+    // === 阶段3: 首帧预缓冲 (Pre-Buffer Offset 0) ===
+    // 只有当请求包含开头(0)时才等待，且只等一小会儿，防止死锁
+    if (start === 0 && !task.receivedOffsets.has(0)) {
+        if(window.monitor) window.monitor.info('STEP', `⏳ 正在预缓冲首帧...`);
+        
+        await new Promise(resolve => {
+            const check = setInterval(() => {
+                if (task.receivedOffsets.has(0) || task.finished || !window.activeStreams.has(requestId)) {
+                    clearInterval(check);
+                    resolve();
+                }
+            }, 50);
+            // 最多等 3秒，等不到硬着头皮也要发 Meta，否则 SW 会超时报错
+            setTimeout(() => { clearInterval(check); resolve(); }, 3000);
+        });
+        
+        if(window.monitor) window.monitor.info('STEP', `✅ 首帧就绪 (或超时跳过)`);
+    }
+
+    // === 阶段4: 响应 SW ===
+    sendToSW({
+        type: 'STREAM_META',
+        requestId,
+        fileSize: meta.fileSize,
+        fileType: meta.fileType,
+        start, end
+    });
 }
+
 
 function stopStreamTask(requestId) {
     window.activeStreams.delete(requestId);
@@ -635,7 +653,14 @@ function applyHooks() {
                 return;
             }
             
+            
             window.smartMetaCache.set(pkt.fileId, pkt);
+            if (window.metaResolvers.has(pkt.fileId)) {
+                const resolve = window.metaResolvers.get(pkt.fileId);
+                resolve(pkt);
+                window.metaResolvers.delete(pkt.fileId);
+            }
+
             
             if (!window.remoteFiles.has(pkt.fileId)) window.remoteFiles.set(pkt.fileId, new Set());
             window.remoteFiles.get(pkt.fileId).add(pkt.senderId);
