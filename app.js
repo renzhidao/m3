@@ -14,6 +14,9 @@ export function init() {
       if (window.ui && window.ui.init) window.ui.init();
       if (window.uiEvents && window.uiEvents.init) window.uiEvents.init();
       
+      // 修复：必须先恢复文件元数据，再渲染UI，防止历史图片/视频报404
+      if (window.smartCore && window.smartCore.initMeta) await window.smartCore.initMeta();
+      
       this.loadHistory(20);
 
       // 启动时并发：P2P 和 MQTT 同时开始连接，不互相等待

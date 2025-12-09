@@ -18,13 +18,15 @@ export function init() {
   window.blobUrls = new Map();
   
   setInterval(watchdog, 1000);
-  setTimeout(restoreMetaFromDB, 1000);
+  // setTimeout(restoreMetaFromDB, 1000); // Moved to manual init
 
   if ('serviceWorker' in navigator) {
       navigator.serviceWorker.addEventListener('message', event => handleSWMessage(event));
   }
 
   window.smartCore = {
+      initMeta: async () => { await restoreMetaFromDB(); },
+
       handleBinary: (data, fromPeerId) => handleIncomingBinary(data, fromPeerId),
       
       download: async (fileId, fileName) => {
@@ -164,7 +166,39 @@ const MAX_INFLIGHT = 64;
 const TIMEOUT_MS = 5000;
 const HIGH_WATER_MARK = 50 * 1024 * 1024; 
 
-function startStreamTask(req) {
+
+async function waitForMeta(fileId, requestId) {
+    const start = performance.now();
+    let attempt = 0;
+    
+    while (attempt < 40) { // Max 2s
+        const meta = window.smartMetaCache.get(fileId);
+        if (meta) {
+            const cost = (performance.now() - start).toFixed(3);
+            if (attempt > 0 && window.monitor) {
+                 window.monitor.warn('Core', `✅ [Race] 竞态消除! Meta追回成功`, {fileId, cost: cost + 'ms'});
+            }
+            return meta;
+        }
+        
+        // 纳米级日志：首次丢失时记录
+        if (attempt === 0 && window.monitor) {
+             const keys = Array.from(window.smartMetaCache.keys());
+             window.monitor.warn('Core', `⚠️ [Race] Meta未就绪，进入弹性等待...`, {
+                 req: requestId.slice(-4),
+                 target: fileId,
+                 existKeys: keys.length > 5 ? keys.length : keys // 仅列出少量，防止刷屏
+             });
+        }
+        
+        await new Promise(r => setTimeout(r, 50));
+        attempt++;
+    }
+    return null;
+}
+
+
+async function startStreamTask(req) {
     const { requestId, fileId, range } = req;
     
     if (window.virtualFiles.has(fileId)) {
