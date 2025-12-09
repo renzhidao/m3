@@ -1,14 +1,14 @@
 import { MSG_TYPE, CHAT, NET_PARAMS } from './constants.js';
 
 /**
- * Smart Core v2.5.7 - Robust FS & Stream
- * 修复：1. 保存无反应 (强制流式下载)
- *       2. 设备卡死 (降频增效 + 暴力GC)
- *       3. 坏文件导致白屏 (配合UI层容错)
+ * Smart Core v2.5.8 - Auto Retry & Fast Recovery
+ * 修复：1. 网络错误自动重试 (缩短超时时间)
+ *       2. 传输卡死自动恢复 (Watchdog 增强)
+ *       3. 集成 P2PVideoPlayer (解决手机播放 MP4 格式错误)
  */
 
 export function init() {
-  if (window.monitor) window.monitor.info('Core', 'Smart Core v2.5.7 (Robust) 启动');
+  if (window.monitor) window.monitor.info('Core', 'Smart Core v2.5.8 (Auto Retry) 启动');
 
   window.virtualFiles = new Map(); 
   window.remoteFiles = new Map();  
@@ -16,6 +16,9 @@ export function init() {
   window.activeStreams = new Map(); 
   window.pendingAcks = new Map(); 
   window.blobUrls = new Map();
+  
+  // 全局播放器实例引用
+  window.activePlayer = null;
   
   setInterval(watchdog, 1000);
   setTimeout(restoreMetaFromDB, 1000);
@@ -27,27 +30,23 @@ export function init() {
   window.smartCore = {
       handleBinary: (data, fromPeerId) => handleIncomingBinary(data, fromPeerId),
       
-      // === 修复1：统一流式下载，解决点击无反应 ===
       download: async (fileId, fileName) => {
-          // 无论本地还是远程，统统走 SW 虚拟链接下载，利用浏览器原生下载管理器
           if(window.monitor) window.monitor.info('UI', `[Download] 启动流式下载: ${fileName}`);
           
           const url = `/virtual/file/${fileId}/${encodeURIComponent(fileName)}`;
           
-          // 创建隐藏链接触发下载
           const a = document.createElement('a');
           a.href = url;
           a.download = fileName; 
           document.body.appendChild(a);
           a.click();
           
-          // 延时清理 DOM，不阻塞主线程
           setTimeout(() => document.body.removeChild(a), 100);
       },
       
       play: (fileId, fileName) => {
+          // 1. 优先检查本地文件 (自己发送的)
           if (window.virtualFiles.has(fileId)) {
-              // 存活检查：如果文件对象虽然在Map里，但size为0或不可读，降级处理
               const file = window.virtualFiles.get(fileId);
               try {
                   if (file.size === 0) throw new Error('File Empty');
@@ -57,10 +56,41 @@ export function init() {
                   return url;
               } catch(e) {
                   console.warn('Local file invalidated:', fileId);
-                  window.virtualFiles.delete(fileId); // 移除坏引用
-                  return null; // 返回 null 让 UI 处理
+                  window.virtualFiles.delete(fileId);
+                  return null;
               }
           }
+
+          // 2. [核心修复] 检测 MP4 视频，启动 P2P 转码播放器 (解决手机报错)
+          const isVideo = fileName.match(/\.(mp4|mov|m4v)$/i);
+          if (isVideo) {
+              console.log('[UI] 启动 P2P 流式播放器:', fileName);
+              
+              // 销毁上一个播放器实例，防止内存泄漏
+              if (window.activePlayer) {
+                  try { window.activePlayer.destroy(); } catch(e){}
+              }
+
+              // 创建新播放器，绑定 fileId
+              window.activePlayer = new P2PVideoPlayer(fileId);
+              
+              // 手动通知 Service Worker 开始下载 P2P 数据流
+              // 这里的 range=bytes=0- 表示从头开始下载
+              const requestId = 'vid_' + Date.now();
+              if (navigator.serviceWorker.controller) {
+                  navigator.serviceWorker.controller.postMessage({
+                      type: 'STREAM_OPEN',
+                      requestId: requestId,
+                      fileId: fileId,
+                      range: 'bytes=0-'
+                  });
+              }
+              
+              // 返回 MSE 的 URL，手机浏览器会认为这是一个标准的本地流
+              return window.activePlayer.getUrl();
+          }
+
+          // 3. 非视频文件，走原来的 SW 虚拟路径
           return `/virtual/file/${fileId}/${encodeURIComponent(fileName)}`;
       },
       
@@ -97,7 +127,6 @@ function flowSend(conn, data, callback) {
 
     const attempt = () => {
         if (!conn.open) return callback(new Error('Closed during send'));
-        // 维持高水位：1.5MB
         if (dc.bufferedAmount < 1.5 * 1024 * 1024) {
             try { conn.send(data); callback(null); } catch(e) { callback(e); }
         } else {
@@ -137,11 +166,11 @@ function handleSWMessage(event) {
     else if (d.type === 'STREAM_CANCEL') stopStreamTask(d.requestId);
 }
 
-// === 修复2：降频增效 ===
-const CHUNK_SIZE = 512 * 1024;  // 64KB -> 512KB (减少8倍回调)
-const MAX_INFLIGHT = 8;         // 64 -> 8 (减少内存积压)
-const TIMEOUT_MS = 15000;       // 5s -> 15s (宽容弱网)
-const HIGH_WATER_MARK = 20 * 1024 * 1024; // 50MB -> 20MB (防OOM)
+// === 优化：加速重试 ===
+const CHUNK_SIZE = 512 * 1024;
+const MAX_INFLIGHT = 8;
+const TIMEOUT_MS = 5000;       // 优化：15s -> 5s (遇到错误更快重试)
+const HIGH_WATER_MARK = 20 * 1024 * 1024;
 
 function startStreamTask(req) {
     const { requestId, fileId, range } = req;
@@ -207,7 +236,6 @@ function startStreamTask(req) {
     }
 }
 
-// === 修复3：暴力清理，防止内存泄漏 ===
 function stopStreamTask(requestId) {
     const task = window.activeStreams.get(requestId);
     if (task) {
@@ -234,14 +262,21 @@ function pumpStream(task) {
         task.buffer.delete(task.cursor); 
         task.bufferBytes -= chunk.byteLength;
         
+        // 1. 发给 ServiceWorker (保持原有的下载/缓存逻辑)
         sendToSW({ type: 'STREAM_DATA', requestId: task.requestId, chunk });
+
+        // 2. [核心修复] 如果有播放器正在播放该文件，分流喂给播放器
+        // 这解决了手机因为没有 MP4 索引而报错的问题
+        if (window.activePlayer && window.activePlayer.fileId === task.fileId) {
+             window.activePlayer.appendChunk(chunk);
+        }
         
         task.cursor += chunk.byteLength;
         
         if (task.cursor > task.end) {
             sendToSW({ type: 'STREAM_END', requestId: task.requestId });
             task.finished = true;
-            stopStreamTask(task.requestId); // 立即清理
+            stopStreamTask(task.requestId);
             if(window.monitor) window.monitor.info('STEP', `✅ 传输完成`);
             return;
         }
@@ -300,14 +335,21 @@ function watchdog() {
     
     window.activeStreams.forEach(task => {
         let needsPump = false;
+        
+        // 1. 检查超时请求 (Timeout Check)
         task.inflight.forEach((ts, offset) => {
             if (now - ts > TIMEOUT_MS) {
                 task.inflight.delete(offset);
-                task.missing.add(offset);
+                task.missing.add(offset); // 移回待抓取队列，立即重试
                 needsPump = true;
             }
         });
-        if (task.inflight.size === 0 && !task.finished) needsPump = true;
+        
+        // 2. 检查空闲死锁 (Stall Check)
+        if (task.inflight.size === 0 && !task.finished) {
+            needsPump = true;
+        }
+        
         if (needsPump) pumpStream(task); 
     });
     
@@ -396,7 +438,7 @@ function serveLocalFile(req) {
     sendToSW({ type: 'STREAM_META', requestId: req.requestId, fileSize: file.size, fileType: file.type, start, end });
 
     let offset = start;
-    const CHUNK = 512 * 1024; // 同样增大块大小
+    const CHUNK = 512 * 1024;
     
     window.activeStreams.set(req.requestId, { finished: false });
 
@@ -547,4 +589,103 @@ function applyHooks() {
 
         originalProcess.apply(this, arguments);
     };
+}
+
+/**
+ * ====================================================================
+ * P2P 视频播放器 (基于 MSE + MP4Box.js)
+ * 核心作用：在浏览器前端将 P2P 收到的离散 MP4 数据包，
+ * 实时封装成 fMP4 片段，从而解决手机 (iOS/Android) 对普通 MP4 的格式兼容报错。
+ * ====================================================================
+ */
+class P2PVideoPlayer {
+    constructor(fileId) {
+        this.fileId = fileId;
+        this.mediaSource = new MediaSource();
+        // 创建 Blob URL，UI 层的 video 标签 src 直接指向这个 URL 即可
+        this.url = URL.createObjectURL(this.mediaSource);
+        
+        // MP4Box.js 实例，用于处理 MP4 容器格式
+        this.mp4box = MP4Box.createFile();
+        
+        this.sourceBuffer = null;
+        this.queue = [];
+        this.fileStart = 0;
+        
+        this.mediaSource.addEventListener('sourceopen', () => this.init());
+    }
+
+    getUrl() { return this.url; }
+
+    init() {
+        // 当 MP4Box 解析出视频头部信息（moov）时触发
+        this.mp4box.onReady = (info) => {
+            console.log('[P2PPlayer] 视频元数据已解析:', info);
+            
+            // 获取第一个视频轨道
+            const track = info.videoTracks[0];
+            if (track) {
+                // 构建带 Codec 的 MIME 类型，这是骗过手机浏览器的关键
+                // 例如: video/mp4; codecs="avc1.42E01E"
+                const mime = `video/mp4; codecs="${track.codec}"`;
+                
+                if (MediaSource.isTypeSupported(mime)) {
+                    this.sourceBuffer = this.mediaSource.addSourceBuffer(mime);
+                    
+                    // 设置切片策略：每 20 个样本切一个片段，喂给浏览器
+                    // 样本数越少延迟越低，但 CPU 消耗略高
+                    this.mp4box.setSegmentOptions(track.id, this.sourceBuffer, { nbSamples: 20 });
+                } else {
+                    console.error('[P2PPlayer] 浏览器不支持此编码:', mime);
+                }
+            }
+        };
+
+        // 当 MP4Box 切割好一个 fMP4 片段时触发
+        this.mp4box.onSegment = (id, user, buffer) => {
+            if (this.sourceBuffer) {
+                if (!this.sourceBuffer.updating) {
+                    try { 
+                        this.sourceBuffer.appendBuffer(buffer); 
+                    } catch(e) {
+                        // 如果 Buffer 满了，可能需要清理，暂时简单压入队列
+                        console.warn('[P2PPlayer] Buffer Append Error', e);
+                    }
+                } else {
+                    this.queue.push(buffer);
+                }
+            }
+        };
+        
+        // 简单的消费队列循环，防止 SourceBuffer 忙碌时丢包
+        setInterval(() => {
+            if (this.sourceBuffer && !this.sourceBuffer.updating && this.queue.length > 0) {
+                try { 
+                    this.sourceBuffer.appendBuffer(this.queue.shift()); 
+                } catch(e) {}
+            }
+        }, 50);
+    }
+
+    // 接收来自 P2P 层的原始二进制数据
+    appendChunk(data) {
+        // 必须深拷贝数据，因为 ArrayBuffer 可能会在传输层被转移或复用
+        const buffer = data.slice(0); 
+        
+        // 告诉 mp4box 这段数据在文件中的偏移量，保证连续性
+        buffer.fileStart = this.fileStart; 
+        this.fileStart += buffer.byteLength;
+        
+        // 喂给 mp4box，它会自动触发 onReady 或 onSegment
+        this.mp4box.appendBuffer(buffer);
+    }
+
+    destroy() {
+        URL.revokeObjectURL(this.url);
+        window.activePlayer = null;
+        this.mp4box = null;
+        if(this.sourceBuffer) {
+             try { this.mediaSource.removeSourceBuffer(this.sourceBuffer); } catch(e){}
+        }
+    }
 }

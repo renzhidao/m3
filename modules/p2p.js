@@ -70,7 +70,9 @@ export function init() {
               }
               return;
           }
+          
           if(window.monitor) window.monitor.error('P2P', `错误: ${e.type}`, e);
+          
           if (e.type === 'unavailable-id') {
              const newId = 'u_' + Math.random().toString(36).substr(2, 9);
              window.state.myId = newId;
@@ -78,16 +80,20 @@ export function init() {
              location.reload();
              return;
           }
+          
           if (e.type === 'disconnected') {
              p.reconnect();
              return;    
           }
-          if (['network', 'server-error', 'socket-error', 'socket-closed'].includes(e.type)) {
-             setTimeout(() => this.start(), 5000);
-          }
+          
+          // === 修复：通用网络错误重试 ===
+          // 只要不是上述已处理的特定逻辑，遇到网络报错一律重试
+          setTimeout(() => this.start(), 3000);
         });
       } catch (err) {
         if(window.monitor) window.monitor.fatal('P2P', `初始化崩溃: ${err.message}`);
+        // === 修复：启动崩溃自动重试 ===
+        setTimeout(() => this.start(), 3000);
       }
     },
 
