@@ -103,11 +103,25 @@ self.addEventListener('fetch', event => {
   );
 });
 
+
 async function handleVirtualStream(event) {
     const clientId = event.clientId;
-    const client = await self.clients.get(clientId) || (await self.clients.matchAll({type:'window'}))[0];
+    let client = await self.clients.get(clientId);
     
-    if (!client) return new Response("Service Worker: No Client Active", { status: 503 });
+    // 如果找不到 Client，尝试 Claim 并轮询
+    if (!client) {
+        await self.clients.claim();
+        for (let i = 0; i < 5; i++) { // 尝试 5 次，每次 200ms
+            const clients = await self.clients.matchAll({type:'window', includeUncontrolled: true});
+            if (clients && clients.length > 0) {
+                client = clients[0];
+                break;
+            }
+            await new Promise(r => setTimeout(r, 200));
+        }
+    }
+    
+    if (!client) return new Response("Service Worker: No Client Active (Retry Failed)", { status: 503 });
 
     const parts = new URL(event.request.url).pathname.split('/');
     const fileId = parts[3];

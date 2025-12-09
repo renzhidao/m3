@@ -38,7 +38,14 @@ export function init() {
 
       // 启动时并发：P2P 和 MQTT 同时开始连接，不互相等待
       if (window.p2p) window.p2p.start();
+      
       if (window.mqtt) window.mqtt.start();
+      
+      // === 修复：主动握手 SW，防止老设备连接丢失 ===
+      if (navigator.serviceWorker && navigator.serviceWorker.controller) {
+          navigator.serviceWorker.controller.postMessage({ type: 'PING' });
+      }
+
 
       this.loopTimer = setInterval(() => this.loop(), NET_PARAMS.LOOP_INTERVAL);
       this.bindLifecycle();
