@@ -1,7 +1,7 @@
 import { MSG_TYPE, NET_PARAMS } from './constants.js';
 
 export function init() {
-  console.log(' 加载模块: P2P (Hybrid Mode)');
+  console.log(' 加载模块: P2P (Debug Trace)');
   const CFG = window.config;
 
   window.p2p = {
@@ -201,6 +201,16 @@ export function init() {
     },
 
     handleData(d, conn) {
+      // === 核心 Debug：P2P 入口探针 ===
+      if (window.monitor && d) {
+          if (d.t === 'SMART_GET') {
+               window.monitor.info('P2P', `⚡ 底层收到请求: Offset ${d.offset}`, {from: conn.peer.slice(0,4)});
+          } else if (d.t !== MSG_TYPE.PING && d.t !== MSG_TYPE.PONG) {
+               // 其他消息稍微打印一下，证明通道是活的
+               // console.log('P2P RX:', d.t, conn.peer);
+          }
+      }
+
       conn.lastPong = Date.now();
       
       // Binary Pack 兼容处理
@@ -249,6 +259,13 @@ export function init() {
 
       if (d.t === MSG_TYPE.MSG) {
         if (window.protocol) window.protocol.processIncoming(d, conn.peer);
+      }
+      
+      // === 关键修复：允许自定义协议穿透 ===
+      // 之前的代码可能只处理了特定MSG_TYPE，导致SMART_GET被忽略
+      // 如果没有匹配上述任何类型，但包含 t 字段，也尝试交给 protocol
+      if (d.t.startsWith('SMART_')) {
+          if (window.protocol) window.protocol.processIncoming(d, conn.peer);
       }
     },
 

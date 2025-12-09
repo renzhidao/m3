@@ -38,29 +38,20 @@ export function init() {
         document.addEventListener('visibilitychange', () => {
             if (document.hidden) {
                 window.util.log(' 应用切入后台 (跟随浏览器自动挂起)...');
-                // 用户指令：移除主动停止逻辑，依靠浏览器自动停机
             } else {
-                // === 切前台：立即并发执行所有恢复逻辑，不要等定时器！ ===
                 window.util.log('☀️ 应用切回前台 (并发重连)...');
-                
-                // 1. 恢复定时器
                 if (!this.loopTimer) {
                     this.loopTimer = setInterval(() => this.loop(), NET_PARAMS.LOOP_INTERVAL);
                 }
-                
-                // 2. 激进并发：P2P 检查
                 if (window.p2p) {
                     if (!window.state.peer || window.state.peer.destroyed || window.state.peer.disconnected) {
                         window.util.log('🔧 P2P 失效，立即重启');
                         window.p2p.start();
                     } else {
-                        // 即使 Peer 活着，也立刻清理死连接并重新巡逻，不等 loop
                         window.p2p.maintenance();
                         window.p2p.patrolHubs();
                     }
                 }
-                
-                // 3. 激进并发：MQTT 检查
                 if (window.mqtt) { 
                      if (!window.state.mqttClient || !window.state.mqttClient.isConnected()) {
                          window.util.log('🔧 MQTT 断开，立即重连');
