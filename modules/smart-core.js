@@ -170,6 +170,7 @@ const HIGH_WATER_MARK = 50 * 1024 * 1024;
 
 
 
+
 async function startStreamTask(req) {
     const { requestId, fileId, range } = req;
     
@@ -185,10 +186,7 @@ async function startStreamTask(req) {
         if (window.monitor) window.monitor.warn('STEP', `⏳ Meta未就绪，挂起等待...`, {reqId: requestId.slice(-4)});
         
         meta = await new Promise(resolve => {
-            // 1. 注册一次性监听
             window.metaResolvers.set(fileId, resolve);
-            
-            // 2. 启动超时轮询 (双保险)
             let attempt = 0;
             const timer = setInterval(() => {
                 const m = window.smartMetaCache.get(fileId);
@@ -196,7 +194,7 @@ async function startStreamTask(req) {
                     clearInterval(timer);
                     window.metaResolvers.delete(fileId);
                     resolve(m);
-                } else if (++attempt > 40) { // 2s Timeout
+                } else if (++attempt > 40) { // 2s
                     clearInterval(timer);
                     window.metaResolvers.delete(fileId);
                     resolve(null);
@@ -209,6 +207,16 @@ async function startStreamTask(req) {
         if(window.monitor) window.monitor.error('STEP', `❌ Meta等待超时`, {fileId});
         sendToSW({ type: 'STREAM_ERROR', requestId, msg: 'Meta Timeout' });
         return;
+    }
+
+    // === [Trace] 关键诊断日志 ===
+    const peers = Array.from(window.remoteFiles.get(fileId) || []);
+    if (window.monitor) {
+        window.monitor.info('Trace', `🚀 任务初始化`, {
+            req: requestId.slice(-4),
+            file: meta.fileName,
+            peers: peers.length > 0 ? peers : "❌无节点(等待WHO_HAS)"
+        });
     }
 
     // === 阶段2: 任务初始化 ===
@@ -235,7 +243,7 @@ async function startStreamTask(req) {
         end,
         cursor: start, 
         nextReq: start, 
-        peers: Array.from(window.remoteFiles.get(fileId) || []),
+        peers: peers,
         buffer: new Map(),     
         bufferBytes: 0,        
         inflight: new Map(),
@@ -246,7 +254,6 @@ async function startStreamTask(req) {
     };
     window.activeStreams.set(requestId, task);
 
-    // 立即启动 P2P 拉取 (不管 SW 还没回)
     if (task.peers.length === 0) {
         window.protocol.flood({ t: 'SMART_WHO_HAS', fileId });
     } else {
@@ -254,22 +261,26 @@ async function startStreamTask(req) {
     }
 
     // === 阶段3: 首帧预缓冲 (Pre-Buffer Offset 0) ===
-    // 只有当请求包含开头(0)时才等待，且只等一小会儿，防止死锁
     if (start === 0 && !task.receivedOffsets.has(0)) {
-        if(window.monitor) window.monitor.info('STEP', `⏳ 正在预缓冲首帧...`);
+        if(window.monitor) window.monitor.info('Trace', `⏳ 等待首帧(Offset 0)...`);
+        const t0 = performance.now();
         
         await new Promise(resolve => {
             const check = setInterval(() => {
                 if (task.receivedOffsets.has(0) || task.finished || !window.activeStreams.has(requestId)) {
                     clearInterval(check);
-                    resolve();
+                    resolve(true);
                 }
             }, 50);
-            // 最多等 3秒，等不到硬着头皮也要发 Meta，否则 SW 会超时报错
-            setTimeout(() => { clearInterval(check); resolve(); }, 3000);
+            setTimeout(() => { clearInterval(check); resolve(false); }, 3000);
         });
         
-        if(window.monitor) window.monitor.info('STEP', `✅ 首帧就绪 (或超时跳过)`);
+        const cost = Math.round(performance.now() - t0);
+        const success = task.receivedOffsets.has(0);
+        if(window.monitor) {
+            if(success) window.monitor.info('Trace', `✅ 首帧就绪 (耗时${cost}ms)`);
+            else window.monitor.warn('Trace', `⚠️ 首帧等待超时 (耗时${cost}ms) - 强制响应SW`);
+        }
     }
 
     // === 阶段4: 响应 SW ===
@@ -280,6 +291,7 @@ async function startStreamTask(req) {
         fileType: meta.fileType,
         start, end
     });
+    if(window.monitor) window.monitor.info('Trace', `📤 已发送 Meta 给 SW (Ready to Stream)`);
 }
 
 
