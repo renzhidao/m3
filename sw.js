@@ -21,27 +21,55 @@ self.addEventListener('activate', event => {
 });
 
 const streamControllers = new Map();
+const streamClients = new Map(); // 记录 RequestId -> ClientId 映射
+
+function logToClient(requestId, msg, level='ERROR') {
+    const clientId = streamClients.get(requestId);
+    if (!clientId) return;
+    self.clients.get(clientId).then(client => {
+        if (client) client.postMessage({ type: 'SW_LOG', level, msg, requestId });
+    });
+}
 
 self.addEventListener('message', event => {
     const data = event.data;
     if (!data || !data.requestId) return;
 
     const controller = streamControllers.get(data.requestId);
-    if (!controller) return;
+    
+    // 收到主线程的心跳或日志请求，可选
+    
+    if (!controller) {
+        if (data.type === 'STREAM_DATA') {
+            // 管道可能已断开
+            // logToClient(data.requestId, 'SW: 收到数据但管道已关闭', 'WARN');
+        }
+        return;
+    }
 
     switch (data.type) {
         case 'STREAM_DATA':
             try {
-                if (data.chunk) controller.enqueue(new Uint8Array(data.chunk));
-            } catch(e) { }
+                if (data.chunk) {
+                    controller.enqueue(new Uint8Array(data.chunk));
+                }
+            } catch(e) { 
+                logToClient(data.requestId, `SW Enqueue Fail: ${e.message}`, 'FATAL');
+                try { controller.error(e); } catch(err){}
+                streamControllers.delete(data.requestId);
+            }
             break;
         case 'STREAM_END':
             try { controller.close(); } catch(e) {}
             streamControllers.delete(data.requestId);
+            streamClients.delete(data.requestId);
             break;
         case 'STREAM_ERROR':
-            try { controller.error(new Error(data.msg)); } catch(e) {}
+            const err = new Error(data.msg);
+            logToClient(data.requestId, `SW收到主线程报错: ${data.msg}`, 'ERROR');
+            try { controller.error(err); } catch(e) {}
             streamControllers.delete(data.requestId);
+            streamClients.delete(data.requestId);
             break;
     }
 });
@@ -50,7 +78,6 @@ self.addEventListener('fetch', event => {
   const url = new URL(event.request.url);
 
   if (url.pathname.includes('/virtual/file/')) {
-    // console.log('[SW] [STEP 4a] 拦截虚拟请求', url.pathname);
     event.respondWith(handleVirtualStream(event));
     return;
   }
@@ -87,13 +114,18 @@ async function handleVirtualStream(event) {
     const range = event.request.headers.get('Range');
     const requestId = Math.random().toString(36).slice(2) + Date.now();
 
+    // 记录映射，以便回传日志
+    streamClients.set(requestId, client.id);
+
     const stream = new ReadableStream({
         start(controller) {
             streamControllers.set(requestId, controller);
             client.postMessage({ type: 'STREAM_OPEN', requestId, fileId, range });
         },
-        cancel() {
+        cancel(reason) {
+            logToClient(requestId, `浏览器取消流: ${reason}`, 'WARN');
             streamControllers.delete(requestId);
+            streamClients.delete(requestId);
             client.postMessage({ type: 'STREAM_CANCEL', requestId });
         }
     });
@@ -117,6 +149,7 @@ async function handleVirtualStream(event) {
                 else if (d.type === 'STREAM_ERROR') {
                     self.removeEventListener('message', metaHandler);
                     streamControllers.delete(requestId);
+                    streamClients.delete(requestId);
                     resolve(new Response(d.msg || 'File Not Found', { status: 404 }));
                 }
             }
@@ -127,7 +160,9 @@ async function handleVirtualStream(event) {
         setTimeout(() => {
             self.removeEventListener('message', metaHandler);
             if (streamControllers.has(requestId)) {
+                logToClient(requestId, '等待 Meta 超时 (10s)', 'ERROR');
                 streamControllers.delete(requestId);
+                streamClients.delete(requestId);
                 resolve(new Response("Gateway Timeout (Metadata Wait)", { status: 504 }));
             }
         }, 10000);
