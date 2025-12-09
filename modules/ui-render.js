@@ -37,6 +37,15 @@ export function init() {
   
   // === 视频错误处理 + 环境检测 ===
   window.handleVideoError = function(el, fileName) {
+      if (el.src.includes('/virtual/file/')) {
+          let retries = parseInt(el.dataset.retry || '0');
+          if (retries < 3) {
+              el.dataset.retry = retries + 1;
+              if(window.monitor) window.monitor.warn('UI', `⚠️ 视频Error重试(${retries+1})...`);
+              setTimeout(() => { const s = el.src; el.src=''; el.src=s; el.load(); }, 1000);
+              return;
+          }
+      }
       el.style.display = 'none';
       const errDiv = el.parentElement.querySelector('.video-error');
       if(errDiv) errDiv.style.display = 'block';
@@ -82,6 +91,26 @@ export function init() {
   };
 
   window.handleImageError = function(el, fileName) {
+
+      // === 修复：SW启动延迟导致的404自动重试 ===
+      if (el.src.includes('/virtual/file/')) {
+          let retries = parseInt(el.dataset.retry || '0');
+          if (retries < 3) {
+              el.dataset.retry = retries + 1;
+              if(window.monitor) window.monitor.warn('UI', `⚠️ 图片加载失败，正在重试(${retries+1}/3)...`, {file: fileName});
+              setTimeout(() => {
+                  const src = el.src;
+                  el.src = ''; // 强制刷新
+                  el.src = src;
+              }, 1000);
+              return;
+          }
+      }
+
+      if (el.dataset.errHandled) return;
+      el.dataset.errHandled = 'true';
+      el.classList.add('error');
+      
       if (el.dataset.errHandled) return;
       el.dataset.errHandled = 'true';
       el.classList.add('error');
