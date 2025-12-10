@@ -1,139 +1,80 @@
-// Loader v2.0 - Visual Diagnostic
-// 这个版本会将日志直接打印在屏幕上，方便排查白屏问题
+// Loader v2.1 - Runtime Diagnostic
+// 包含启动诊断 + P2P 实时监控面板
 
-function logToScreen(msg, color = '#0f0') {
-    console.log(msg);
-    const box = document.getElementById('debug-boot');
-    if (box) {
-        const line = document.createElement('div');
-        line.style.color = color;
-        line.style.marginBottom = '4px';
-        line.innerText = '> ' + msg;
-        box.appendChild(line);
-    }
-}
-
-// 初始化屏幕日志区域
-(function initDebugUI() {
-    if (!document.getElementById('debug-boot')) {
+// === UI: 实时诊断面板 ===
+const debugPanel = {
+    el: null,
+    init() {
+        if (document.getElementById('p2p-monitor')) return;
         const div = document.createElement('div');
-        div.id = 'debug-boot';
+        div.id = 'p2p-monitor';
         div.style.position = 'fixed';
         div.style.top = '0';
-        div.style.left = '0';
-        div.style.width = '100%';
-        div.style.height = '100%';
-        div.style.background = '#000';
-        div.style.color = '#fff';
-        div.style.zIndex = '99999';
-        div.style.padding = '20px';
+        div.style.right = '0';
+        div.style.width = '200px'; // 稍微窄一点，不挡操作
+        div.style.maxHeight = '150px';
+        div.style.background = 'rgba(0,0,0,0.8)';
+        div.style.color = '#0f0';
+        div.style.zIndex = '100000';
+        div.style.fontSize = '10px';
         div.style.fontFamily = 'monospace';
         div.style.overflowY = 'auto';
-        div.style.fontSize = '12px';
-        div.innerHTML = '<h3 style="color:#fff;border-bottom:1px solid #333;padding-bottom:10px">🚀 系统启动诊断模式</h3>';
+        div.style.pointerEvents = 'none'; // 允许点击穿透
+        div.style.padding = '4px';
+        div.innerHTML = '<div style="border-bottom:1px solid #444;margin-bottom:2px">📡 P2P 实时监控</div>';
         document.body.appendChild(div);
+        this.el = div;
+    },
+    log(msg, type='info') {
+        if (!this.el) this.init();
+        const line = document.createElement('div');
+        line.innerText = `[${new Date().toLocaleTimeString().split(' ')[0]}] ${msg}`;
+        if (type === 'error') line.style.color = '#f55';
+        if (type === 'warn') line.style.color = '#fa0';
+        if (type === 'tx') line.style.color = '#aaf'; // 发送
+        if (type === 'rx') line.style.color = '#afa'; // 接收
+        this.el.appendChild(line);
+        this.el.scrollTop = this.el.scrollHeight;
+        // 自动清理
+        if (this.el.childElementCount > 20) this.el.removeChild(this.el.children[1]);
     }
-})();
+};
 
-// 硬编码加载顺序 (绕过 registry.txt 可能的乱码或错误)
-const LOAD_ORDER = [
-    "monitor",
-    "constants",
-    "utils",
-    "state",
-    "db",
-    "protocol",    // protocol 必须在 smart-core 之前
-    "smart-core",  // 核心模块
-    "p2p",
-    "mqtt",
-    "hub",
-    "ui-render",
-    "ui-events"
-];
+// 暴露给全局
+window.visualLog = (msg, type) => debugPanel.log(msg, type);
+
+// === 之前的启动逻辑 ===
+const LOAD_ORDER = ["monitor", "constants", "utils", "state", "db", "protocol", "smart-core", "p2p", "mqtt", "hub", "ui-render", "ui-events"];
 
 async function boot() {
-    logToScreen('开始加载...', '#aaa');
+    debugPanel.init();
+    debugPanel.log('Loader: 系统启动...', 'warn');
 
     // 1. 加载配置
     try {
-        const cfg = await fetch('./config.json').then(r => r.json());
-        window.config = cfg;
-        logToScreen('✅ 配置加载成功');
-    } catch(e) {
-        logToScreen('⚠️ 配置加载失败 (使用默认空配置)', '#fa0');
-        window.config = { peer: {}, mqtt: {} };
-    }
+        window.config = await fetch('./config.json').then(r => r.json());
+    } catch(e) { window.config = { peer: {}, mqtt: {} }; }
 
-    // 2. 串行加载模块
+    // 2. 加载模块
     for (const mod of LOAD_ORDER) {
-        logToScreen(`⏳ 正在加载模块: ${mod}...`, '#aaa');
-        const path = `./modules/${mod}.js?t=` + Date.now();
         try {
-            const m = await import(path);
-            if (m.init) {
-                try {
-                    m.init();
-                    logToScreen(`  -> ${mod} 初始化完成`);
-                } catch(initErr) {
-                    logToScreen(`❌ ${mod}.init() 执行出错: ${initErr.message}`, '#f00');
-                    console.error(initErr);
-                }
-            } else {
-                logToScreen(`  -> ${mod} 已加载 (无 init)`);
-            }
+            const m = await import(`./modules/${mod}.js?t=` + Date.now());
+            if (m.init) m.init();
         } catch(e) {
-            logToScreen(`❌ 模块文件加载失败: ${mod}.js`, '#f00');
-            logToScreen(`  原因: ${e.message}`, '#f55');
-            // 如果是核心模块失败，可能导致崩溃
-            if (mod === 'protocol' || mod === 'smart-core') {
-                 logToScreen('🚨 核心依赖丢失，系统可能无法启动', '#f00');
-            }
+            debugPanel.log(`❌ ${mod} 失败: ${e.message}`, 'error');
+            console.error(e);
         }
     }
     
-    // 3. 加载 App 主程序
-    logToScreen('⏳ 正在启动主程序 app.js...', '#aaa');
+    // 3. 启动 App
     try {
-        const appPath = './app.js?t=' + Date.now();
-        const appMod = await import(appPath);
-        if (appMod.init) {
-            appMod.init();
-            logToScreen('✅ App.init() 调用成功', '#0f0');
-        } else {
-            // 尝试全局查找
-            if (window.app && window.app.init) {
-                window.app.init();
-                logToScreen('✅ window.app.init() 调用成功 (Fallback)', '#0f0');
-            } else {
-                logToScreen('❌ 找不到 App 启动入口!', '#f00');
-            }
-        }
+        const appMod = await import('./app.js?t=' + Date.now());
+        if (appMod.init) appMod.init();
+        else if (window.app && window.app.init) window.app.init();
+        debugPanel.log('✅ 系统就绪', 'info');
     } catch(e) {
-        logToScreen(`❌ app.js 加载/执行失败: ${e.message}`, '#f00');
+        debugPanel.log(`❌ App 启动失败`, 'error');
     }
-
-    logToScreen('🎉 启动流程结束', '#0ff');
-    
-    // 3秒后如果没有报错，隐藏诊断层
-    setTimeout(() => {
-        const box = document.getElementById('debug-boot');
-        if (box && !document.body.innerText.includes('❌')) {
-             // box.style.display = 'none'; // 为了看清日志，暂时不自动隐藏
-             logToScreen('诊断层将在 5秒后自动关闭...', '#666');
-             setTimeout(() => {
-                 if(box) box.style.display = 'none';
-             }, 5000);
-        }
-    }, 2000);
 }
-
-// 捕获全局未处理错误
-window.addEventListener('error', e => {
-    logToScreen(`🔥 全局崩溃: ${e.message} at ${e.filename}:${e.lineno}`, '#f00');
-});
-
-window.addEventListener('unhandledrejection', e => {
-    logToScreen(`🔥 未捕获 Promise 异常: ${e.reason}`, '#f00');
-});
 
 boot();

@@ -1,18 +1,13 @@
 import { MSG_TYPE, CHAT, NET_PARAMS } from './constants.js';
 
-/**
- * Smart Core v2.6.2 - Crash Fix
- */
-
-function logError(msg, err) {
-    console.error(`[SmartCore] ${msg}`, err);
-    if (window.monitor) window.monitor.error('CORE', msg, err);
+function log(msg, type='info') {
+    if (window.visualLog) window.visualLog(msg, type);
+    console.log(`[SmartCore] ${msg}`);
 }
 
 export function init() {
-  if (window.monitor) window.monitor.info('Core', 'Smart Core v2.6.2 启动');
+  log('Core Start');
 
-  // 初始化全局对象
   window.virtualFiles = new Map(); 
   window.remoteFiles = new Map();  
   window.smartMetaCache = new Map(); 
@@ -28,7 +23,6 @@ export function init() {
       navigator.serviceWorker.addEventListener('message', event => handleSWMessage(event));
   }
 
-  // 暴露 API
   window.smartCore = {
       handleBinary: (data, fromPeerId) => handleIncomingBinary(data, fromPeerId),
       
@@ -38,17 +32,18 @@ export function init() {
               if (window.ui && window.ui.downloadBlob) window.ui.downloadBlob(file, fileName);
               return;
           }
+          log(`启动下载: ${fileName}`, 'tx');
           const url = `/virtual/file/${fileId}/${encodeURIComponent(fileName)}`;
           const a = document.createElement('a'); a.href = url; a.download = fileName; 
           document.body.appendChild(a); a.click(); setTimeout(() => document.body.removeChild(a), 100);
       },
       
       play: (fileId, fileName) => {
+          log(`Play: ${fileName}`, 'info');
           if (window.virtualFiles.has(fileId)) {
               try {
                   const file = window.virtualFiles.get(fileId);
                   if (file.size === 0) throw new Error('Empty');
-                  if (window.blobUrls.has(fileId)) return window.blobUrls.get(fileId);
                   const url = URL.createObjectURL(file);
                   window.blobUrls.set(fileId, url);
                   return url;
@@ -58,13 +53,16 @@ export function init() {
           const isVideo = fileName.match(/\.(mp4|mov|m4v)$/i);
           if (isVideo) {
               if (window.activePlayer) try { window.activePlayer.destroy(); } catch(e){}
-              try { window.activePlayer = new P2PVideoPlayer(fileId); } catch (e) { return null; }
+              try { window.activePlayer = new P2PVideoPlayer(fileId); } catch (e) { log('No MP4Box', 'error'); return null; }
               
               const requestId = 'vid_' + Date.now();
               if (navigator.serviceWorker.controller) {
                   navigator.serviceWorker.controller.postMessage({
                       type: 'STREAM_OPEN', requestId, fileId, range: 'bytes=0-'
                   });
+                  log('SW Stream Open', 'tx');
+              } else {
+                  log('SW Not Active!', 'error');
               }
               return window.activePlayer.getUrl();
           }
@@ -72,17 +70,8 @@ export function init() {
       }
   };
 
-  // === 核心修复：延迟劫持 Protocol，防止依赖未就绪导致启动崩溃 ===
-  const patchProtocol = () => {
-      if (!window.protocol || !window.protocol.sendMsg) {
-          console.warn('SmartCore: Protocol not ready, retrying in 200ms...');
-          setTimeout(patchProtocol, 200);
-          return;
-      }
-
-      // 防止重复劫持
-      if (window.protocol._smartPatched) return;
-      window.protocol._smartPatched = true;
+  setTimeout(() => {
+      if (!window.protocol || !window.protocol.sendMsg) return;
 
       const originalSendMsg = window.protocol.sendMsg;
       window.protocol.sendMsg = function(txt, kind, meta) {
@@ -90,6 +79,8 @@ export function init() {
               const file = meta.fileObj;
               const fileId = window.util.uuid();
               window.virtualFiles.set(fileId, file);
+              
+              log(`Tx File: ${file.name}`, 'tx');
               
               const target = (window.state.activeChat && window.state.activeChat !== CHAT.PUBLIC_ID) ? window.state.activeChat : CHAT.PUBLIC_ID;
               const fileMeta = {
@@ -99,9 +90,8 @@ export function init() {
               };
 
               window.protocol.processIncoming(fileMeta); 
-              const metaAck = { ...fileMeta, _sentTs: Date.now() };
-              window.pendingAcks.set(metaAck.id, metaAck);
               window.protocol.broadcast({ t: 'SMART_META', ...fileMeta }, target);
+              log('Meta Broadcast', 'tx');
               return;
           }
           originalSendMsg.apply(this, arguments);
@@ -109,20 +99,13 @@ export function init() {
 
       const originalProcess = window.protocol.processIncoming;
       window.protocol.processIncoming = function(pkt, fromPeerId) {
-          if (pkt.t === 'SMART_ACK') {
-               if (window.pendingAcks.has(pkt.refId)) window.pendingAcks.delete(pkt.refId);
-               return;
-          }
           if (pkt.t === 'SMART_META') {
               if (window.state.seenMsgs.has(pkt.id)) return;
               window.state.seenMsgs.add(pkt.id);
-              if (pkt.target === window.state.myId) {
-                  const conn = window.state.conns[fromPeerId];
-                  if (conn && conn.open) conn.send({ t: 'SMART_ACK', refId: pkt.id });
-              }
-              window.db.saveMsg({ 
-                  id: pkt.id, ts: pkt.ts, senderId: pkt.senderId, n: pkt.n, target: pkt.target, kind: pkt.kind, txt: pkt.txt, meta: pkt
-              });
+              
+              log(`Rx Meta: ${pkt.meta.fileName}`, 'rx');
+              
+              window.db.saveMsg({ id: pkt.id, ts: pkt.ts, senderId: pkt.senderId, n: pkt.n, target: pkt.target, kind: pkt.kind, txt: pkt.txt, meta: pkt });
               window.smartMetaCache.set(pkt.fileId, pkt);
               if (!window.remoteFiles.has(pkt.fileId)) window.remoteFiles.set(pkt.fileId, new Set());
               window.remoteFiles.get(pkt.fileId).add(pkt.senderId);
@@ -132,11 +115,15 @@ export function init() {
           if (pkt.t === 'SMART_WHO_HAS') {
               if (window.virtualFiles.has(pkt.fileId)) {
                    const conn = window.state.conns[fromPeerId];
-                   if(conn && conn.open) conn.send({ t: 'SMART_HAVE', fileId: pkt.fileId });
+                   if(conn && conn.open) {
+                       conn.send({ t: 'SMART_HAVE', fileId: pkt.fileId });
+                       log(`Rx WHO_HAS -> Rep HAVE`, 'tx');
+                   }
               }
               return;
           }
           if (pkt.t === 'SMART_HAVE') {
+              log(`Rx HAVE from ${fromPeerId}`, 'rx');
               if (!window.remoteFiles.has(pkt.fileId)) window.remoteFiles.set(pkt.fileId, new Set());
               window.remoteFiles.get(pkt.fileId).add(fromPeerId);
               window.activeStreams.forEach(task => {
@@ -148,16 +135,14 @@ export function init() {
               return;
           }
           if (pkt.t === 'SMART_GET') {
+              log(`Rx GET chunk ${pkt.offset}`, 'rx');
               handleSmartGet(pkt, fromPeerId);
               return;
           }
           originalProcess.apply(this, arguments);
       };
-      console.log('✅ SmartCore: Protocol Hijacked Successfully');
-  };
-
-  // 尝试执行劫持
-  patchProtocol();
+      log('Protocol Patched', 'info');
+  }, 1000);
 }
 
 async function restoreMetaFromDB() {
@@ -171,8 +156,10 @@ async function restoreMetaFromDB() {
 
 function handleSWMessage(event) {
     const d = event.data;
-    if (d && d.type === 'STREAM_OPEN') startStreamTask(d);
-    else if (d && d.type === 'STREAM_CANCEL') stopStreamTask(d.requestId);
+    if (d && d.type === 'STREAM_OPEN') {
+        log('SW req Stream', 'info');
+        startStreamTask(d);
+    }
 }
 
 const CHUNK_SIZE = 512 * 1024;
@@ -180,17 +167,17 @@ const TIMEOUT_MS = 5000;
 
 function startStreamTask(req) {
     const { requestId, fileId, range } = req;
-    if (window.virtualFiles.has(fileId)) { serveLocalFile(req); return; }
+    log(`Start Task: ${fileId}`, 'info');
 
     const meta = window.smartMetaCache.get(fileId);
     if (!meta) {
         sendToSW({ type: 'STREAM_ERROR', requestId, msg: 'Meta Not Found' });
         window.protocol.flood({ t: 'SMART_WHO_HAS', fileId });
+        log('Meta Missing, flooding WHO_HAS', 'warn');
         return;
     }
 
-    let start = 0;
-    let end = meta.fileSize - 1;
+    let start = 0; let end = meta.fileSize - 1;
     if (range && range.startsWith('bytes=')) {
         const parts = range.replace('bytes=', '').split('-');
         start = parseInt(parts[0], 10);
@@ -206,8 +193,13 @@ function startStreamTask(req) {
     };
     window.activeStreams.set(requestId, task);
     
-    if (task.peers.length === 0) window.protocol.flood({ t: 'SMART_WHO_HAS', fileId });
-    else pumpStream(task);
+    if (task.peers.length === 0) {
+        window.protocol.flood({ t: 'SMART_WHO_HAS', fileId });
+        log('No Peers, flooding WHO_HAS', 'warn');
+    } else {
+        log(`Found ${task.peers.length} peers, pumping...`, 'info');
+        pumpStream(task);
+    }
 }
 
 function stopStreamTask(reqId) {
@@ -217,7 +209,7 @@ function stopStreamTask(reqId) {
 }
 
 function pumpStream(task) {
-    if (task.finished || !window.activeStreams.has(task.requestId)) return;
+    if (task.finished) return;
     
     while (task.buffer.has(task.cursor)) {
         const chunk = task.buffer.get(task.cursor);
@@ -228,6 +220,7 @@ function pumpStream(task) {
         if (task.cursor > task.end) {
             sendToSW({ type: 'STREAM_END', requestId: task.requestId });
             task.finished = true;
+            log('Transfer Finished', 'success');
             stopStreamTask(task.requestId);
             return;
         }
@@ -243,7 +236,10 @@ function pumpStream(task) {
         const peer = task.peers[Math.floor(Math.random() * task.peers.length)];
         task.inflight.set(next, Date.now());
         const conn = window.state.conns[peer];
-        if (conn && conn.open) conn.send({ t: 'SMART_GET', reqId: task.requestId, fileId: task.fileId, offset: next, size });
+        if (conn && conn.open) {
+            conn.send({ t: 'SMART_GET', reqId: task.requestId, fileId: task.fileId, offset: next, size });
+            log(`TX GET ${next} -> ${peer.slice(0,4)}`, 'tx');
+        }
     }
 }
 
@@ -252,12 +248,9 @@ function watchdog() {
     window.activeStreams.forEach(task => {
         let needsPump = false;
         task.inflight.forEach((ts, offset) => {
-            if (now - ts > TIMEOUT_MS) { task.inflight.delete(offset); needsPump = true; }
+            if (now - ts > TIMEOUT_MS) { task.inflight.delete(offset); needsPump = true; log(`Timeout chunk ${offset}`, 'warn'); }
         });
         if (needsPump || (task.inflight.size === 0 && !task.finished)) pumpStream(task);
-    });
-    window.pendingAcks.forEach((m, id) => {
-        if (now - m._sentTs > 2000) window.pendingAcks.delete(id);
     });
 }
 
@@ -276,6 +269,7 @@ function handleIncomingBinary(buffer, fromPeerId) {
                         task.receivedOffsets.add(h.offset); 
                         task.inflight.delete(h.offset);     
                         task.buffer.set(h.offset, body);
+                        log(`Rx DATA ${h.offset} <- ${fromPeerId.slice(0,4)}`, 'rx');
                         pumpStream(task);
                     }
                     return; 
@@ -283,8 +277,7 @@ function handleIncomingBinary(buffer, fromPeerId) {
             }
         }
     } catch(e) {}
-    // Fallback
-    if (window.protocol && window.protocol.processIncoming) console.warn('Unknown binary');
+    log('Rx Unknown Binary', 'warn');
 }
 
 function handleSmartGet(pkt, pid) {
@@ -302,20 +295,9 @@ function handleSmartGet(pkt, pid) {
         packet.set(hb, 1);
         packet.set(new Uint8Array(raw), 1 + hb.byteLength);
         conn.send(packet);
+        log(`Tx DATA ${pkt.offset} -> ${pid.slice(0,4)}`, 'tx');
     };
     reader.readAsArrayBuffer(file.slice(pkt.offset, pkt.offset + pkt.size));
-}
-
-function serveLocalFile(req) {
-    const file = window.virtualFiles.get(req.fileId);
-    if (!file) return;
-    sendToSW({ type: 'STREAM_META', requestId: req.requestId, fileSize: file.size, fileType: file.type, start:0, end:file.size-1 });
-    const reader = new FileReader();
-    reader.onload = () => {
-         sendToSW({ type: 'STREAM_DATA', requestId: req.requestId, chunk: reader.result });
-         sendToSW({ type: 'STREAM_END', requestId: req.requestId });
-    };
-    reader.readAsArrayBuffer(file);
 }
 
 function sendToSW(msg) {
