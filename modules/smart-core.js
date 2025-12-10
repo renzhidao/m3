@@ -95,6 +95,7 @@ export function init() {
       play: (fileId, name) => {
           if (window.virtualFiles.has(fileId)) return URL.createObjectURL(window.virtualFiles.get(fileId));
           startDownloadTask(fileId);
+          autoBindVideo(fileId);
           if (name.match(/\.(mp4|mov)$/i)) {
               if (window.activePlayer) try{window.activePlayer.destroy()}catch(e){}
               window.activePlayer = new P2PVideoPlayer(fileId);
@@ -107,14 +108,20 @@ export function init() {
               const a = document.createElement('a'); a.href = URL.createObjectURL(window.virtualFiles.get(fileId)); a.download = name; a.click();
           } else { startDownloadTask(fileId); log('⏳ 开始下载...'); }
       },
-      cacheMeta: (m) => { if(m && m.fileId) window.smartMetaCache.set(m.fileId, m); }
+      cacheMeta: (m) => { if(m && m.fileId) window.smartMetaCache.set(m.fileId, m); },
+      // 显式绑定播放器，启用拖动随机访问
+      bindVideo: (video, fileId) => bindVideoEvents(video, fileId),
+      // 主动寻址到时间（秒）
+      seek: (fileId, seconds) => seekToTime(fileId, seconds)
   };
 }
 
-const CHUNK_SIZE = 128 * 1024; // 避免触发 DataChannel 单包上限
-const BASE_TAIL_SEGMENTS = 2;   // 初始预取尾部 2 块
-const ESCALATE_ROUNDS = 4;      // 最多追加 4 轮
-const ESCALATE_STEP_MS = 300;   // 每轮间隔
+// ==== 传输/播放参数 ====
+const CHUNK_SIZE = 128 * 1024; // 单包128KB，兼容移动端
+const PARALLEL = 6;            // 并发窗口大小
+const BASE_TAIL_SEGMENTS = 2;  // 初始预取尾部 2 块（拿 moov）
+const ESCALATE_ROUNDS = 4;     // 最多追加 4 轮
+const ESCALATE_STEP_MS = 300;  // 逐轮间隔
 
 function startDownloadTask(fileId) {
     if (window.activeTasks.has(fileId)) return;
@@ -123,7 +130,8 @@ function startDownloadTask(fileId) {
     
     const task = {
         fileId, size: meta.fileSize, received: 0, chunks: [], nextOffset: 0,
-        peers: [], parts: new Map(), tailRequested: new Set(), moovReady: false
+        peers: [], parts: new Map(), tailRequested: new Set(), moovReady: false,
+        inflight: new Set(), wantQueue: [], lastWanted: -CHUNK_SIZE, peerIndex: 0
     };
     
     if (meta.senderId && window.state.conns[meta.senderId]) task.peers.push(meta.senderId);
@@ -141,19 +149,18 @@ function startDownloadTask(fileId) {
 }
 
 function prefetchTail(task, segCount) {
-    const peer = task.peers[0];
-    if (!peer) return;
-    const conn = window.state.conns[peer];
-    if (!conn || !conn.open) return;
-
+    const offs = [];
     for (let i = segCount; i >= 1; i--) {
         const offset = task.size - i * CHUNK_SIZE;
         if (offset >= 0 && !task.tailRequested.has(offset)) {
             task.tailRequested.add(offset);
-            conn.send({ t: 'SMART_GET_CHUNK', fileId: task.fileId, offset, size: CHUNK_SIZE });
+            offs.push(offset);
             log(`📡 预取尾部: ${(offset/1024).toFixed(0)}KB`);
         }
     }
+    // 将尾部预取也纳入窗口，统一并发调度
+    offs.forEach(off => pushWanted(task, off));
+    dispatchRequests(task);
 }
 
 function scheduleTailEscalation(task, round) {
@@ -161,26 +168,59 @@ function scheduleTailEscalation(task, round) {
     setTimeout(() => {
         const t = window.activeTasks.get(task.fileId);
         if (!t || t.moovReady) return;
-        // 每轮再追加 2 块
         prefetchTail(t, BASE_TAIL_SEGMENTS + 2*round);
         scheduleTailEscalation(t, round + 1);
     }, ESCALATE_STEP_MS);
 }
 
+// 窗口填充 + 并发请求
 function requestNextChunk(task) {
-    if (task.received >= task.size) return; 
-    const peer = task.peers[0]; 
-    if (!peer) { log('❌ 无节点'); return; }
-    
-    const conn = window.state.conns[peer];
-    if (conn && conn.open) {
-        conn.send({ t: 'SMART_GET_CHUNK', fileId: task.fileId, offset: task.nextOffset, size: CHUNK_SIZE });
-        log(`📡 请求: ${(task.nextOffset/1024).toFixed(0)}KB`);
-    } else {
-        log(`❌ 节点断开`);
-        task.peers.shift(); 
-        requestNextChunk(task);
+    fillWindow(task);
+    dispatchRequests(task);
+}
+
+function fillWindow(task) {
+    const desired = PARALLEL * 2;
+    while ((task.wantQueue.length + task.inflight.size) < desired) {
+        const next = Math.max(task.nextOffset, task.lastWanted + CHUNK_SIZE);
+        if (next >= task.size) break;
+        pushWanted(task, next);
     }
+}
+
+function pushWanted(task, offset) {
+    if (offset < 0 || offset >= task.size) return;
+    if (task.inflight.has(offset)) return;
+    if (task.parts.has(offset)) return;
+    if (task.wantQueue.indexOf(offset) !== -1) return;
+    task.wantQueue.push(offset);
+    task.lastWanted = Math.max(task.lastWanted, offset);
+}
+
+function pickConn(task) {
+    if (!task.peers.length) return null;
+    const n = task.peers.length;
+    for (let i = 0; i < n; i++) {
+        const idx = (task.peerIndex + i) % n;
+        const pid = task.peers[idx];
+        const c = window.state.conns[pid];
+        if (c && c.open) { task.peerIndex = (idx + 1) % n; return c; }
+    }
+    return null;
+}
+
+function dispatchRequests(task) {
+    let sent = 0;
+    while (task.inflight.size < PARALLEL && task.wantQueue.length > 0) {
+        const off = task.wantQueue.shift();
+        const conn = pickConn(task);
+        if (!conn) { log('❌ 无可用连接'); task.wantQueue.unshift(off); break; }
+        conn.send({ t: 'SMART_GET_CHUNK', fileId: task.fileId, offset: off, size: CHUNK_SIZE });
+        task.inflight.add(off);
+        log(`📡 请求: ${(off/1024).toFixed(0)}KB`);
+        sent++;
+    }
+    return sent;
 }
 
 function handleGetChunk(pkt, fromId) {
@@ -202,7 +242,8 @@ function handleGetChunk(pkt, fromId) {
             
             const conn = window.state.conns[fromId];
             if (conn && conn.open) {
-                conn.send(packet); // 发送 Uint8Array，最大兼容
+                // 发送 Uint8Array，最大兼容
+                conn.send(packet);
                 log(`📤 数据发出: ${pkt.offset} -> ${fromId.slice(0,4)}`);
             } else {
                 log(`❌ 发送失败: 连接断开`);
@@ -228,7 +269,10 @@ function handleBinaryData(buffer, fromId) {
         const task = window.activeTasks.get(header.fileId);
         if (!task) return;
 
-        // 先把任意 offset 的块喂给播放器（MP4Box 支持乱序，只要有 fileStart）
+        // 标记此 offset 已返回
+        if (task.inflight.has(header.offset)) task.inflight.delete(header.offset);
+
+        // 先喂播放器（支持乱序）
         if (window.activePlayer && window.activePlayer.fileId === header.fileId) {
             window.activePlayer.appendChunk(body, header.offset);
         }
@@ -236,7 +280,7 @@ function handleBinaryData(buffer, fromId) {
         // 存入乱序缓存
         if (!task.parts.has(header.offset)) task.parts.set(header.offset, body);
 
-        // 连续冲刷顺序段，更新进度并继续请求
+        // 连续冲刷顺序段
         let advanced = false;
         while (true) {
             const seg = task.parts.get(task.nextOffset);
@@ -255,10 +299,56 @@ function handleBinaryData(buffer, fromId) {
             if (window.activePlayer && window.activePlayer.fileId === header.fileId) {
                 try { window.activePlayer.flush(); } catch(e) {}
             }
-        } else if (advanced) {
+        } else {
+            // 继续填充并发窗口
             requestNextChunk(task);
         }
     } catch(e) { console.error('Binary Parse Error', e); }
+}
+
+// === 拖动/寻址 ===
+function seekToTime(fileId, seconds) {
+    if (!window.activePlayer || window.activePlayer.fileId !== fileId) return;
+    const task = window.activeTasks.get(fileId);
+    if (!task) return;
+
+    let seekRes = null;
+    try { seekRes = window.activePlayer.seek(seconds); } catch(e) {}
+
+    if (seekRes && typeof seekRes.offset === 'number') {
+        const off = Math.max(0, Math.min(task.size - 1, seekRes.offset));
+        // 重置并发窗口，从新位置起拉取
+        task.wantQueue.length = 0;
+        task.lastWanted = off - CHUNK_SIZE;
+        // 不清理 inflight（允许回收利用），但会从新起点补足窗口
+        if (off > task.nextOffset) task.nextOffset = off;
+        fillWindow(task);
+        dispatchRequests(task);
+        log(`⏩ Seek -> 触发字节偏移: ${off}`);
+    } else {
+        // moov 尚未 ready，尽快扩大尾部预取
+        prefetchTail(task, BASE_TAIL_SEGMENTS + 6);
+    }
+}
+
+function bindVideoEvents(video, fileId) {
+    if (!video || video._p2pBound) return;
+    try {
+        video.playsInline = true;
+        video._p2pBound = true;
+        video.addEventListener('seeking', () => {
+            const t = isNaN(video.currentTime) ? 0 : video.currentTime;
+            seekToTime(fileId, t);
+        });
+    } catch(e) {}
+}
+
+function autoBindVideo(fileId) {
+    // 尝试自动绑定第一次出现的 video
+    setTimeout(() => {
+        const v = document.querySelector && document.querySelector('video');
+        if (v) bindVideoEvents(v, fileId);
+    }, 200);
 }
 
 class P2PVideoPlayer {
@@ -327,7 +417,7 @@ class P2PVideoPlayer {
                 const q = this.queues[id];
                 while (sb && !sb.updating && q && q.length) {
                     const seg = q.shift();
-                    try { sb.appendBuffer(seg); } catch(e) { /* 某些设备忙，留待下次 */ break; }
+                    try { sb.appendBuffer(seg); } catch(e) { break; }
                 }
             });
         } catch(e) {}
@@ -342,12 +432,14 @@ class P2PVideoPlayer {
     flush() {
         try { this.mp4box.flush(); } catch(e) {}
         try {
-            // 如果所有队列都清空且不再追加，结束媒体流
             const allEmpty = Object.values(this.queues).every(q => q.length === 0);
             if (this.mediaSource.readyState === 'open' && allEmpty) {
                 this.mediaSource.endOfStream();
             }
         } catch(e) {}
+    }
+    seek(seconds) {
+        try { return this.mp4box.seek(seconds, true); } catch(e) { return null; }
     }
     destroy() { try{URL.revokeObjectURL(this.url);}catch(e){} }
 }
