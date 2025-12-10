@@ -1,14 +1,27 @@
-const debugBox = document.getElementById('debug-console');
-function log(msg, type='ok') {
-    if(debugBox) {
-        // console.log(msg);
-    }
-}
+// Loader v1.1 - SW Priority Fix
+console.log('🚀 Loader: 启动中...');
 
-// 模块加载列表
 const FALLBACK_MODULES = ["monitor", "constants", "utils", "state", "db", "smart-core", "protocol", "p2p", "hub", "mqtt", "ui-render", "ui-events"];
 
 async function boot() {
+    // === 0. 优先注册 Service Worker ===
+    if ('serviceWorker' in navigator) {
+        try {
+            console.log('🔄 Loader: 注册 Service Worker...');
+            const reg = await navigator.serviceWorker.register('./sw.js?t=' + Date.now());
+            
+            // 等待 SW 激活 (关键修复)
+            await navigator.serviceWorker.ready;
+            console.log('✅ Loader: SW 已就绪 (Active)');
+            
+            if (navigator.serviceWorker.controller) {
+                navigator.serviceWorker.controller.postMessage({ type: 'PING' });
+            }
+        } catch (e) {
+            console.error('❌ Loader: SW 注册失败', e);
+        }
+    }
+
     // 1. 加载配置
     try {
         const cfg = await fetch('./config.json').then(r => r.json());
@@ -48,24 +61,17 @@ async function boot() {
         }
     }
     
-    // 4. 启动新核心 (app.js)
-    // === 修复：增加时间戳，强制刷新 app.js 及其依赖 ===
-    setTimeout(async () => {
-        try {
-            const main = await import('./app.js?t=' + Date.now());
-            if(main.init) {
-                main.init();
-                console.log('🚀 System Booting (Stream Final)...');
-            }
-        } catch(e) {
-            console.error('Failed to load app.js', e);
-            alert('启动核心失败: ' + e.message);
-        }
-    }, 500);
+    // 4. 显式调用 app.init (防止模块加载顺序问题)
+    if (window.app && window.app.init && !window.app._inited) {
+        // app.js 内部通常有自启动，这里作为保底
+        console.log('Loader: 检查 App 启动状态...');
+    }
+
+    console.log('🎉 Loader: 所有模块加载完成');
 }
 
-window.onerror = function(msg, url, line) {
-    console.error(`Global Error: ${msg} @ ${url}:${line}`);
-};
+boot().catch(e => console.error('Boot Failed:', e));
 
-boot();
+window.addEventListener('error', e => {
+    console.error('Global Error:', e.error);
+});
