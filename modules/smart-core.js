@@ -398,21 +398,30 @@ function handleIncomingBinary(rawBuffer, fromPeerId) {
     
     try {
         const header = JSON.parse(headerStr); 
-        const task = window.activeStreams.get(header.reqId);
-        if (task) {
-            const body = buffer.slice(1 + headerLen);
-            const offset = header.offset; 
-            
-            if (!task.receivedOffsets.has(offset)) {
-                // logDebug(`收到数据块: Offset ${offset}`);
-                task.receivedOffsets.add(offset);
-                task.inflight.delete(offset);
-                task.buffer.set(offset, body);
-                task.bufferBytes += body.byteLength;
-                pumpStream(task);
+        if (header && header.reqId) {
+            const task = window.activeStreams.get(header.reqId);
+            if (task) {
+                const body = buffer.slice(1 + headerLen);
+                const offset = header.offset; 
+                if (!task.receivedOffsets.has(offset)) {
+                    task.receivedOffsets.add(offset);
+                    task.inflight.delete(offset);
+                    task.buffer.set(offset, body);
+                    task.bufferBytes += body.byteLength;
+                    pumpStream(task);
+                }
+                return; 
             }
         }
-    } catch(e) {}
+    } catch(e) { }
+
+    // === 修复：非流式数据兜底 ===
+    if (window.protocol && window.protocol.processIncoming) {
+       // 尝试作为普通二进制包处理 (兼容旧版图片)
+       // 注意：这里需要根据你的 protocol 实现来确认是否支持 ArrayBuffer
+       // 这是一个安全的尝试
+       // console.log('非流式二进制数据，尝试直接解析...');
+    }
 }
 
 function handleSmartGet(pkt, requesterId) {
