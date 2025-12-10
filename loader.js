@@ -1,39 +1,47 @@
-// Loader v1.1 - SW Priority Fix
-console.log('🚀 Loader: 启动中...');
+// Loader v1.2 - Safe Boot (Timeout Protection)
+console.log('🚀 Loader: 启动中 (Safe Mode)...');
 
 const FALLBACK_MODULES = ["monitor", "constants", "utils", "state", "db", "smart-core", "protocol", "p2p", "hub", "mqtt", "ui-render", "ui-events"];
 
+// 超时辅助函数
+const waitWithTimeout = (promise, ms) => Promise.race([
+    promise,
+    new Promise((_, reject) => setTimeout(() => reject(new Error('TIMEOUT')), ms))
+]);
+
 async function boot() {
-    // === 0. 优先注册 Service Worker ===
+    // === 0. 尝试注册 SW (带超时保护) ===
     if ('serviceWorker' in navigator) {
         try {
             console.log('🔄 Loader: 注册 Service Worker...');
-            const reg = await navigator.serviceWorker.register('./sw.js?t=' + Date.now());
+            // 使用固定版本号，防止无限重装
+            const reg = await navigator.serviceWorker.register('./sw.js?v=fix_boot');
             
-            // 等待 SW 激活 (关键修复)
-            await navigator.serviceWorker.ready;
+            // 核心修复：最多等 2秒，等不到就跳过，防止死锁
+            await waitWithTimeout(navigator.serviceWorker.ready, 2000);
+            
             console.log('✅ Loader: SW 已就绪 (Active)');
-            
             if (navigator.serviceWorker.controller) {
                 navigator.serviceWorker.controller.postMessage({ type: 'PING' });
             }
         } catch (e) {
-            console.error('❌ Loader: SW 注册失败', e);
+            console.warn('⚠️ Loader: SW 跳过 (超时或失败), 继续启动 App...', e.message);
         }
     }
 
-    // 1. 加载配置
+    // === 1. 加载配置 (Fail-Safe) ===
     try {
         const cfg = await fetch('./config.json').then(r => r.json());
         window.config = cfg;
         console.log('✅ 配置文件已加载');
     } catch(e) {
-        console.error('❌ 无法加载 config.json', e);
-        alert('致命错误: 配置文件丢失');
+        console.error('❌ Config Load Error:', e);
+        // 如果配置文件都挂了，无法继续
+        document.body.innerHTML = '<h3 style="color:red;padding:20px">配置加载失败，请检查网络</h3>';
         return;
     }
 
-    // 2. 获取模块列表
+    // === 2. 获取模块列表 ===
     let modules = [];
     try {
         const res = await fetch('./registry.txt?t=' + Date.now()); 
@@ -44,34 +52,32 @@ async function boot() {
             throw new Error('404');
         }
     } catch(e) {
-        console.warn('Loader: Registry not found, using fallback.');
+        console.warn('Loader: Registry fallback.');
         modules = FALLBACK_MODULES;
     }
 
-    // 3. 逐个加载模块并执行初始化
+    // === 3. 串行加载模块 ===
     for (const mod of modules) {
-        const path = `./modules/${mod}.js?t=` + Date.now();
+        const path = `./modules/${mod}.js?v=fix_boot`; // 统一版本控制
         try {
-            const m = await import(path);
-            if (m.init) {
-                m.init();
-            }
+            await import(path).then(m => {
+                if (m.init) m.init();
+            });
         } catch(e) {
             console.error(`❌ Module failed: ${mod}`, e);
         }
     }
     
-    // 4. 显式调用 app.init (防止模块加载顺序问题)
+    // === 4. 确保 App 启动 ===
     if (window.app && window.app.init && !window.app._inited) {
-        // app.js 内部通常有自启动，这里作为保底
-        console.log('Loader: 检查 App 启动状态...');
+        console.log('Loader: Final check app start...');
+        // app.init() 通常是幂等的，多调一次没事
     }
 
-    console.log('🎉 Loader: 所有模块加载完成');
+    console.log('🎉 Loader: 启动流程结束');
 }
 
-boot().catch(e => console.error('Boot Failed:', e));
-
-window.addEventListener('error', e => {
-    console.error('Global Error:', e.error);
+boot().catch(e => {
+    console.error('🔥 BOOT CRASH:', e);
+    alert('启动崩溃，请截图控制台');
 });
