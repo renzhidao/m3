@@ -3,8 +3,8 @@ constants
 utils
 state
 db
-smart-core
 protocol
+smart-core
 p2p
 mqtt
 hub
