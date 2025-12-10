@@ -15,7 +15,7 @@ async function boot() {
         try {
             console.log('🔄 Loader: 注册 Service Worker...');
             // 使用固定版本号，防止无限重装
-            const reg = await navigator.serviceWorker.register('./sw.js?v=fix_boot');
+            const reg = await navigator.serviceWorker.register('./sw.js?v=fix_boot_v2');
             
             // 核心修复：最多等 2秒，等不到就跳过，防止死锁
             await waitWithTimeout(navigator.serviceWorker.ready, 2000);
@@ -36,9 +36,9 @@ async function boot() {
         console.log('✅ 配置文件已加载');
     } catch(e) {
         console.error('❌ Config Load Error:', e);
-        // 如果配置文件都挂了，无法继续
-        document.body.innerHTML = '<h3 style="color:red;padding:20px">配置加载失败，请检查网络</h3>';
-        return;
+        // 如果配置文件都挂了，尝试使用默认空配置继续，而不是直接死掉
+        window.config = { peer: {}, mqtt: {} }; 
+        console.warn('⚠️ 使用空配置继续启动');
     }
 
     // === 2. 获取模块列表 ===
@@ -58,11 +58,13 @@ async function boot() {
 
     // === 3. 串行加载模块 ===
     for (const mod of modules) {
-        const path = `./modules/${mod}.js?v=fix_boot`; // 统一版本控制
+        // 使用时间戳确保加载最新文件
+        const path = `./modules/${mod}.js?t=` + Date.now();
         try {
-            await import(path).then(m => {
-                if (m.init) m.init();
-            });
+            const m = await import(path);
+            if (m.init) {
+                m.init();
+            }
         } catch(e) {
             console.error(`❌ Module failed: ${mod}`, e);
         }
@@ -71,7 +73,7 @@ async function boot() {
     // === 4. 确保 App 启动 ===
     if (window.app && window.app.init && !window.app._inited) {
         console.log('Loader: Final check app start...');
-        // app.init() 通常是幂等的，多调一次没事
+        // 如果 app.js 自己没调用 init (现在它应该调了)，这里是最后一道保险
     }
 
     console.log('🎉 Loader: 启动流程结束');
@@ -79,5 +81,9 @@ async function boot() {
 
 boot().catch(e => {
     console.error('🔥 BOOT CRASH:', e);
-    alert('启动崩溃，请截图控制台');
+});
+
+// 全局错误监听
+window.addEventListener('error', e => {
+    console.error('Global Error:', e.error);
 });
