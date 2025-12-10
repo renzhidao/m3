@@ -14,7 +14,7 @@ export function init() {
       
       const p = window.state.peer;
       const pid = conn.peer;
-
+      
       try { conn.removeAllListeners(); } catch(e){}
       try { conn.close(); } catch(e){}
       
@@ -209,18 +209,41 @@ export function init() {
     handleData(d, conn) {
       // === 核心 Debug：P2P 入口探针 ===
       if (window.monitor && d) {
-          if (d.t === 'SMART_GET') {
+          if (d.t === 'SMART_GET' || d.t === 'SMART_GET_CHUNK') {
                window.monitor.info('P2P', `⚡ 底层收到请求: Offset ${d.offset}`, {from: conn.peer.slice(0,4)});
           } else if (d.t !== MSG_TYPE.PING && d.t !== MSG_TYPE.PONG) {
-               // 其他消息稍微打印一下，证明通道是活的
+               // 可按需打开更详细的调试
                // console.log('P2P RX:', d.t, conn.peer);
           }
       }
 
       conn.lastPong = Date.now();
       
-      // Binary Pack 兼容处理
-      if (d instanceof ArrayBuffer || d instanceof Uint8Array || (d.buffer && d.buffer instanceof ArrayBuffer)) {
+      // 1) Blob 兼容
+      if (typeof Blob !== 'undefined' && d instanceof Blob) {
+          const reader = new FileReader();
+          reader.onload = () => {
+              if (window.smartCore && window.smartCore.handleBinary) {
+                  window.smartCore.handleBinary(reader.result, conn.peer);
+              }
+          };
+          reader.readAsArrayBuffer(d);
+          return;
+      }
+
+      // 2) 数字键对象 → 二进制回放
+      if (d && typeof d === 'object' && !d.t && (0 in d)) {
+          try {
+              const arr = new Uint8Array(Object.values(d));
+              if (window.smartCore && window.smartCore.handleBinary) {
+                  window.smartCore.handleBinary(arr, conn.peer);
+              }
+              return;
+          } catch(e) {}
+      }
+
+      // 3) 标准二进制
+      if (d instanceof ArrayBuffer || d instanceof Uint8Array || (d && d.buffer instanceof ArrayBuffer)) {
           if (window.smartCore && window.smartCore.handleBinary) {
               window.smartCore.handleBinary(d, conn.peer);
           }
@@ -268,9 +291,7 @@ export function init() {
       }
       
       // === 关键修复：允许自定义协议穿透 ===
-      // 之前的代码可能只处理了特定MSG_TYPE，导致SMART_GET被忽略
-      // 如果没有匹配上述任何类型，但包含 t 字段，也尝试交给 protocol
-      if (d.t.startsWith('SMART_')) {
+      if (d.t && d.t.startsWith('SMART_')) {
           if (window.protocol) window.protocol.processIncoming(d, conn.peer);
       }
     },

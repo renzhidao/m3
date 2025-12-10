@@ -1,64 +1,41 @@
 import { CHAT, UI_CONFIG } from './constants.js';
 
 export function init() {
-  console.log('📦 加载模块: UI Events (Delegation Fix)');
-  
   window.uiEvents = {
     init() {
       this.bindClicks();
-      this.bindDelegation(); // 新增：全局委托
-      this.injectStyles();
-      this.addMonitorBtn();
+      this.bindDelegation();
+      this.addDiagBtn();
     },
     
-    addMonitorBtn() {
-        const header = document.querySelector('.chat-header div:last-child');
-        if (header && !document.getElementById('btnMonitor')) {
-            const btn = document.createElement('div');
-            btn.className = 'btn-icon';
-            btn.id = 'btnMonitor';
-            btn.innerHTML = '🐞';
-            btn.title = '打开诊断面板';
+    addDiagBtn() {
+        const box = document.querySelector('.settings-box');
+        if (box && !document.getElementById('btnNetDiag')) {
+            const btn = document.createElement('button');
+            btn.id = 'btnNetDiag';
+            btn.className = 'st-btn';
+            btn.style.background = '#607d8b';
+            btn.style.marginTop = '10px';
+            btn.innerText = '📡 网络诊断';
             btn.onclick = () => {
-                if(window.monitor) window.monitor.show();
+                if (window.smartCore && window.smartCore.runDiag) {
+                    window.smartCore.runDiag();
+                    alert('诊断已开始，请查看日志');
+                    document.getElementById('settings-panel').style.display = 'none';
+                    document.getElementById('miniLog').style.display = 'flex';
+                }
             };
-            header.prepend(btn);
+            box.appendChild(btn);
         }
     },
 
-    injectStyles() {
-      const css = '.file-card { display: flex; align-items: center; gap: 10px; background: rgba(0,0,0,0.2); padding: 8px 12px; border-radius: 8px; min-width: 200px; } ' +
-                  '.file-icon { font-size: 24px; } ' +
-                  '.file-info { flex: 1; min-width: 0; } ' +
-                  '.file-name { font-size: 14px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; } ' +
-                  '.file-size { font-size: 11px; opacity: 0.7; } ' +
-                  '.file-dl-btn { text-decoration: none; color: white; font-weight: bold; padding: 4px 8px; background: #2a7cff; border-radius: 4px; font-size: 12px; }';
-      const style = document.createElement('style');
-      style.textContent = css;
-      document.head.appendChild(style);
-    },
-
-    // === 核心修复：事件委托，一劳永逸 ===
     bindDelegation() {
         const list = document.getElementById('msgList');
         if (!list) return;
-
         list.addEventListener('click', (e) => {
-            // 1. 图片预览
             if (e.target.classList.contains('chat-img')) {
                 e.stopPropagation();
-                this.showImagePreview(e.target.src);
-            }
-        });
-        
-        list.addEventListener('contextmenu', (e) => {
-            const bubble = e.target.closest('.msg-bubble');
-            if (bubble) {
-                const selection = window.getSelection();
-                const range = document.createRange();
-                range.selectNodeContents(bubble);
-                selection.removeAllRanges();
-                selection.addRange(range);
+                // 预览逻辑
             }
         });
     },
@@ -79,30 +56,42 @@ export function init() {
         if (el) el.style.display = (el.style.display === 'flex') ? 'none' : 'flex';
       });
       
-      const logEl = document.getElementById('logContent');
-      if (logEl) {
-          logEl.addEventListener('contextmenu', (e) => {
-              const selection = window.getSelection();
-              const range = document.createRange();
-              range.selectNodeContents(logEl);
-              selection.removeAllRanges();
-              selection.addRange(range);
-          });
+      // === 新增：复制日志按钮 ===
+      const logBar = document.querySelector('.log-bar');
+      if (logBar && !document.getElementById('btnCopyLog')) {
+          const btn = document.createElement('button');
+          btn.id = 'btnCopyLog';
+          btn.className = 'log-btn';
+          btn.innerText = '📋 复制';
+          btn.style.marginRight = '10px';
+          btn.onclick = () => {
+              const el = document.getElementById('logContent');
+              if(el) {
+                  // 创建选区
+                  const range = document.createRange();
+                  range.selectNode(el);
+                  window.getSelection().removeAllRanges();
+                  window.getSelection().addRange(range);
+                  // 执行复制
+                  try {
+                      document.execCommand('copy');
+                      alert('日志已复制到剪贴板');
+                  } catch(e) { alert('复制失败，请长按手动复制'); }
+                  window.getSelection().removeAllRanges();
+              }
+          };
+          logBar.prepend(btn);
       }
-      
+
       bind('btnDlLog', () => {
         const el = document.getElementById('logContent');
         if (!el) return;
-        const text = (window.logSystem && window.logSystem.fullHistory) ? window.logSystem.fullHistory.join('\n') : 'Log Error';
         if (window.ui && window.ui.downloadBlob) {
-            window.ui.downloadBlob(btoa(unescape(encodeURIComponent(text))), 'p1_log.txt');
+            window.ui.downloadBlob(el.innerText, 'p1_log.txt');
         }
       });
 
-      bind('btnSettings', () => {
-        document.getElementById('settings-panel').style.display = 'grid';
-        document.getElementById('iptNick').value = window.state.myName;
-      });
+      bind('btnSettings', () => document.getElementById('settings-panel').style.display = 'grid');
       bind('btnCloseSettings', () => document.getElementById('settings-panel').style.display = 'none');
       
       bind('btnSave', () => {
@@ -121,22 +110,10 @@ export function init() {
         fi.onchange = (e) => {
           const file = e.target.files[0];
           if (!file) return;
-
-          const editor = document.getElementById('editor');
-          if (editor) editor.innerText = `⏳ 准备发送: ${file.name}`;
-
           const kind = file.type.startsWith('image/') ? CHAT.KIND_IMAGE : CHAT.KIND_FILE;
-          
           window.protocol.sendMsg(null, kind, {
-              fileObj: file, 
-              name: file.name,
-              size: file.size,
-              type: file.type
+              fileObj: file, name: file.name, size: file.size, type: file.type
           });
-          
-          if (editor) editor.innerText = '';
-          if(window.monitor) window.monitor.info('UI', `选择文件: ${file.name}`);
-          
           e.target.value = '';
         };
       }
@@ -170,24 +147,7 @@ export function init() {
           }
         });
       }
-    },
-
-    bindMsgEvents() {
-        // 空函数：已通过 bindDelegation 替代，保留此函数为了兼容旧调用
-    },
-    
-    showImagePreview(src) {
-        const overlay = document.createElement('div');
-        overlay.className = 'img-preview-overlay';
-        overlay.innerHTML = `<img src="${src}" class="img-preview-content">`;
-        
-        overlay.onclick = () => {
-            document.body.removeChild(overlay);
-        };
-        
-        document.body.appendChild(overlay);
     }
   };
-  
   window.uiEvents.init();
 }

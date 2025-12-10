@@ -1,80 +1,71 @@
-// Loader v2.1 - Runtime Diagnostic
-// 包含启动诊断 + P2P 实时监控面板
+// Loader v3.0 - SW Reset & Stable
+console.log('🚀 Loader: 系统启动 (SW重置版)...');
 
-// === UI: 实时诊断面板 ===
-const debugPanel = {
-    el: null,
-    init() {
-        if (document.getElementById('p2p-monitor')) return;
-        const div = document.createElement('div');
-        div.id = 'p2p-monitor';
-        div.style.position = 'fixed';
-        div.style.top = '0';
-        div.style.right = '0';
-        div.style.width = '200px'; // 稍微窄一点，不挡操作
-        div.style.maxHeight = '150px';
-        div.style.background = 'rgba(0,0,0,0.8)';
-        div.style.color = '#0f0';
-        div.style.zIndex = '100000';
-        div.style.fontSize = '10px';
-        div.style.fontFamily = 'monospace';
-        div.style.overflowY = 'auto';
-        div.style.pointerEvents = 'none'; // 允许点击穿透
-        div.style.padding = '4px';
-        div.innerHTML = '<div style="border-bottom:1px solid #444;margin-bottom:2px">📡 P2P 实时监控</div>';
-        document.body.appendChild(div);
-        this.el = div;
-    },
-    log(msg, type='info') {
-        if (!this.el) this.init();
-        const line = document.createElement('div');
-        line.innerText = `[${new Date().toLocaleTimeString().split(' ')[0]}] ${msg}`;
-        if (type === 'error') line.style.color = '#f55';
-        if (type === 'warn') line.style.color = '#fa0';
-        if (type === 'tx') line.style.color = '#aaf'; // 发送
-        if (type === 'rx') line.style.color = '#afa'; // 接收
-        this.el.appendChild(line);
-        this.el.scrollTop = this.el.scrollHeight;
-        // 自动清理
-        if (this.el.childElementCount > 20) this.el.removeChild(this.el.children[1]);
-    }
-};
-
-// 暴露给全局
-window.visualLog = (msg, type) => debugPanel.log(msg, type);
-
-// === 之前的启动逻辑 ===
-const LOAD_ORDER = ["monitor", "constants", "utils", "state", "db", "protocol", "smart-core", "p2p", "mqtt", "hub", "ui-render", "ui-events"];
+const FALLBACK_MODULES = ["monitor", "constants", "utils", "state", "db", "protocol", "smart-core", "p2p", "hub", "mqtt", "ui-render", "ui-events"];
 
 async function boot() {
-    debugPanel.init();
-    debugPanel.log('Loader: 系统启动...', 'warn');
+    // === 0. Service Worker 重置与注册 ===
+    if ('serviceWorker' in navigator) {
+        try {
+            // 1. 先卸载所有旧的 SW，防止冲突
+            const regs = await navigator.serviceWorker.getRegistrations();
+            for (const reg of regs) {
+                // 如果是旧的带时间戳的，或者状态异常的，卸载它
+                await reg.unregister();
+                console.log('🧹 已卸载旧 SW:', reg.scope);
+            }
 
-    // 1. 加载配置
+            // 2. 注册新的 (使用固定 URL，不要加时间戳！)
+            console.log('🔄 正在注册新 SW...');
+            const newReg = await navigator.serviceWorker.register('./sw.js'); // 固定 URL
+            
+            // 3. 强制等待激活
+            if (newReg.installing) {
+                console.log('⏳ SW 正在安装...');
+            } else if (newReg.waiting) {
+                console.log('⏳ SW 等待中 (跳过等待)...');
+                // newReg.waiting.postMessage({ type: 'SKIP_WAITING' }); // sw.js 里已有 skipWaiting
+            } else if (newReg.active) {
+                console.log('✅ SW 已激活');
+            }
+            
+            await navigator.serviceWorker.ready;
+            if (navigator.serviceWorker.controller) {
+                navigator.serviceWorker.controller.postMessage({ type: 'PING' });
+            }
+            console.log('✅ Service Worker 握手成功');
+
+        } catch (e) {
+            console.warn('⚠️ SW 注册警告:', e);
+        }
+    }
+
+    // === 1. 加载配置 ===
+    try { window.config = await fetch('./config.json').then(r => r.json()); } 
+    catch(e) { window.config = { peer: {}, mqtt: {} }; }
+
+    // === 2. 加载模块列表 ===
+    let modules = [];
     try {
-        window.config = await fetch('./config.json').then(r => r.json());
-    } catch(e) { window.config = { peer: {}, mqtt: {} }; }
+        const res = await fetch('./registry.txt?t=' + Date.now());
+        if(res.ok) modules = (await res.text()).split('\n').map(l => l.trim()).filter(l => l && !l.startsWith('#'));
+        else throw new Error('404');
+    } catch(e) { modules = FALLBACK_MODULES; }
 
-    // 2. 加载模块
-    for (const mod of LOAD_ORDER) {
+    // === 3. 加载模块 ===
+    for (const mod of modules) {
         try {
             const m = await import(`./modules/${mod}.js?t=` + Date.now());
             if (m.init) m.init();
-        } catch(e) {
-            debugPanel.log(`❌ ${mod} 失败: ${e.message}`, 'error');
-            console.error(e);
-        }
+        } catch(e) { console.error(`Failed: ${mod}`, e); }
     }
     
-    // 3. 启动 App
+    // === 4. 启动 App ===
     try {
         const appMod = await import('./app.js?t=' + Date.now());
         if (appMod.init) appMod.init();
         else if (window.app && window.app.init) window.app.init();
-        debugPanel.log('✅ 系统就绪', 'info');
-    } catch(e) {
-        debugPanel.log(`❌ App 启动失败`, 'error');
-    }
+    } catch(e) { console.error('App Launch Failed', e); }
 }
 
 boot();

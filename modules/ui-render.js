@@ -1,253 +1,150 @@
 import { CHAT, UI_CONFIG } from './constants.js';
 
 export function init() {
-  console.log('📦 加载模块: UI Render (Safe Guard)');
   window.ui = window.ui || {};
   
-  const style = document.createElement('style');
-  style.textContent = `
-    .img-preview-overlay {
-        position: fixed; top: 0; left: 0; width: 100%; height: 100%;
-        background: rgba(0,0,0,0.95); z-index: 9999;
-        display: flex; flex-direction: column; align-items: center; justify-content: center;
-        cursor: zoom-out;
-        animation: fadeIn 0.2s ease;
-    }
-    @keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
-    .img-preview-content {
-        max-width: 100%; max-height: 90%;
-        object-fit: contain;
-        box-shadow: 0 0 20px rgba(0,0,0,0.5);
-    }
-    .stream-card {
-        background: rgba(0,0,0,0.3); padding: 10px; border-radius: 8px; min-width: 220px;
-    }
-    .file-expired {
-        opacity: 0.6; font-style: italic; font-size: 12px; color: #ff3b30;
-        background: rgba(255,0,0,0.1); padding: 8px; border-radius: 4px;
-        border: 1px dashed #ff3b30;
-    }
-    .video-error {
-        color: #ff3b30; font-size: 11px; padding: 10px; text-align: center; border: 1px dashed #ff3b30; border-radius: 4px;
-    }
+  // 样式保持不变...
+  const css = `
+    .msg-bubble { max-width: 80%; padding: 8px 12px; border-radius: 8px; word-break: break-all; position: relative; }
+    .msg-row { display: flex; margin-bottom: 10px; }
+    .msg-row.me { justify-content: flex-end; }
+    .msg-row.me .msg-bubble { background: #0084ff; color: #fff; border-bottom-right-radius: 2px; }
+    .msg-row.other { justify-content: flex-start; }
+    .msg-row.other .msg-bubble { background: #333; color: #fff; border-bottom-left-radius: 2px; }
+    .msg-meta { font-size: 10px; color: #666; margin-top: 2px; text-align: right; }
+    .stream-card { background: rgba(0,0,0,0.3); padding: 10px; border-radius: 8px; min-width: 220px; }
+    .mini-log { display: none; flex-direction: column; position: fixed; bottom: 0; left: 0; right: 0; height: 40%; background: rgba(0,0,0,0.9); z-index: 999; border-top: 1px solid #444; }
+    .log-content { flex: 1; overflow-y: auto; padding: 10px; font-family: monospace; font-size: 11px; color: #0f0; user-select: text !important; -webkit-user-select: text !important; }
+    .log-bar { padding: 5px; background: #222; display: flex; gap: 10px; justify-content: flex-end; }
+    .log-btn { padding: 4px 10px; background: #444; color: #fff; border: none; border-radius: 4px; font-size: 12px; }
   `;
-  document.head.appendChild(style);
-  
+  const style = document.createElement('style'); style.textContent = css; document.head.appendChild(style);
+
   const render = {
     init() { this.renderList(); this.updateSelf(); },
-
-    updateSelf() {
-      const elId = document.getElementById('myId');
-      const elNick = document.getElementById('myNick');
-      const elSt = document.getElementById('statusText');
-      const elDot = document.getElementById('statusDot');
-      const elCount = document.getElementById('onlineCount');
-
-      if (elId) elId.innerText = window.state.myId.slice(0, 6);
-      if (elNick) elNick.innerText = window.state.myName;
-      
-      if (elSt) {
-        let s = '在线';
-        if (window.state.isHub) s = '👑网关';
-        if (window.state.mqttStatus === '在线') s += '+MQTT';
-        else if (window.state.mqttStatus === '失败') s += '(M离)';
-        elSt.innerText = s;
-      }
-      
-      if (elDot) elDot.className = window.state.mqttStatus === '在线' ? 'dot online' : 'dot';
-      
-      if (elCount) {
-         let count = 0;
-         Object.values(window.state.conns).forEach(c => { if(c.open) count++; });
-         elCount.innerText = count;
-      }
-    },
-
+    clearMsgs() { document.getElementById('msgList').innerHTML = ''; },
+    
     renderList() {
       const list = document.getElementById('contactList');
       if (!list) return;
-
-      const pubUnread = window.state.unread[CHAT.PUBLIC_ID] || 0;
+      list.innerHTML = '';
       
       let html = `
-        <div class="contact-item ${window.state.activeChat === CHAT.PUBLIC_ID ? 'active' : ''}" 
-              data-chat-id="${CHAT.PUBLIC_ID}" data-chat-name="${CHAT.PUBLIC_NAME}">
-          <div class="avatar" style="background:${UI_CONFIG.COLOR_GROUP}">群</div>
-          <div class="c-info">
-            <div class="c-name">${CHAT.PUBLIC_NAME} 
-               ${pubUnread > 0 ? `<span class="unread-badge">${pubUnread}</span>` : ''}
-            </div>
-          </div>
+        <div class="contact-item ${window.state.activeChat===CHAT.PUBLIC_ID?'active':''}" data-chat-id="${CHAT.PUBLIC_ID}" data-chat-name="公共频道">
+           <div class="avatar" style="background:#ff9800">群</div>
+           <div class="info"><div class="name">公共频道</div><div class="status">在线: ${Object.keys(window.state.conns).length}</div></div>
         </div>`;
-
-      const map = new Map();
-      Object.values(window.state.contacts).forEach(c => map.set(c.id, c));
-      Object.keys(window.state.conns).forEach(k => {
-         if (k !== window.state.myId) {
-            const existing = map.get(k) || {};
-            map.set(k, { ...existing, id: k, n: window.state.conns[k].label || k.slice(0, 6) });
-         }
-      });
-
-      map.forEach((v, id) => {
-        if (!id || id === window.state.myId || id.startsWith(window.config.hub.prefix)) return;
-        const isOnline = window.state.conns[id] && window.state.conns[id].open;
-        const unread = window.state.unread[id] || 0;
-        const safeName = window.util.escape(v.n || id.slice(0, 6));
-        const bg = isOnline ? UI_CONFIG.COLOR_ONLINE : window.util.colorHash(id);
-
-        html += `
-          <div class="contact-item ${window.state.activeChat === id ? 'active' : ''}" 
-                data-chat-id="${id}" data-chat-name="${safeName}">
-            <div class="avatar" style="background:${bg}">${safeName[0]}</div>
-            <div class="c-info">
-              <div class="c-name">${safeName} ${unread > 0 ? `<span class="unread-badge">${unread}</span>` : ''}</div>
-              <div class="c-time">${isOnline ? '在线' : '离线'}</div>
-            </div>
-          </div>`;
+      
+      Object.keys(window.state.conns).forEach(id => {
+          const conn = window.state.conns[id];
+          const name = conn.label || id.slice(0, 6);
+          const active = window.state.activeChat === id ? 'active' : '';
+          const unread = window.state.unread[id] ? `<div class="badge">${window.state.unread[id]}</div>` : '';
+          html += `<div class="contact-item ${active}" data-chat-id="${id}" data-chat-name="${window.util.escape(name)}"><div class="avatar">${name[0]}</div><div class="info"><div class="name">${window.util.escape(name)}</div><div class="status" style="color:#4caf50">● 在线</div></div>${unread}</div>`;
       });
       list.innerHTML = html;
     },
 
-    clearMsgs() {
-      const box = document.getElementById('msgList');
-      if (box) box.innerHTML = '';
+    updateSelf() {
+        const elNick = document.getElementById('myNick');
+        const elId = document.getElementById('myId');
+        const elDot = document.getElementById('statusDot');
+        const elText = document.getElementById('statusText');
+        if(elNick) elNick.innerText = window.state.myName;
+        if(elId) elId.innerText = window.state.myId;
+        
+        let status = '离线', color = '#999';
+        const mqttOn = window.state.mqttStatus === '在线';
+        const p2pCount = Object.keys(window.state.conns).length;
+        if (mqttOn && p2pCount > 0) { status = '在线+P2P'; color = '#4caf50'; }
+        else if (mqttOn) { status = '在线(MQTT)'; color = '#2196f3'; }
+        else if (p2pCount > 0) { status = 'P2P组网'; color = '#ff9800'; }
+        
+        if(elDot) elDot.style.background = color;
+        if(elText) { elText.innerText = status; elText.style.color = color; }
+        const countEl = document.getElementById('onlineCount');
+        if(countEl) countEl.innerText = p2pCount;
     },
 
     appendMsg(m) {
       const box = document.getElementById('msgList');
-      if (!box || !m) return;
-      if (document.getElementById('msg-' + m.id)) return;
+      if (!box || document.getElementById('msg-' + m.id)) return;
 
-      // === 修复：Try-Catch 保护，防止一条坏消息渲染失败导致白屏 ===
-      try {
-          const isMe = m.senderId === window.state.myId;
-          let content = '', style = '';
-    
-          if (m.kind === 'SMART_FILE_UI') {
-             const meta = m.meta;
-             const sizeStr = (meta.fileSize / (1024*1024)).toFixed(2) + ' MB';
-             const isVideo = meta.fileType.startsWith('video');
-             const isAudio = meta.fileType.startsWith('audio');
-             const isImg = meta.fileType.startsWith('image');
+      const isMe = m.senderId === window.state.myId;
+      let content = '', style = '';
+
+      if (m.kind === 'SMART_FILE_UI') {
+         const meta = m.meta;
+         
+         // === 核心修复：渲染时自动注入缓存 ===
+         // 既然 UI 拿到了数据，就顺便告诉 SmartCore
+         if (window.smartCore && window.smartCore.cacheMeta) {
+             // 兼容嵌套结构
+             const realMeta = (meta && meta.fileId) ? meta : (meta && meta.meta);
+             if (realMeta) window.smartCore.cacheMeta(realMeta);
+         }
+         // ================================
+
+         const safeName = window.util.escape(meta.fileName || '未知文件');
+         const sizeStr = meta.fileSize ? (meta.fileSize / (1024*1024)).toFixed(2) + ' MB' : '未知大小';
+         
+         const isVideo = meta.fileType && meta.fileType.startsWith('video');
+         const fileId = meta.fileId || (meta.meta && meta.meta.fileId);
+
+         // 只有当 fileId 存在时才渲染播放器
+         if (fileId && isVideo) {
+             // 获取播放链接 (现在 cache 肯定有了)
+             const streamUrl = window.smartCore ? window.smartCore.play(fileId, safeName) : '';
              
-             // === 修复：存活检查 ===
-             // 即使是自己发的消息，如果浏览器内存回收了 File 对象，smartCore.play 会返回 null
-             const streamUrl = window.smartCore.play(meta.fileId, meta.fileName);
-             
-             if (isMe && !streamUrl) {
-                 content = `
-                 <div class="file-expired">
-                     <div style="font-weight:bold">❌ ${window.util.escape(meta.fileName)}</div>
-                     <div>文件引用已失效 (请重新发送)</div>
-                 </div>`;
-                 style = 'background:transparent;padding:0;border:none';
-             } else {
-                 if (isVideo) {
-                     const errScript = `this.style.display='none';this.nextElementSibling.style.display='block';`;
-                     
-                     content = `
-                     <div class="stream-card">
-                         <div style="font-weight:bold;color:#4ea8ff">🎬 ${window.util.escape(meta.fileName)}</div>
-                         <div style="font-size:11px;color:#aaa;margin-bottom:8px">${sizeStr} (流式直连)</div>
-                         
-                         <video controls src="${streamUrl}" 
-                                style="width:100%;max-width:300px;background:#000;border-radius:4px"
-                                onerror="${errScript}"></video>
-                         
-                         <div class="video-error" style="display:none">
-                            ❌ 视频加载失败<br>可能原因: 文件损坏或编码不支持
-                         </div>
-    
-                         <div style="text-align:right;margin-top:4px">
-                             <a href="javascript:void(0)" onclick="window.smartCore.download('${meta.fileId}','${window.util.escape(meta.fileName)}')" style="color:#aaa;font-size:10px;text-decoration:none">⬇ 保存本地</a>
-                         </div>
-                     </div>`;
-                     style = 'background:transparent;padding:0;border:none';
-                 } else if (isAudio) {
-                     content = `
-                     <div class="stream-card">
-                         <div style="font-weight:bold;color:#4ea8ff">🎵 ${window.util.escape(meta.fileName)}</div>
-                         <div style="font-size:11px;color:#aaa;margin-bottom:8px">${sizeStr} (流式音频)</div>
-                         <audio controls src="${streamUrl}" style="width:100%;max-width:260px;height:40px;margin-top:4px"></audio>
-                         <div style="text-align:right;margin-top:4px">
-                             <a href="javascript:void(0)" onclick="window.smartCore.download('${meta.fileId}','${window.util.escape(meta.fileName)}')" style="color:#aaa;font-size:10px;text-decoration:none">⬇ 保存本地</a>
-                         </div>
-                     </div>`;
-                     style = 'background:transparent;padding:0;border:none';
-                 } else if (isImg) {
-                     content = `
-                     <div class="stream-card">
-                         <img src="${streamUrl}" class="chat-img" style="max-width:200px;border-radius:4px;display:block">
-                         <div style="font-size:10px;color:#aaa;margin-top:4px">${sizeStr}</div>
-                     </div>`;
-                     style = 'background:transparent;padding:0;border:none';
-                 } else {
-                     content = `
-                     <div class="stream-card">
-                         <div style="font-weight:bold;color:#fff">📄 ${window.util.escape(meta.fileName)}</div>
-                         <div style="font-size:11px;color:#aaa;margin:4px 0">${sizeStr}</div>
-                         <a href="javascript:void(0)" onclick="window.smartCore.download('${meta.fileId}','${window.util.escape(meta.fileName)}')"
-                            style="display:inline-block;background:#2a7cff;color:white;padding:6px 12px;border-radius:4px;text-decoration:none;font-size:12px;cursor:pointer">
-                            ⚡ 极速下载
-                         </a>
-                     </div>`;
-                     style = 'background:transparent;padding:0;border:none';
-                 }
-             }
-    
-          } else if (m.kind === CHAT.KIND_IMAGE) {
-             content = `<img src="${m.txt}" class="chat-img" style="min-height:50px; background:#222;">`;
-             style = 'background:transparent;padding:0';
-          } else {
-             content = window.util.escape(m.txt);
-          }
-          
-          const html = `
-            <div class="msg-row ${isMe ? 'me' : 'other'}" id="msg-${m.id}">
-              <div>
-                <div class="msg-bubble" style="${style}">${content}</div>
-                <div class="msg-meta">${isMe ? '我' : window.util.escape(m.n)} ${new Date(m.ts).toLocaleTimeString()}</div>
-              </div>
-            </div>`;
-    
-          box.insertAdjacentHTML('beforeend', html);
-          box.scrollTop = box.scrollHeight;
-          
-          if (window.uiEvents && window.uiEvents.bindMsgEvents) window.uiEvents.bindMsgEvents();
-      } catch (err) {
-          console.error('Render Msg Error:', err);
+             const errScript = `this.style.display='none';this.nextElementSibling.style.display='block';`;
+             content = `
+             <div class="stream-card">
+                 <div style="font-weight:bold;color:#4ea8ff">🎬 ${safeName}</div>
+                 <div style="font-size:11px;color:#aaa;margin-bottom:8px">${sizeStr} (流式直连)</div>
+                 <video controls src="${streamUrl}" 
+                        style="width:100%;max-width:300px;background:#000;border-radius:4px"
+                        onerror="${errScript}"></video>
+                 <div class="video-error" style="display:none;color:#f55;font-size:10px;padding:10px">❌ 播放失败</div>
+                 <div style="text-align:right;margin-top:4px">
+                     <a href="javascript:void(0)" onclick="window.smartCore.download('${fileId}','${safeName}')" style="color:#aaa;font-size:10px;text-decoration:none">⬇ 保存本地</a>
+                 </div>
+             </div>`;
+             style = 'background:transparent;padding:0;border:none';
+         } else {
+             content = `
+             <div class="stream-card">
+                 <div style="font-weight:bold;color:#fff">📄 ${safeName}</div>
+                 <div style="font-size:11px;color:#aaa;margin:4px 0">${sizeStr}</div>
+                 <a href="javascript:void(0)" onclick="window.smartCore.download('${fileId}','${safeName}')"
+                    style="display:inline-block;background:#2a7cff;color:white;padding:6px 12px;border-radius:4px;text-decoration:none;font-size:12px">下载</a>
+             </div>`;
+             style = 'background:transparent;padding:0;border:none';
+         }
+      } else {
+         content = window.util.escape(m.txt);
       }
+      
+      const html = `
+        <div class="msg-row ${isMe ? 'me' : 'other'}" id="msg-${m.id}">
+          <div>
+            <div class="msg-bubble" style="${style}">${content}</div>
+            <div class="msg-meta">${isMe ? '我' : window.util.escape(m.n)} ${new Date(m.ts).toLocaleTimeString()}</div>
+          </div>
+        </div>`;
+
+      box.insertAdjacentHTML('beforeend', html);
+      box.scrollTop = box.scrollHeight;
     },
     
     downloadBlob(data, name) {
-        try {
-            let url;
-            if (typeof data === 'string') {
-                if (data.startsWith('')) {
-                     const a = document.createElement('a');
-                     a.href = data;
-                     a.download = name;
-                     a.click();
-                     return;
-                }
-                const blob = new Blob([data], {type: 'text/plain'});
-                url = URL.createObjectURL(blob);
-            } else {
-                url = URL.createObjectURL(data);
-            }
-            
-            const a = document.createElement('a');
-            a.href = url;
-            a.download = name;
-            document.body.appendChild(a);
-            a.click();
-            document.body.removeChild(a);
-            setTimeout(() => URL.revokeObjectURL(url), 1000);
-        } catch(e) {
-            console.error('Download failed', e);
-            alert('下载失败: ' + e.message);
-        }
+        let url;
+        if (data instanceof Blob) url = URL.createObjectURL(data);
+        else if (typeof data === 'string') url = 'data:text/plain;charset=utf-8,' + encodeURIComponent(data);
+        else return;
+        const a = document.createElement('a');
+        a.href = url; a.download = name;
+        document.body.appendChild(a); a.click();
+        setTimeout(() => document.body.removeChild(a), 100);
     }
   };
   Object.assign(window.ui, render);
