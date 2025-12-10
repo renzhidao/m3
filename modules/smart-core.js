@@ -109,19 +109,22 @@ export function init() {
           } else { startDownloadTask(fileId); log('⏳ 开始下载...'); }
       },
       cacheMeta: (m) => { if(m && m.fileId) window.smartMetaCache.set(m.fileId, m); },
-      // 显式绑定播放器，启用拖动随机访问
       bindVideo: (video, fileId) => bindVideoEvents(video, fileId),
-      // 主动寻址到时间（秒）
       seek: (fileId, seconds) => seekToTime(fileId, seconds)
   };
 }
 
 // ==== 传输/播放参数 ====
 const CHUNK_SIZE = 128 * 1024; // 单包128KB，兼容移动端
-const PARALLEL = 6;            // 并发窗口大小
+const PARALLEL = 10;           // 并发窗口大小（配合背压，不会冲爆）
 const BASE_TAIL_SEGMENTS = 2;  // 初始预取尾部 2 块（拿 moov）
-const ESCALATE_ROUNDS = 4;     // 最多追加 4 轮
+const ESCALATE_ROUNDS = 4;     # 最多追加 4 轮
 const ESCALATE_STEP_MS = 300;  // 逐轮间隔
+
+// 发送端背压参数
+const MAX_BUFFERED = 1.5 * 1024 * 1024; // 高水位：1.5MB
+const LOW_WATER   = 256 * 1024;         // 低水位：256KB
+const SEND_QUEUES = new Map();          // peerId -> [{packet, offset}]
 
 function startDownloadTask(fileId) {
     if (window.activeTasks.has(fileId)) return;
@@ -158,7 +161,6 @@ function prefetchTail(task, segCount) {
             log(`📡 预取尾部: ${(offset/1024).toFixed(0)}KB`);
         }
     }
-    // 将尾部预取也纳入窗口，统一并发调度
     offs.forEach(off => pushWanted(task, off));
     dispatchRequests(task);
 }
@@ -210,21 +212,24 @@ function pickConn(task) {
 }
 
 function dispatchRequests(task) {
-    let sent = 0;
     while (task.inflight.size < PARALLEL && task.wantQueue.length > 0) {
         const off = task.wantQueue.shift();
         const conn = pickConn(task);
         if (!conn) { log('❌ 无可用连接'); task.wantQueue.unshift(off); break; }
-        conn.send({ t: 'SMART_GET_CHUNK', fileId: task.fileId, offset: off, size: CHUNK_SIZE });
-        task.inflight.add(off);
-        log(`📡 请求: ${(off/1024).toFixed(0)}KB`);
-        sent++;
+        try {
+            conn.send({ t: 'SMART_GET_CHUNK', fileId: task.fileId, offset: off, size: CHUNK_SIZE });
+            task.inflight.add(off);
+            log(`📡 请求: ${(off/1024).toFixed(0)}KB`);
+        } catch(e) {
+            log('❌ 请求发送失败: ' + e.message);
+            task.wantQueue.unshift(off);
+            break;
+        }
     }
-    return sent;
 }
 
 function handleGetChunk(pkt, fromId) {
-    log(`📩 请求: ${pkt.offset} from ${fromId ? fromId.slice(0,4) : '?'}`);
+    log(` 请求: ${pkt.offset} from ${fromId ? fromId.slice(0,4) : '?'}`);
     const file = window.virtualFiles.get(pkt.fileId);
     if (!file) { log(`❌ 无此文件`); return; }
     
@@ -242,15 +247,66 @@ function handleGetChunk(pkt, fromId) {
             
             const conn = window.state.conns[fromId];
             if (conn && conn.open) {
-                // 发送 Uint8Array，最大兼容
-                conn.send(packet);
-                log(`📤 数据发出: ${pkt.offset} -> ${fromId.slice(0,4)}`);
+                sendWithBackpressure(conn, packet, fromId, pkt.offset);
             } else {
                 log(`❌ 发送失败: 连接断开`);
             }
         } catch(e) { log(`❌ 发送异常: ${e.message}`); }
     };
     reader.readAsArrayBuffer(blob);
+}
+
+// === 发送端背压 ===
+function getDC(conn) {
+    return conn._dc || conn.dc || conn.dataChannel || null;
+}
+function queueSend(key, obj) {
+    let q = SEND_QUEUES.get(key);
+    if (!q) { q = []; SEND_QUEUES.set(key, q); }
+    q.push(obj);
+}
+function flushQueue(key, conn, dc, peerLabel) {
+    const q = SEND_QUEUES.get(key);
+    if (!q || q.length === 0) return;
+    try {
+        while (q.length && dc.bufferedAmount < MAX_BUFFERED) {
+            const { packet, offset } = q.shift();
+            conn.send(packet);
+            log(`📤 数据发出: ${offset} -> ${peerLabel}`);
+        }
+    } catch(e) {
+        // 出错就保留队列，稍后重试
+    }
+}
+function sendWithBackpressure(conn, packet, fromId, offset) {
+    const dc = getDC(conn);
+    const peerLabel = (fromId ? fromId.slice(0,4) : (conn.peer || '?').toString().slice(0,4));
+    const key = conn.peer || fromId || conn._targetId || 'peer';
+    if (!dc) {
+        try { conn.send(packet); log(`📤 数据发出: ${offset} -> ${peerLabel}`); } catch(e) { log('❌ 发送失败: ' + e.message); }
+        return;
+    }
+    try { dc.bufferedAmountLowThreshold = LOW_WATER; } catch(e) {}
+    const tryImmediate = () => {
+        try {
+            if (dc.bufferedAmount < MAX_BUFFERED) {
+                conn.send(packet);
+                log(` 数据发出: ${offset} -> ${peerLabel}`);
+            } else {
+                queueSend(key, { packet, offset });
+                if (!dc._p2pFlowHook) {
+                    dc._p2pFlowHook = true;
+                    dc.onbufferedamountlow = () => flushQueue(key, conn, dc, peerLabel);
+                }
+                // 保险：定时器兜底
+                setTimeout(() => flushQueue(key, conn, dc, peerLabel), 80);
+            }
+        } catch(e) {
+            queueSend(key, { packet, offset });
+            setTimeout(() => flushQueue(key, conn, dc, peerLabel), 120);
+        }
+    };
+    tryImmediate();
 }
 
 function handleBinaryData(buffer, fromId) {
@@ -300,7 +356,6 @@ function handleBinaryData(buffer, fromId) {
                 try { window.activePlayer.flush(); } catch(e) {}
             }
         } else {
-            // 继续填充并发窗口
             requestNextChunk(task);
         }
     } catch(e) { console.error('Binary Parse Error', e); }
@@ -317,16 +372,13 @@ function seekToTime(fileId, seconds) {
 
     if (seekRes && typeof seekRes.offset === 'number') {
         const off = Math.max(0, Math.min(task.size - 1, seekRes.offset));
-        // 重置并发窗口，从新位置起拉取
         task.wantQueue.length = 0;
         task.lastWanted = off - CHUNK_SIZE;
-        // 不清理 inflight（允许回收利用），但会从新起点补足窗口
         if (off > task.nextOffset) task.nextOffset = off;
         fillWindow(task);
         dispatchRequests(task);
         log(`⏩ Seek -> 触发字节偏移: ${off}`);
     } else {
-        // moov 尚未 ready，尽快扩大尾部预取
         prefetchTail(task, BASE_TAIL_SEGMENTS + 6);
     }
 }
@@ -334,6 +386,7 @@ function seekToTime(fileId, seconds) {
 function bindVideoEvents(video, fileId) {
     if (!video || video._p2pBound) return;
     try {
+        video.controls = true;
         video.playsInline = true;
         video._p2pBound = true;
         video.addEventListener('seeking', () => {
@@ -344,10 +397,12 @@ function bindVideoEvents(video, fileId) {
 }
 
 function autoBindVideo(fileId) {
-    // 尝试自动绑定第一次出现的 video
     setTimeout(() => {
         const v = document.querySelector && document.querySelector('video');
-        if (v) bindVideoEvents(v, fileId);
+        if (v) {
+            if (!v.controls) v.controls = true;
+            bindVideoEvents(v, fileId);
+        }
     }, 200);
 }
 
@@ -361,18 +416,24 @@ class P2PVideoPlayer {
         this.sourceBuffers = {};  // trackId -> SourceBuffer
         this.queues = {};         // trackId -> Array<ArrayBuffer>
         this.ready = false;
+        this.info = null;
         this.mediaSource.addEventListener('sourceopen', () => this.init());
     }
     getUrl() { return this.url; }
     init() {
         this.mp4box.onReady = (info) => {
             try {
+                this.info = info;
                 const vts = (info.videoTracks || []);
                 const ats = (info.audioTracks || []);
                 const tracks = [...vts, ...ats];
                 if (tracks.length === 0) return;
 
-                // 创建对应 SourceBuffer
+                // 设置总时长，便于显示进度条
+                if (info.duration && info.timescale) {
+                    try { this.mediaSource.duration = info.duration / info.timescale; } catch(e) {}
+                }
+
                 tracks.forEach(t => {
                     const isVideo = (vts.find(v => v.id === t.id) != null);
                     const mime = (isVideo ? 'video/mp4' : 'audio/mp4') + `; codecs="${t.codec}"`;
@@ -384,11 +445,9 @@ class P2PVideoPlayer {
                     this.sourceBuffers[t.id] = sb;
                     this.queues[t.id] = [];
                     sb.addEventListener('updateend', () => this.drain());
-                    // 为每个轨配置分片
                     this.mp4box.setSegmentOptions(t.id, { trackId: t.id }, { nbSamples: 50 });
                 });
 
-                // 初始化分片（init segments）
                 const inits = this.mp4box.initializeSegmentation();
                 if (inits && inits.length) {
                     inits.forEach(seg => {
@@ -423,7 +482,6 @@ class P2PVideoPlayer {
         } catch(e) {}
     }
     appendChunk(buf, offset) {
-        // MP4Box 需要 ArrayBuffer 且设置 fileStart 为绝对偏移（支持乱序）
         const u8 = buf instanceof Uint8Array ? buf : new Uint8Array(buf);
         const ab = u8.buffer.slice(u8.byteOffset, u8.byteOffset + u8.byteLength);
         ab.fileStart = offset;
