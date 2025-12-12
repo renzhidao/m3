@@ -108,14 +108,19 @@ export function init() {
       const fi = document.getElementById('fileInput');
       if (fi) {
         fi.onchange = (e) => {
-          const file = e.target.files[0];
-          if (!file) return;
-          const kind = file.type.startsWith('image/') ? CHAT.KIND_IMAGE : CHAT.KIND_FILE;
-          window.protocol.sendMsg(null, kind, {
-              fileObj: file, name: file.name, size: file.size, type: file.type
-          });
-          e.target.value = '';
-        };
+    console.log('[UI] file chosen:', e.target && e.target.files && e.target.files[0] ? e.target.files[0].name : '(none)', 'has shareLocalFile:', !!(window.smartCore && window.smartCore.shareLocalFile));
+const file = e.target.files[0];
+    if (!file) return;
+    const kind = file.type.startsWith('image/') ? CHAT.KIND_IMAGE : CHAT.KIND_FILE;
+    if (window.smartCore && typeof window.smartCore.shareLocalFile === 'function') {
+      window.smartCore.shareLocalFile(file);
+    } else {
+      // 兜底：即便拦截异常，也避免 [空消息]
+      window.protocol.sendMsg(`[文件] ${file.name}`, kind, {
+        fileObj: file, name: file.name, size: file.size, type: file.type
+      });
+    }
+    e.target.value = '';};
       }
 
       bind('btnBack', () => { 

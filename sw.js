@@ -1,139 +1,144 @@
-const CACHE_NAME = 'p1-stream-v1765199401'; // Bump Version
-const CORE_ASSETS = [
-  './',
-  './index.html',
-  './manifest.json',
-  './style.css',
-  './loader.js'
-];
+const CACHE_NAME = 'p1-cache-v3';
+const STREAM_PATH = '/stream/';
 
-self.addEventListener('install', event => {
-  self.skipWaiting();
-  event.waitUntil(caches.open(CACHE_NAME).then(c => c.addAll(CORE_ASSETS).catch(()=>{})));
-});
+self.addEventListener('install', e => self.skipWaiting());
+self.addEventListener('activate', e => self.clients.claim());
 
-self.addEventListener('activate', event => {
-  event.waitUntil(
-    caches.keys().then(keys => Promise.all(
-      keys.map(k => k !== CACHE_NAME ? caches.delete(k) : Promise.resolve())
-    )).then(() => self.clients.claim())
-  );
-});
-
-const streamControllers = new Map();
+// 消息通道
+let dataPort = null;
+const chunkMap = new Map(); // reqId -> { controller }
 
 self.addEventListener('message', event => {
-    const data = event.data;
-    if (!data || !data.requestId) return;
-
-    const controller = streamControllers.get(data.requestId);
-    if (!controller) return;
-
-    switch (data.type) {
-        case 'STREAM_DATA':
-            try {
-                if (data.chunk) controller.enqueue(new Uint8Array(data.chunk));
-            } catch(e) { }
-            break;
-        case 'STREAM_END':
-            try { controller.close(); } catch(e) {}
-            streamControllers.delete(data.requestId);
-            break;
-        case 'STREAM_ERROR':
-            try { controller.error(new Error(data.msg)); } catch(e) {}
-            streamControllers.delete(data.requestId);
-            break;
-    }
+  const msg = event.data;
+  if (msg && msg.type === 'INIT_PORT') {
+    dataPort = event.ports && event.ports[0];
+    if (dataPort) dataPort.onmessage = handleClientMsg;
+  }
 });
+
+function handleClientMsg(event) {
+  const { type, reqId, chunk, done } = (event.data || {});
+  if (type !== 'STREAM_DATA') return;
+  const ctx = chunkMap.get(reqId);
+  if (!ctx) return;
+  try {
+    if (chunk) ctx.controller.enqueue(new Uint8Array(chunk));
+    if (done) {
+      ctx.controller.close();
+      chunkMap.delete(reqId);
+    }
+  } catch (e) {
+    chunkMap.delete(reqId);
+    // 可选：通知页面中止
+    // notifyClient({ type:'PULL_ABORT', reqId, reason:'enqueue_error' });
+  }
+}
 
 self.addEventListener('fetch', event => {
   const url = new URL(event.request.url);
-
-  if (url.pathname.includes('/virtual/file/')) {
-    event.respondWith(handleVirtualStream(event));
+  if (url.pathname.startsWith(STREAM_PATH)) {
+    const fileId = url.pathname.slice(STREAM_PATH.length);
+    event.respondWith(handleStream(event.request, fileId));
     return;
   }
-
-  if (url.pathname.endsWith('registry.txt') || url.pathname.endsWith('.js')) {
-    event.respondWith(
-      fetch(event.request).catch(() => caches.match(event.request))
-    );
-    return;
-  }
-
-  event.respondWith(
-    caches.match(event.request).then(cached => {
-      const netFetch = fetch(event.request).then(res => {
-         if (event.request.method === 'GET' && url.protocol.startsWith('http')) {
-             const clone = res.clone();
-             caches.open(CACHE_NAME).then(c => c.put(event.request, clone));
-         }
-         return res;
-      }).catch(() => null);
-      return cached || netFetch;
-    })
-  );
+  // 其他资源：维持原缓存策略
+  event.respondWith(caches.match(event.request).then(res => res || fetch(event.request)));
 });
 
-async function handleVirtualStream(event) {
-    const clientId = event.clientId;
-    const client = await self.clients.get(clientId) || (await self.clients.matchAll({type:'window'}))[0];
-    
-    if (!client) return new Response("Service Worker: No Client Active", { status: 503 });
+async function handleStream(request, fileId) {
+  const method = request.method || 'GET';
+  if (!['GET', 'HEAD', 'OPTIONS'].includes(method)) {
+    return new Response(null, { status: 405, headers: baseHeaders() });
+  }
 
-    const parts = new URL(event.request.url).pathname.split('/');
-    const fileId = parts[3];
-    const fileName = decodeURIComponent(parts[4] || 'file'); // 获取文件名
-    const range = event.request.headers.get('Range');
-    const requestId = Math.random().toString(36).slice(2) + Date.now();
+  if (method === 'OPTIONS') {
+    return new Response(null, { status: 204, headers: { ...baseHeaders(), 'Accept-Ranges': 'bytes' } });
+  }
 
-    const stream = new ReadableStream({
-        start(controller) {
-            streamControllers.set(requestId, controller);
-            client.postMessage({ type: 'STREAM_OPEN', requestId, fileId, range });
-        },
-        cancel() {
-            streamControllers.delete(requestId);
-            client.postMessage({ type: 'STREAM_CANCEL', requestId });
-        }
-    });
+  const meta = await getMetaFromClient(fileId);
+  if (!meta || !meta.size) {
+    return new Response('meta not available', { status: 404, headers: baseHeaders() });
+  }
 
-    return new Promise(resolve => {
-        const metaHandler = (e) => {
-            const d = e.data;
-            if (d && d.requestId === requestId) {
-                if (d.type === 'STREAM_META') {
-                    self.removeEventListener('message', metaHandler);
-                    const headers = new Headers();
-                    headers.set('Content-Type', d.fileType || 'application/octet-stream');
-                    headers.set('Accept-Ranges', 'bytes');
-                    
-                    // === 修复：强制下载，而不是预览 ===
-                    headers.set('Content-Disposition', `attachment; filename="${fileName}"`);
-                    
-                    const total = d.fileSize;
-                    const start = d.start;
-                    const end = d.end;
-                    headers.set('Content-Length', end - start + 1);
-                    headers.set('Content-Range', `bytes ${start}-${end}/${total}`);
-                    resolve(new Response(stream, { status: 206, headers }));
-                } 
-                else if (d.type === 'STREAM_ERROR') {
-                    self.removeEventListener('message', metaHandler);
-                    streamControllers.delete(requestId);
-                    resolve(new Response(d.msg || 'File Not Found', { status: 404 }));
-                }
-            }
-        };
+  const size = +meta.size;
+  const type = meta.type || guessTypeByName(meta.name) || 'video/mp4';
 
-        self.addEventListener('message', metaHandler);
+  const r = parseRange(request.headers.get('range'), size);
+  if (r === null) {
+    // 非法范围
+    const h = { ...baseHeaders(), 'Content-Type': type, 'Accept-Ranges': 'bytes', 'Content-Range': `bytes */${size}` };
+    return new Response(null, { status: 416, headers: h });
+  }
 
-        setTimeout(() => {
-            self.removeEventListener('message', metaHandler);
-            if (streamControllers.has(requestId)) {
-                streamControllers.delete(requestId);
-                resolve(new Response("Gateway Timeout (Metadata Wait)", { status: 504 }));
-            }
-        }, 30000); // 10s -> 30s
-    });
+  const common = { ...baseHeaders(), 'Content-Type': type, 'Accept-Ranges': 'bytes', 'Vary': 'Range' };
+
+  // HEAD：仅返回头
+  if (method === 'HEAD') {
+    if (r.partial) {
+      const len = r.end - r.start + 1;
+      return new Response(null, { status: 206, headers: { ...common, 'Content-Range': `bytes ${r.start}-${r.end}/${size}`, 'Content-Length': String(len) } });
+    } else {
+      return new Response(null, { status: 200, headers: { ...common, 'Content-Length': String(size) } });
+    }
+  }
+
+  // GET：构造流并按精确范围下发
+  const reqId = Math.random().toString(36).slice(2);
+  const body = new ReadableStream({
+    start(controller) {
+      chunkMap.set(reqId, { controller });
+      notifyClient({ type: 'PULL_START', reqId, fileId, start: r.start, end: r.end }); // end 为含端
+    },
+    cancel() {
+      chunkMap.delete(reqId);
+      notifyClient({ type: 'PULL_CANCEL', reqId });
+    }
+  });
+
+  if (r.partial) {
+    const len = r.end - r.start + 1;
+    const headers = { ...common, 'Content-Range': `bytes ${r.start}-${r.end}/${size}`, 'Content-Length': String(len) };
+    return new Response(body, { status: 206, headers });
+  } else {
+    const headers = { ...common, 'Content-Length': String(size) };
+    return new Response(body, { status: 200, headers });
+  }
+}
+
+function parseRange(header, size) {
+  if (!size || size <= 0) return { start: 0, end: -1, partial: false };
+  if (!header) return { start: 0, end: size - 1, partial: false };
+  const m = /bytes=(\d*)-(\d*)/i.exec(header);
+  if (!m) return null;
+  let [, s, e] = m;
+  if (s === '' && e) { // 后缀范围 -N
+    const len = Math.min(parseInt(e, 10), size);
+    return { start: size - len, end: size - 1, partial: true };
+  }
+  const start = parseInt(s, 10);
+  const end = e ? Math.min(parseInt(e, 10), size - 1) : size - 1;
+  if (Number.isNaN(start) || start < 0 || start > end) return null;
+  return { start, end, partial: true };
+}
+
+function getMetaFromClient(fileId) {
+  return new Promise(resolve => {
+    if (!dataPort) { resolve(null); return; }
+    const ch = new MessageChannel();
+    ch.port1.onmessage = e => resolve(e.data || null);
+    dataPort.postMessage({ type: 'GET_META', fileId }, [ch.port2]);
+  });
+}
+
+function notifyClient(msg) { if (dataPort) dataPort.postMessage(msg); }
+function baseHeaders() { return { 'Cache-Control': 'no-store' }; }
+function guessTypeByName(name = '') {
+  const n = (name || '').toLowerCase();
+  if (n.endsWith('.mp4') || n.endsWith('.m4v')) return 'video/mp4';
+  if (n.endsWith('.mov')) return 'video/quicktime';
+  if (n.endsWith('.webm')) return 'video/webm';
+  if (n.endsWith('.mkv')) return 'video/x-matroska';
+  if (n.endsWith('.mp3')) return 'audio/mpeg';
+  if (n.endsWith('.m4a') || n.endsWith('.aac')) return 'audio/mp4';
+  return null;
 }

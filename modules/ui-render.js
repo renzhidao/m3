@@ -1,10 +1,8 @@
 import { CHAT, UI_CONFIG } from './constants.js';
 
 export function init() {
-  // 保底 UI 容器
   if (!window.ui) window.ui = {};
 
-  // 基础样式（含 stream-card）
   const css = `
     .msg-row { display:flex; margin:8px 12px; }
     .msg-row.me { justify-content: flex-end; }
@@ -14,13 +12,14 @@ export function init() {
     .msg-meta { margin:4px 4px 0; font-size:11px; color:#9ca3af; }
     .stream-card { background:#0b1220; border:1px solid #1f2a44; border-radius:8px; padding:10px; }
     .stream-card video { width:100%; max-width:320px; background:#000; border-radius:4px; }
-    .stream-card .video-error { display:none; color:#f55; font-size:12px; padding:6px 0; }
     .avatar { width:36px; height:36px; border-radius:50%; background:#2a7cff; color:#fff; display:flex; align-items:center; justify-content:center; margin-right:8px; }
     .contact-item { display:flex; align-items:center; gap:8px; padding:8px; cursor:pointer; border-bottom:1px solid #222; position:relative; }
     .contact-item.active { background:#0b1220; }
     .badge { position:absolute; right:10px; top:50%; transform:translateY(-50%); background:#ef4444; color:#fff; border-radius:10px; padding:2px 6px; font-size:11px; }
   `;
   const styleEl = document.createElement('style'); styleEl.textContent = css; document.head.appendChild(styleEl);
+
+  const esc = (s)=> (window.util && window.util.escape) ? window.util.escape(s) : (s ?? '');
 
   const render = {
     init() { this.renderList(); this.updateSelf(); },
@@ -30,44 +29,23 @@ export function init() {
       const list = document.getElementById('contactList');
       if (!list) return;
       list.innerHTML = '';
-
-      let html = `
-        <div class="contact-item ${window.state.activeChat===CHAT.PUBLIC_ID?'active':''}" data-chat-id="${CHAT.PUBLIC_ID}" data-chat-name="公共频道">
-           <div class="avatar" style="background:#ff9800">群</div>
-           <div class="info"><div class="name">公共频道</div><div class="status">在线: ${Object.keys(window.state.conns).length}</div></div>
-        </div>`;
-
+      
+      let html = `<div class="contact-item ${window.state.activeChat===CHAT.PUBLIC_ID?'active':''}" data-chat-id="${CHAT.PUBLIC_ID}" data-chat-name="公共频道"><div class="avatar" style="background:#ff9800">群</div><div class="info"><div class="name">公共频道</div><div class="status">在线: ${Object.keys(window.state.conns).length}</div></div></div>`;
       Object.keys(window.state.conns).forEach(id => {
         const conn = window.state.conns[id];
         const name = (conn && conn.label) ? conn.label : id.slice(0, 6);
         const active = window.state.activeChat === id ? 'active' : '';
         const unread = window.state.unread[id] ? `<div class="badge">${window.state.unread[id]}</div>` : '';
-        const esc = (s)=> (window.util && window.util.escape) ? window.util.escape(s) : s;
-        html += `
-          <div class="contact-item ${active}" data-chat-id="${id}" data-chat-name="${esc(name)}">
-            <div class="avatar">${esc(name)[0] || '?'}</div>
-            <div class="info"><div class="name">${esc(name)}</div><div class="status" style="color:#4caf50">● 在线</div></div>
-            ${unread}
-          </div>`;
+        html += `<div class="contact-item ${active}" data-chat-id="${id}" data-chat-name="${esc(name)}"><div class="avatar">${esc(name)[0] || '?'}</div><div class="info"><div class="name">${esc(name)}</div><div class="status" style="color:#4caf50">● 在线</div></div>${unread}</div>`;
       });
-
       list.innerHTML = html;
     },
 
     updateSelf() {
-      // 轻量刷新顶部状态（存在才更新）
-      const esc = (s)=> (window.util && window.util.escape) ? window.util.escape(s) : s;
       const title = document.getElementById('chatTitle');
       const status = document.getElementById('chatStatus');
       if (title) title.innerText = window.state.activeChatName || '公共频道';
-      if (status) {
-        let s = '未连接';
-        if (window.state.mqttStatus === '在线') s = '在线';
-        else if (window.state.mqttStatus === '失败') s = '失败';
-        else if (window.state.mqttStatus === '断开') s = '断开';
-        else if (window.state.mqttStatus === '暂停') s = '暂停';
-        status.innerText = s;
-      }
+      if (status) status.innerText = window.state.mqttStatus || '未知';
     },
 
     appendMsg(m) {
@@ -75,73 +53,50 @@ export function init() {
       if (!box || !m) return;
 
       const isMe = (m.senderId === window.state.myId);
-      const esc = (s)=> (window.util && window.util.escape) ? window.util.escape(s) : (s||'');
       let content = '';
       let bubbleStyle = '';
 
-      // 统一抽取 meta（兼容嵌套）
-      const meta = (m && m.meta && m.meta.fileId) ? m.meta : (m && m.meta && m.meta.meta ? m.meta.meta : (m && m.fileId ? m : null));
+      const meta = (m && m.meta && m.meta.fileId) ? m.meta : (m && m.meta && m.meta.meta ? m.meta.meta : null);
 
-      // SMART 文件/图片元信息 → 渲染卡片
       if ((m.t === 'SMART_META' && meta) || (m.kind && (m.kind === CHAT.KIND_FILE || m.kind === CHAT.KIND_IMAGE) && meta)) {
-        // 告知 SmartCore 缓存 meta（防丢）
-        if (window.smartCore && window.smartCore.cacheMeta) {
-          const realMeta = (meta && meta.fileId) ? meta : (m.meta && m.meta.meta);
-          if (realMeta) window.smartCore.cacheMeta(realMeta);
-        }
+        if (window.smartCore && window.smartCore.cacheMeta) window.smartCore.cacheMeta(meta);
 
         const safeName = esc(meta.fileName || '未知文件');
         const sizeStr = meta.fileSize ? (meta.fileSize / (1024*1024)).toFixed(2) + ' MB' : '未知大小';
-        const isVideo = meta.fileType && meta.fileType.startsWith && meta.fileType.startsWith('video');
+        const isVideo = meta.fileType && meta.fileType.includes('video');
         const fileId = meta.fileId;
 
-        if (fileId && isVideo) {
-          // 获取流式播放 URL，并渲染 <video>
-          const streamUrl = (window.smartCore && window.smartCore.play) ? window.smartCore.play(fileId, safeName) : '';
-          const videoId = `v_${m.id || ('v_'+Math.random().toString(36).slice(2,8))}`;
-          const errScript = `this.style.display='none';this.nextElementSibling.style.display='block';`;
-
+        // 如果支持 Service Worker，则使用流式播放地址
+        const hasSW = ('serviceWorker' in navigator) && !!navigator.serviceWorker.controller;
+        
+        if (fileId && isVideo && hasSW) {
+          const streamUrl = `/stream/${fileId}`;
           content = `
             <div class="stream-card">
               <div style="font-weight:bold;color:#4ea8ff">🎬 ${safeName}</div>
-              <div style="font-size:11px;color:#aaa;margin-bottom:8px">${sizeStr} (流式直连)</div>
-              <video id="${videoId}" controls autoplay muted playsinline src="${streamUrl}"
-                     style="width:100%;max-width:320px;background:#000;border-radius:4px"
-                     onerror="${errScript}"></video>
-              <div class="video-error">❌ 播放失败</div>
+              <div style="font-size:11px;color:#aaa;margin-bottom:8px">${sizeStr} (SW流式)</div>
+              <video controls autoplay muted playsinline src="${streamUrl}" 
+                     style="width:100%;max-width:320px;background:#000;border-radius:4px"></video>
               <div style="text-align:right;margin-top:4px">
-                <a href="javascript:void(0)" onclick="window.smartCore && window.smartCore.download && window.smartCore.download('${fileId}','${safeName}')"
-                   style="color:#aaa;font-size:12px;text-decoration:none">⬇ 保存本地</a>
+                 <a href="${streamUrl}" download="${safeName}" style="color:#aaa;font-size:12px;text-decoration:none">⬇ 保存</a>
               </div>
             </div>`;
           bubbleStyle = 'background:transparent;padding:0;border:none';
-
-          // 异步绑定 seeking → 随意拖动
-          setTimeout(() => {
-            const v = document.getElementById(videoId);
-            if (v && window.smartCore && window.smartCore.bindVideo) {
-              window.smartCore.bindVideo(v, fileId);
-            }
-          }, 0);
         } else {
-          // 普通文件卡片
+          // 不支持 SW 或者是普通文件
           content = `
             <div class="stream-card">
-              <div style="font-weight:bold;color:#fff">📄 ${safeName}</div>
+              <div style="font-weight:bold;color:#fff">${isVideo ? '🎞' : '📄'} ${safeName}</div>
               <div style="font-size:11px;color:#aaa;margin:4px 0">${sizeStr}</div>
-              <a href="javascript:void(0)"
-                 onclick="window.smartCore && window.smartCore.download && window.smartCore.download('${fileId}','${safeName}')"
+              <a href="javascript:void(0)" onclick="window.smartCore.download('${fileId}','${safeName}')"
                  style="display:inline-block;background:#2a7cff;color:white;padding:6px 12px;border-radius:4px;text-decoration:none;font-size:12px">下载</a>
             </div>`;
           bubbleStyle = 'background:transparent;padding:0;border:none';
         }
       } else if (m.kind === CHAT.KIND_IMAGE && m.txt && /^data:image\//.test(m.txt)) {
-        // 兼容老式“data URL 图片”消息
         content = `<img class="chat-img" src="${m.txt}" style="max-width:240px;border-radius:6px" />`;
       } else {
-        // 文本消息（包含 SMART_META 之外的提示性文本）
-        const t = (typeof m.txt === 'string') ? m.txt : '';
-        content = esc(t) || '<span style="color:#9ca3af">[空消息]</span>';
+        content = m.txt ? esc(m.txt) : '<span style="color:#9ca3af">[空消息]</span>';
       }
 
       const who = isMe ? '我' : esc(m.n || '');
@@ -156,25 +111,11 @@ export function init() {
 
       box.insertAdjacentHTML('beforeend', html);
       box.scrollTop = box.scrollHeight;
-    },
-
-    downloadBlob(data, name) {
-      let url = '';
-      if (data instanceof Blob) url = URL.createObjectURL(data);
-      else if (typeof data === 'string') url = 'data:text/plain;charset=utf-8,' + encodeURIComponent(data);
-      else return;
-      const a = document.createElement('a');
-      a.href = url; a.download = name;
-      document.body.appendChild(a); a.click();
-      setTimeout(() => document.body.removeChild(a), 100);
     }
   };
 
   Object.assign(window.ui, render);
-  // 自启一次，防止外部遗漏调用
-  if (document.readyState === 'complete' || document.readyState === 'interactive') {
-    try { window.ui.init(); } catch(e) {}
-  } else {
-    window.addEventListener('DOMContentLoaded', () => { try { window.ui.init(); } catch(e) {} });
-  }
+  const start = () => { try { window.ui.init(); } catch(e) {} };
+  if (document.readyState === 'complete' || document.readyState === 'interactive') start();
+  else document.addEventListener('DOMContentLoaded', start);
 }
