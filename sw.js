@@ -1,4 +1,4 @@
-const CACHE_NAME = 'p1-stream-v1765199403'; // Bump Version
+const CACHE_NAME = 'p1-stream-v1765199404'; // Bump Version Fixed
 const CORE_ASSETS = [
   './',
   './index.html',
@@ -26,7 +26,6 @@ self.addEventListener('message', event => {
     const data = event.data;
     if (!data) return;
 
-    // ✅ 兼容握手：页面发 PING，这里回 PING
     if (data.type === 'PING') {
         try { event.source && event.source.postMessage({ type: 'PING' }); } catch(e) {}
         return;
@@ -85,11 +84,23 @@ self.addEventListener('fetch', event => {
 
 async function handleVirtualStream(event) {
     const clientId = event.clientId;
-    const client = await self.clients.get(clientId) || (await self.clients.matchAll({type:'window'}))[0];
+    // === 修复1: 恢复激进的 Client 查找 (兼容图片并发加载) ===
+    let client = await self.clients.get(clientId);
+    if (!client) {
+        await self.clients.claim();
+        // 尝试轮询，针对刚刷新的页面
+        for (let i = 0; i < 3; i++) {
+            const list = await self.clients.matchAll({type:'window', includeUncontrolled:true});
+            if (list && list.length > 0) {
+                client = list[0]; 
+                break;
+            }
+            await new Promise(r => setTimeout(r, 100)); // wait 100ms
+        }
+    }
 
     if (!client) return new Response("Service Worker: No Client Active", { status: 503 });
 
-    // ✅ 关键修复：兼容 /repo/virtual/file/... 这种带前缀子路径（GitHub Pages/任意 Pages）
     const pathname = new URL(event.request.url).pathname;
     const marker = '/virtual/file/';
     const idx = pathname.indexOf(marker);
@@ -97,25 +108,21 @@ async function handleVirtualStream(event) {
 
     const tail = pathname.slice(idx + marker.length);
     const segs = tail.split('/').filter(Boolean);
-
     const fileId = segs[0];
     if (!fileId) return new Response("Bad Virtual URL (missing fileId)", { status: 400 });
 
     let fileName = 'file';
-    try {
-        // 文件名理论上不会含 '/', 这里做个兼容
-        fileName = decodeURIComponent(segs.slice(1).join('/') || 'file');
-    } catch(e) {
-        fileName = segs.slice(1).join('/') || 'file';
-    }
+    try { fileName = decodeURIComponent(segs.slice(1).join('/') || 'file'); } 
+    catch(e) { fileName = segs.slice(1).join('/') || 'file'; }
 
-    const range = event.request.headers.get('Range');
+    // === 修复2: 严格区分 Range 请求 ===
+    const rangeHeader = event.request.headers.get('Range');
     const requestId = Math.random().toString(36).slice(2) + Date.now();
 
     const stream = new ReadableStream({
         start(controller) {
             streamControllers.set(requestId, controller);
-            client.postMessage({ type: 'STREAM_OPEN', requestId, fileId, range });
+            client.postMessage({ type: 'STREAM_OPEN', requestId, fileId, range: rangeHeader });
         },
         cancel() {
             streamControllers.delete(requestId);
@@ -130,17 +137,27 @@ async function handleVirtualStream(event) {
                 if (d.type === 'STREAM_META') {
                     self.removeEventListener('message', metaHandler);
                     const headers = new Headers();
-                    headers.set('Content-Type', d.fileType || 'video/mp4');
-                    headers.set('Accept-Ranges', 'bytes');
+                    // === 修复3: 恢复 octet-stream 以支持图片嗅探 ===
+                    headers.set('Content-Type', d.fileType || 'application/octet-stream');
                     headers.set('Content-Disposition', `inline; filename="${fileName}"`);
-
+                    
                     const total = d.fileSize;
                     const start = d.start;
                     const end = d.end;
-                    headers.set('Content-Length', end - start + 1);
-                    headers.set('Content-Range', `bytes ${start}-${end}/${total}`);
+                    const len = end - start + 1;
+                    
+                    headers.set('Content-Length', len);
 
-                    resolve(new Response(stream, { status: 206, headers }));
+                    // === 修复2续: 根据 Range 决定 200 或 206 ===
+                    if (rangeHeader) {
+                        headers.set('Accept-Ranges', 'bytes');
+                        headers.set('Content-Range', `bytes ${start}-${end}/${total}`);
+                        resolve(new Response(stream, { status: 206, headers }));
+                    } else {
+                        // 无 Range 请求时，通常不发 Content-Range，且返回 200
+                        headers.set('Accept-Ranges', 'bytes'); // 告知支持 Range
+                        resolve(new Response(stream, { status: 200, headers }));
+                    }
                 } 
                 else if (d.type === 'STREAM_ERROR') {
                     self.removeEventListener('message', metaHandler);
