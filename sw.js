@@ -1,4 +1,4 @@
-const CACHE_NAME = 'p1-stream-v1765199404'; // Bump Version Fixed
+const CACHE_NAME = 'p1-stream-v1765199405'; // Version Fix-200-OK
 const CORE_ASSETS = [
   './',
   './index.html',
@@ -84,18 +84,14 @@ self.addEventListener('fetch', event => {
 
 async function handleVirtualStream(event) {
     const clientId = event.clientId;
-    // === 修复1: 恢复激进的 Client 查找 (兼容图片并发加载) ===
+    // === 兼容性恢复: 激进的 Client 查找 (针对图片并发) ===
     let client = await self.clients.get(clientId);
     if (!client) {
         await self.clients.claim();
-        // 尝试轮询，针对刚刷新的页面
         for (let i = 0; i < 3; i++) {
             const list = await self.clients.matchAll({type:'window', includeUncontrolled:true});
-            if (list && list.length > 0) {
-                client = list[0]; 
-                break;
-            }
-            await new Promise(r => setTimeout(r, 100)); // wait 100ms
+            if (list && list.length > 0) { client = list[0]; break; }
+            await new Promise(r => setTimeout(r, 100));
         }
     }
 
@@ -115,13 +111,14 @@ async function handleVirtualStream(event) {
     try { fileName = decodeURIComponent(segs.slice(1).join('/') || 'file'); } 
     catch(e) { fileName = segs.slice(1).join('/') || 'file'; }
 
-    // === 修复2: 严格区分 Range 请求 ===
+    // === 关键判断: 是否有 Range ===
     const rangeHeader = event.request.headers.get('Range');
     const requestId = Math.random().toString(36).slice(2) + Date.now();
 
     const stream = new ReadableStream({
         start(controller) {
             streamControllers.set(requestId, controller);
+            // 传给主线程，让 Core 知道是否有 range
             client.postMessage({ type: 'STREAM_OPEN', requestId, fileId, range: rangeHeader });
         },
         cancel() {
@@ -137,25 +134,29 @@ async function handleVirtualStream(event) {
                 if (d.type === 'STREAM_META') {
                     self.removeEventListener('message', metaHandler);
                     const headers = new Headers();
-                    // === 修复3: 恢复 octet-stream 以支持图片嗅探 ===
-                    headers.set('Content-Type', d.fileType || 'application/octet-stream');
-                    headers.set('Content-Disposition', `inline; filename="${fileName}"`);
                     
                     const total = d.fileSize;
                     const start = d.start;
                     const end = d.end;
                     const len = end - start + 1;
-                    
+
+                    headers.set('Content-Disposition', `inline; filename="${fileName}"`);
                     headers.set('Content-Length', len);
 
-                    // === 修复2续: 根据 Range 决定 200 或 206 ===
+                    // === 核心修复逻辑 ===
                     if (rangeHeader) {
+                        // 【视频流模式】 -> 206 Partial Content
+                        // 类型优先用 core 传回的，或者是 mp4
+                        headers.set('Content-Type', d.fileType || 'video/mp4');
                         headers.set('Accept-Ranges', 'bytes');
                         headers.set('Content-Range', `bytes ${start}-${end}/${total}`);
                         resolve(new Response(stream, { status: 206, headers }));
                     } else {
-                        // 无 Range 请求时，通常不发 Content-Range，且返回 200
-                        headers.set('Accept-Ranges', 'bytes'); // 告知支持 Range
+                        // 【旧版模式】 -> 200 OK (图片/音频/下载)
+                        // 强制 octet-stream，让浏览器自己 Sniff 图片头
+                        headers.set('Content-Type', 'application/octet-stream');
+                        // 不发送 Content-Range
+                        // 不发送 Accept-Ranges (模仿旧版行为)
                         resolve(new Response(stream, { status: 200, headers }));
                     }
                 } 

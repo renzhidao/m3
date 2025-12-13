@@ -463,7 +463,17 @@ function handleStreamOpen(data, source) {
 
     const reqChunkIndex = Math.floor(start / CHUNK_SIZE) * CHUNK_SIZE;
 
-    if (Math.abs(task.nextOffset - start) > CHUNK_SIZE * 2) {
+    // === 修复: 图片/音频极速加载优化 ===
+    // 如果是小文件 (< 2MB) 或起播段，强制插队优先下载
+    if (task.size < 2 * 1024 * 1024) {
+        // 小文件：全量预取
+        for (let off = 0; off < task.size; off += CHUNK_SIZE) {
+            if (!task.parts.has(off) && !task.wantQueue.includes(off) && !task.inflight.has(off)) {
+                task.wantQueue.unshift(off); // 插队到最前
+            }
+        }
+    } else if (Math.abs(task.nextOffset - start) > CHUNK_SIZE * 2) {
+        // 大文件 Seek
         log(`⏩ SW Seek -> ${start}`);
         task.nextOffset = reqChunkIndex;
         task.wantQueue = [];
