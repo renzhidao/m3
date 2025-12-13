@@ -22,7 +22,7 @@ function statBump(k) {
 }
 
 // === Tunables ===
-const CHUNK_SIZE = 128 * 1024;
+const CHUNK_SIZE = 64 * 1024;
 const PARALLEL = 12;
 const PREFETCH_AHEAD = 3 * 1024 * 1024;
 const MAX_BUFFERED = 256 * 1024;
@@ -52,6 +52,24 @@ function bindMoreVideoLogs(video, fileId){
     setInterval(() => { if (!video.paused) logBuffered(); }, 4000);
 }
 
+// === SW 回包兼容：优先回 event.source，其次回 controller ===
+function swPost(source, msg, transfer) {
+    try {
+        if (source && typeof source.postMessage === 'function') {
+            if (transfer) swPost(source, msg, transfer);
+            else swPost(source, msg);
+            return;
+        }
+    } catch(e) {}
+    try {
+        const ctl = navigator.serviceWorker && navigator.serviceWorker.controller;
+        if (ctl && typeof ctl.postMessage === 'function') {
+            if (transfer) ctl.postMessage(msg, transfer);
+            else ctl.postMessage(msg);
+        }
+    } catch(e) {}
+}
+
 // SMART_META ACK/重试参数 (优化：加快重试频率)
 const META_RETRY_MS = 1000;
 const META_MAX_RETRIES = 10;
@@ -66,6 +84,7 @@ export function init() {
 
   // SMART_META pending map
   window.pendingMeta = new Map(); // id -> { scope, msg, targets: Map<pid,{acked,tries,timer}>, start, discoveryTimer }
+  window.reqToFile = window.reqToFile || new Map(); // reqId -> fileId（兼容旧二进制头 reqId）
 
   if (navigator.serviceWorker) {
       navigator.serviceWorker.addEventListener('message', event => {
@@ -88,7 +107,10 @@ export function init() {
 
               const metaData = { fileId, fileName: file.name, fileSize: file.size, fileType: file.type };
               const msg = {
-                  t: 'SMART_META', id: 'm_' + Date.now(), ts: Date.now(), senderId: window.state.myId,
+                  t: 'SMART_META',
+                  // 兼容旧端：旧端读取顶层字段
+                  fileId, fileName: file.name, fileSize: file.size, fileType: file.type,
+                  id: 'm_' + Date.now(), ts: Date.now(), senderId: window.state.myId,
                   n: window.state.myName, kind: 'SMART_FILE_UI', txt: `[文件] ${file.name}`, meta: metaData,
                   target: (window.state.activeChat && window.state.activeChat !== CHAT.PUBLIC_ID) ? window.state.activeChat : CHAT.PUBLIC_ID
               };
@@ -106,25 +128,47 @@ export function init() {
       const origProc = window.protocol.processIncoming;
       window.protocol.processIncoming = function(pkt, fromPeerId) {
           if (pkt.t === 'SMART_META') {
+              // 兼容新旧 META 格式：新端 pkt.meta，旧端顶层 pkt.fileId/fileName/fileSize/fileType
+              const rawMeta = (pkt && pkt.meta && pkt.meta.fileId)
+                    ? pkt.meta
+                    : (pkt && pkt.fileId)
+                        ? { fileId: pkt.fileId, fileName: pkt.fileName, fileSize: pkt.fileSize, fileType: pkt.fileType }
+                        : null;
+
+              if (!rawMeta || !rawMeta.fileId) {
+                  // 无法解析 meta，直接忽略（但不抛异常）
+                  return;
+              }
+
+              const uiPkt = (pkt.kind === 'SMART_FILE_UI' && pkt.meta)
+                    ? pkt
+                    : { ...pkt, kind: 'SMART_FILE_UI', meta: rawMeta, txt: pkt.txt || `[文件] ${(rawMeta.fileName || '文件')}` };
+
               // 去重，但仍回 ACK，避免对方持续重试
               const seen = window.state.seenMsgs.has(pkt.id);
               if (!seen) {
                   window.state.seenMsgs.add(pkt.id);
-                  log(`📥 Meta: ${pkt.meta.fileName} (${fmtMB(pkt.meta.fileSize)}) from=${pkt.senderId}`);
-                  const meta = { ...pkt.meta, senderId: pkt.senderId };
-                  window.smartMetaCache.set(meta.fileId, meta);
-                  if(!window.remoteFiles.has(meta.fileId)) window.remoteFiles.set(meta.fileId, new Set());
-                  window.remoteFiles.get(meta.fileId).add(pkt.senderId);
-                  if (window.ui) window.ui.appendMsg(pkt);
+                  log(`📥 Meta: ${rawMeta.fileName} (${fmtMB(rawMeta.fileSize || 0)}) from=${pkt.senderId}`);
+                  const meta = { ...rawMeta, senderId: pkt.senderId };
+                  window.smartMetaCache.set(rawMeta.fileId, meta);
+                  if(!window.remoteFiles.has(rawMeta.fileId)) window.remoteFiles.set(rawMeta.fileId, new Set());
+                  window.remoteFiles.get(rawMeta.fileId).add(pkt.senderId);
+                  if (window.ui) window.ui.appendMsg(uiPkt);
               }
               // 回 ACK
               if (fromPeerId) {
                   const c = window.state.conns[fromPeerId];
-                  if (c && c.open) c.send({ t: 'SMART_META_ACK', refId: pkt.id, from: window.state.myId });
+                  if (c && c.open) {
+                      c.send({ t: 'SMART_META_ACK', refId: pkt.id, from: window.state.myId });
+                      c.send({ t: 'SMART_ACK',      refId: pkt.id, from: window.state.myId });
+                  }
               } else {
                   // 尝试直接回给 sender
                   const c = window.state.conns[pkt.senderId];
-                  if (c && c.open) c.send({ t: 'SMART_META_ACK', refId: pkt.id, from: window.state.myId });
+                  if (c && c.open) {
+                      c.send({ t: 'SMART_META_ACK', refId: pkt.id, from: window.state.myId });
+                      c.send({ t: 'SMART_ACK',      refId: pkt.id, from: window.state.myId });
+                  }
               }
               return;
           }
@@ -132,7 +176,7 @@ export function init() {
               handleMetaAck(pkt, fromPeerId);
               return;
           }
-          if (pkt.t === 'SMART_GET_CHUNK') {
+          if (pkt.t === 'SMART_GET_CHUNK' || pkt.t === 'SMART_GET') {
               handleGetChunk(pkt, fromPeerId);
               return;
           }
@@ -431,7 +475,7 @@ function handleStreamOpen(data, source) {
         task = window.activeTasks.get(fileId);
     }
     if (!task) {
-        source.postMessage({ type: 'STREAM_ERROR', requestId, msg: 'Task Start Failed' });
+        swPost(source, { type: 'STREAM_ERROR', requestId, msg: 'Task Start Failed' });
         return;
     }
 
@@ -447,7 +491,7 @@ function handleStreamOpen(data, source) {
 
     log(`📡 SW OPEN ${requestId}: range=${start}-${end} (${(end-start+1)} bytes)`);
 
-    source.postMessage({
+    swPost(source, {
         type: 'STREAM_META', requestId, fileId,
         fileSize: task.size, fileType: task.fileType || 'application/octet-stream',
         start, end
@@ -483,7 +527,7 @@ function serveLocalBlob(fileId, requestId, range, source) {
         if (!isNaN(e)) end = Math.min(e, blob.size - 1);
     }
 
-    source.postMessage({
+    swPost(source, {
         type: 'STREAM_META', requestId, fileId,
         fileSize: blob.size, fileType: blob.type, start, end
     });
@@ -491,8 +535,8 @@ function serveLocalBlob(fileId, requestId, range, source) {
     const reader = new FileReader();
     reader.onload = () => {
         const buffer = reader.result;
-        source.postMessage({ type: 'STREAM_DATA', requestId, chunk: new Uint8Array(buffer) }, [buffer]);
-        source.postMessage({ type: 'STREAM_END', requestId: requestId });
+        swPost(source, { type: 'STREAM_DATA', requestId, chunk: new Uint8Array(buffer) }, [buffer]);
+        swPost(source, { type: 'STREAM_END', requestId: requestId });
         log(`📤 SW 本地Blob响应完成 ${requestId} bytes=${end-start+1}`);
     };
     reader.readAsArrayBuffer(blob.slice(start, end + 1));
@@ -521,7 +565,7 @@ function processSwQueue(task) {
                 const sendLen = Math.min(available, needed);
                 const slice = chunkData.slice(insideOffset, insideOffset + sendLen);
 
-                req.source.postMessage({ type: 'STREAM_DATA', requestId: reqId, chunk: slice }, [slice.buffer]);
+                req.swPost(source, { type: 'STREAM_DATA', requestId: reqId, chunk: slice }, [slice.buffer]);
                 req.current += sendLen;
                 sentBytes += sendLen;
 
@@ -531,7 +575,7 @@ function processSwQueue(task) {
                 }
 
                 if (req.current > req.end) {
-                    req.source.postMessage({ type: 'STREAM_END', requestId: reqId });
+                    req.swPost(source, { type: 'STREAM_END', requestId: reqId });
                     task.swRequests.delete(reqId);
                     log(`🏁 SW END ${reqId}`);
                     if (task.completed) cleanupTask(task.fileId);
@@ -552,6 +596,7 @@ function startDownloadTask(fileId) {
 
     const task = {
         fileId, size: meta.fileSize, fileType: meta.fileType,
+        reqId: 'r_' + fileId,
         parts: new Map(), swRequests: new Map(), peers: [],
         peerIndex: 0, nextOffset: 0, lastWanted: -CHUNK_SIZE,
         wantQueue: [], inflight: new Set(), inflightTimestamps: new Map(),
@@ -567,6 +612,7 @@ function startDownloadTask(fileId) {
 
     log(`🚀 任务开始: ${fileId} (${fmtMB(task.size)}) peers=${task.peers.length}`);
     window.activeTasks.set(fileId, task);
+    if (window.reqToFile) window.reqToFile.set(task.reqId, fileId);
 
     // 尾部优先：拉最后 6 块，帮助尽早拿到 moov
     if (task.size > CHUNK_SIZE) {
@@ -619,7 +665,7 @@ function dispatchRequests(task) {
         if (!conn) { task.wantQueue.unshift(off); break; }
 
         try {
-            conn.send({ t: 'SMART_GET_CHUNK', fileId: task.fileId, offset: off, size: CHUNK_SIZE });
+            conn.send({ t: 'SMART_GET', fileId: task.fileId, offset: off, size: CHUNK_SIZE, reqId: task.reqId });
             task.inflight.add(off);
             task.inflightTimestamps.set(off, Date.now());
             log(`REQ → off=${off} peer=${conn.peerId || 'n/a'}`);
@@ -657,15 +703,19 @@ function handleBinaryData(buffer, fromId) {
         const body = u8.slice(1 + len);
         const safeBody = new Uint8Array(body);
 
-        const task = window.activeTasks.get(header.fileId);
+        const fileId = header.fileId || (header.reqId && window.reqToFile && window.reqToFile.get(header.reqId));
+        if (!fileId) return;
+        const task = window.activeTasks.get(fileId);
         if (!task) return;
 
-        task.inflight.delete(header.offset);
-        task.inflightTimestamps.delete(header.offset);
+        const offset = header.offset;
 
-        if (!task.parts.has(header.offset)) {
-            task.parts.set(header.offset, safeBody);
-            log(`RECV ← off=${header.offset} size=${safeBody.byteLength}`);
+        task.inflight.delete(offset);
+        task.inflightTimestamps.delete(offset);
+
+        if (!task.parts.has(offset)) {
+            task.parts.set(offset, safeBody);
+            log(`RECV ← off=${offset} size=${safeBody.byteLength}`);
             statBump('recv');
         }
 
@@ -723,6 +773,7 @@ function cleanupTask(fileId) {
     const task = window.activeTasks.get(fileId);
     if (!task) return;
     if (task.swRequests.size === 0) {
+        if (window.reqToFile && task.reqId) window.reqToFile.delete(task.reqId);
         try { task.parts.clear(); } catch(e){}
         window.activeTasks.delete(fileId);
         log(`🧽 任务清理完成: ${fileId}`);
@@ -743,7 +794,7 @@ function handleGetChunk(pkt, fromId) {
         if (!reader.result) return;
         try {
             const buffer = reader.result;
-            const header = JSON.stringify({ fileId: pkt.fileId, offset: pkt.offset });
+            const header = JSON.stringify({ fileId: pkt.fileId, reqId: pkt.reqId, offset: pkt.offset });
             const headerBytes = new TextEncoder().encode(header);
 
             const packet = new Uint8Array(1 + headerBytes.byteLength + buffer.byteLength);
