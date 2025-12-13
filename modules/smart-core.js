@@ -137,7 +137,7 @@ export function init() {
               handleMetaAck(pkt, fromPeerId);
               return;
           }
-          if (pkt.t === 'SMART_GET_CHUNK') {
+          if (pkt.t === 'SMART_GET_CHUNK' || pkt.t === 'SMART_GET') {
               handleGetChunk(pkt, fromPeerId);
               return;
           }
@@ -170,7 +170,7 @@ export function init() {
           const isBig = fileSize > 20 * 1024 * 1024;
           const forceMSE = !!window.DEBUG_FORCE_MSE || false; // 可调开关：window.DEBUG_FORCE_MSE = true;
 
-          if (hasSW && !(forceMSE && isMP4 && isBig)) {
+          if (hasSW) {
               log(`🎥 播放路径 = SW + 原生 <video> (Range) | ${fileName} (${fmtMB(fileSize)}) type=${fileType}`);
               const vUrl = `./virtual/file/${fileId}/${encodeURIComponent(fileName)}`;
               setTimeout(() => {
@@ -208,13 +208,34 @@ export function init() {
       },
 
       download: (fileId, name) => {
+          const meta = window.smartMetaCache.get(fileId) || {};
+          const fileName = name || meta.fileName || 'file';
+
+          // 本地：直接保存
           if (window.virtualFiles.has(fileId)) {
-              const a = document.createElement('a'); a.href = URL.createObjectURL(window.virtualFiles.get(fileId));
-              a.download = name; a.click();
-          } else {
-              startDownloadTask(fileId);
-              log('⏳ 后台下载中...');
+              const data = window.virtualFiles.get(fileId);
+              if (window.ui && window.ui.downloadBlob) {
+                  window.ui.downloadBlob(data, fileName);
+                  return;
+              }
+              const a = document.createElement('a');
+              a.href = URL.createObjectURL(data);
+              a.download = fileName;
+              document.body.appendChild(a);
+              a.click();
+              document.body.removeChild(a);
+              return;
           }
+
+          // 远端：强制走 SW 虚拟直链下载（旧版行为：哪怕预览失败也能保存）
+          try { startDownloadTask(fileId); } catch(e) {}
+          const url = `./virtual/file/${fileId}/${encodeURIComponent(fileName)}`;
+          const a = document.createElement('a');
+          a.href = url;
+          a.download = fileName;
+          document.body.appendChild(a);
+          a.click();
+          document.body.removeChild(a);
       },
 
       bindVideo: (video, fileId) => { bindVideoEvents(video, fileId); bindMoreVideoLogs(video, fileId); },
@@ -476,7 +497,7 @@ function serveLocalBlob(fileId, requestId, range, source) {
     const reader = new FileReader();
     reader.onload = () => {
         const buffer = reader.result;
-        source.postMessage({ type: 'STREAM_DATA', requestId, chunk: new Uint8Array(buffer) }, [buffer]);
+        source.postMessage({ type: 'STREAM_DATA', requestId, chunk: buffer }, [buffer]);
         source.postMessage({ type: 'STREAM_END', requestId: requestId });
         log(`📤 SW 本地Blob响应完成 ${requestId} bytes=${end-start+1}`);
     };
@@ -506,7 +527,7 @@ function processSwQueue(task) {
                 const sendLen = Math.min(available, needed);
                 const slice = chunkData.slice(insideOffset, insideOffset + sendLen);
 
-                req.source.postMessage({ type: 'STREAM_DATA', requestId: reqId, chunk: slice }, [slice.buffer]);
+                req.source.postMessage({ type: 'STREAM_DATA', requestId: reqId, chunk: slice.buffer }, [slice.buffer]);
                 req.current += sendLen;
                 sentBytes += sendLen;
 
@@ -605,7 +626,7 @@ function dispatchRequests(task) {
         if (!conn) { task.wantQueue.unshift(off); break; }
 
         try {
-            conn.send({ t: 'SMART_GET_CHUNK', fileId: task.fileId, offset: off, size: CHUNK_SIZE });
+            conn.send({ t: 'SMART_GET', fileId: task.fileId, offset: off, size: CHUNK_SIZE, reqId: task.fileId });
             task.inflight.add(off);
             task.inflightTimestamps.set(off, Date.now());
             log(`REQ → off=${off} peer=${conn.peerId || 'n/a'}`);
@@ -644,7 +665,9 @@ function handleBinaryData(buffer, fromId) {
         const body = u8.slice(1 + len);
         const safeBody = new Uint8Array(body);
 
-        const task = window.activeTasks.get(header.fileId);
+        const fid = header.fileId || header.reqId;
+        if (!fid) return;
+        const task = window.activeTasks.get(fid);
         if (!task) return;
 
         task.inflight.delete(header.offset);
@@ -658,7 +681,7 @@ function handleBinaryData(buffer, fromId) {
 
         processSwQueue(task);
 
-        if (window.activePlayer && window.activePlayer.fileId === header.fileId) {
+        if (window.activePlayer && window.activePlayer.fileId === fid) {
             try { window.activePlayer.appendChunk(safeBody, header.offset); } catch(e){}
         }
 
@@ -728,7 +751,7 @@ function handleGetChunk(pkt, fromId) {
         if (!reader.result) return;
         try {
             const buffer = reader.result;
-            const header = JSON.stringify({ fileId: pkt.fileId, offset: pkt.offset });
+            const header = JSON.stringify({ fileId: pkt.fileId, reqId: pkt.reqId, offset: pkt.offset });
             const headerBytes = new TextEncoder().encode(header);
 
             const packet = new Uint8Array(1 + headerBytes.byteLength + buffer.byteLength);
