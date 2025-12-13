@@ -53,13 +53,7 @@ function bindMoreVideoLogs(video, fileId){
 }
 
 // === SW 回包兼容：优先回 event.source，其次回 controller ===
-function swPost(source, msg, transfer) {
-    try {
-        if (source && typeof source.postMessage === 'function') {
-            if (transfer) swPost(source, msg, transfer);
-            else swPost(source, msg);
-            return;
-        }
+
     } catch(e) {}
     try {
         const ctl = navigator.serviceWorker && navigator.serviceWorker.controller;
@@ -75,11 +69,29 @@ const META_RETRY_MS = 1000;
 const META_MAX_RETRIES = 10;
 const META_MAX_TTL_MS = 25000;
 
+
+function sendToSW(source, msg, transfer) {
+    try {
+        if (source && typeof source.postMessage === 'function') {
+            source.postMessage(msg, transfer || []);
+            return;
+        }
+    } catch(e) {}
+    try {
+        const ctl = navigator.serviceWorker && navigator.serviceWorker.controller;
+        if (ctl && typeof ctl.postMessage === 'function') {
+            ctl.postMessage(msg, transfer || []);
+        }
+    } catch(e) {}
+}
+
+
 export function init() {
   window.virtualFiles = new Map();
   window.smartMetaCache = new Map();
   window.remoteFiles = new Map();
   window.activeTasks = new Map();
+  window.activeStreams = new Map(); // 用于本地文件流式服务 (旧版逻辑)
   window.activePlayer = null;
 
   // SMART_META pending map
@@ -461,21 +473,24 @@ function checkTimeouts() {
     });
 }
 
+
 function handleStreamOpen(data, source) {
     const { requestId, fileId, range } = data;
 
+    // 优先处理本地文件 (旧版逻辑)
     if (window.virtualFiles.has(fileId)) {
-        serveLocalBlob(fileId, requestId, range, source);
+        serveLocalFile({ fileId, requestId, range }, source);
         return;
     }
 
+    // 下面是远程 P2P 下载逻辑 (保持新版)
     let task = window.activeTasks.get(fileId);
     if (!task) {
         startDownloadTask(fileId);
         task = window.activeTasks.get(fileId);
     }
     if (!task) {
-        swPost(source, { type: 'STREAM_ERROR', requestId, msg: 'Task Start Failed' });
+        sendToSW(source, { type: 'STREAM_ERROR', requestId, msg: 'Task Start Failed' });
         return;
     }
 
@@ -491,7 +506,7 @@ function handleStreamOpen(data, source) {
 
     log(`📡 SW OPEN ${requestId}: range=${start}-${end} (${(end-start+1)} bytes)`);
 
-    swPost(source, {
+    sendToSW(source, {
         type: 'STREAM_META', requestId, fileId,
         fileSize: task.size, fileType: task.fileType || 'application/octet-stream',
         start, end
@@ -514,36 +529,59 @@ function handleStreamOpen(data, source) {
     requestNextChunk(task);
 }
 
-function serveLocalBlob(fileId, requestId, range, source) {
-    const blob = window.virtualFiles.get(fileId);
-    if (!blob) return;
-
-    let start = 0; let end = blob.size - 1;
+function serveLocalFile(req, source) {
+    const file = window.virtualFiles.get(req.fileId);
+    const range = req.range;
+    let start = 0;
+    let end = file.size - 1;
+    
+    // 照抄旧版 Range 解析
     if (range && range.startsWith('bytes=')) {
         const parts = range.replace('bytes=', '').split('-');
-        const s = parseInt(parts[0], 10);
-        const e = parts[1] ? parseInt(parts[1], 10) : end;
-        if (!isNaN(s)) start = s;
-        if (!isNaN(e)) end = Math.min(e, blob.size - 1);
+        if (parts[0]) start = parseInt(parts[0], 10);
+        if (parts[1]) end = parseInt(parts[1], 10);
     }
 
-    swPost(source, {
-        type: 'STREAM_META', requestId, fileId,
-        fileSize: blob.size, fileType: blob.type, start, end
-    });
+    sendToSW(source, { type: 'STREAM_META', requestId: req.requestId, fileSize: file.size, fileType: file.type, start, end });
 
-    const reader = new FileReader();
-    reader.onload = () => {
-        const buffer = reader.result;
-        swPost(source, { type: 'STREAM_DATA', requestId, chunk: new Uint8Array(buffer) }, [buffer]);
-        swPost(source, { type: 'STREAM_END', requestId: requestId });
-        log(`📤 SW 本地Blob响应完成 ${requestId} bytes=${end-start+1}`);
-    };
-    reader.readAsArrayBuffer(blob.slice(start, end + 1));
+    let offset = start;
+    const CHUNK = 1024 * 1024; // 1MB 分块
+
+    // 记录流状态
+    window.activeStreams.set(req.requestId, { source: source });
+
+    function readLoop() {
+        if (!window.activeStreams.has(req.requestId)) return;
+
+        if (offset > end) {
+            sendToSW(source, { type: 'STREAM_END', requestId: req.requestId });
+            window.activeStreams.delete(req.requestId);
+            return;
+        }
+
+        const sliceEnd = Math.min(offset + CHUNK, end + 1);
+        const reader = new FileReader();
+        reader.onload = () => {
+             if (!window.activeStreams.has(req.requestId)) return;
+             // 发送数据块
+             const buf = reader.result;
+             sendToSW(source, { type: 'STREAM_DATA', requestId: req.requestId, chunk: buf }, [buf]);
+             offset += CHUNK;
+             setTimeout(readLoop, 10); // 10ms 间隔，避免卡死 UI
+        };
+        reader.readAsArrayBuffer(file.slice(offset, sliceEnd));
+    }
+    readLoop();
 }
+
 
 function handleStreamCancel(data) {
     const { requestId } = data;
+    // 清理本地流
+    if (window.activeStreams && window.activeStreams.has(requestId)) {
+        window.activeStreams.delete(requestId);
+    }
+    // 清理 P2P 流
     window.activeTasks.forEach(t => {
         t.swRequests.delete(requestId);
         if (t.completed) cleanupTask(t.fileId);
@@ -565,7 +603,7 @@ function processSwQueue(task) {
                 const sendLen = Math.min(available, needed);
                 const slice = chunkData.slice(insideOffset, insideOffset + sendLen);
 
-                req.swPost(source, { type: 'STREAM_DATA', requestId: reqId, chunk: slice }, [slice.buffer]);
+                req.sendToSW(source, { type: 'STREAM_DATA', requestId: reqId, chunk: slice }, [slice.buffer]);
                 req.current += sendLen;
                 sentBytes += sendLen;
 
@@ -575,7 +613,7 @@ function processSwQueue(task) {
                 }
 
                 if (req.current > req.end) {
-                    req.swPost(source, { type: 'STREAM_END', requestId: reqId });
+                    req.sendToSW(source, { type: 'STREAM_END', requestId: reqId });
                     task.swRequests.delete(reqId);
                     log(`🏁 SW END ${reqId}`);
                     if (task.completed) cleanupTask(task.fileId);
