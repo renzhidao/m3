@@ -1,144 +1,163 @@
-const CACHE_NAME = 'p1-cache-v3';
-const STREAM_PATH = '/stream/';
+const CACHE_NAME = 'p1-stream-v1765199403'; // Bump Version
+const CORE_ASSETS = [
+  './',
+  './index.html',
+  './manifest.json',
+  './style.css',
+  './loader.js'
+];
 
-self.addEventListener('install', e => self.skipWaiting());
-self.addEventListener('activate', e => self.clients.claim());
-
-// 消息通道
-let dataPort = null;
-const chunkMap = new Map(); // reqId -> { controller }
-
-self.addEventListener('message', event => {
-  const msg = event.data;
-  if (msg && msg.type === 'INIT_PORT') {
-    dataPort = event.ports && event.ports[0];
-    if (dataPort) dataPort.onmessage = handleClientMsg;
-  }
+self.addEventListener('install', event => {
+  self.skipWaiting();
+  event.waitUntil(caches.open(CACHE_NAME).then(c => c.addAll(CORE_ASSETS).catch(()=>{})));
 });
 
-function handleClientMsg(event) {
-  const { type, reqId, chunk, done } = (event.data || {});
-  if (type !== 'STREAM_DATA') return;
-  const ctx = chunkMap.get(reqId);
-  if (!ctx) return;
-  try {
-    if (chunk) ctx.controller.enqueue(new Uint8Array(chunk));
-    if (done) {
-      ctx.controller.close();
-      chunkMap.delete(reqId);
+self.addEventListener('activate', event => {
+  event.waitUntil(
+    caches.keys().then(keys => Promise.all(
+      keys.map(k => k !== CACHE_NAME ? caches.delete(k) : Promise.resolve())
+    )).then(() => self.clients.claim())
+  );
+});
+
+const streamControllers = new Map();
+
+self.addEventListener('message', event => {
+    const data = event.data;
+    if (!data) return;
+
+    // ✅ 兼容握手：页面发 PING，这里回 PING
+    if (data.type === 'PING') {
+        try { event.source && event.source.postMessage({ type: 'PING' }); } catch(e) {}
+        return;
     }
-  } catch (e) {
-    chunkMap.delete(reqId);
-    // 可选：通知页面中止
-    // notifyClient({ type:'PULL_ABORT', reqId, reason:'enqueue_error' });
-  }
-}
+
+    if (!data.requestId) return;
+
+    const controller = streamControllers.get(data.requestId);
+    if (!controller) return;
+
+    switch (data.type) {
+        case 'STREAM_DATA':
+            try {
+                if (data.chunk) controller.enqueue(new Uint8Array(data.chunk));
+            } catch(e) { }
+            break;
+        case 'STREAM_END':
+            try { controller.close(); } catch(e) {}
+            streamControllers.delete(data.requestId);
+            break;
+        case 'STREAM_ERROR':
+            try { controller.error(new Error(data.msg)); } catch(e) {}
+            streamControllers.delete(data.requestId);
+            break;
+    }
+});
 
 self.addEventListener('fetch', event => {
   const url = new URL(event.request.url);
-  if (url.pathname.startsWith(STREAM_PATH)) {
-    const fileId = url.pathname.slice(STREAM_PATH.length);
-    event.respondWith(handleStream(event.request, fileId));
+
+  if (url.pathname.includes('/virtual/file/')) {
+    event.respondWith(handleVirtualStream(event));
     return;
   }
-  // 其他资源：维持原缓存策略
-  event.respondWith(caches.match(event.request).then(res => res || fetch(event.request)));
+
+  if (url.pathname.endsWith('registry.txt') || url.pathname.endsWith('.js')) {
+    event.respondWith(
+      fetch(event.request).catch(() => caches.match(event.request))
+    );
+    return;
+  }
+
+  event.respondWith(
+    caches.match(event.request).then(cached => {
+      const netFetch = fetch(event.request).then(res => {
+         if (event.request.method === 'GET' && url.protocol.startsWith('http')) {
+             const clone = res.clone();
+             caches.open(CACHE_NAME).then(c => c.put(event.request, clone));
+         }
+         return res;
+      }).catch(() => null);
+      return cached || netFetch;
+    })
+  );
 });
 
-async function handleStream(request, fileId) {
-  const method = request.method || 'GET';
-  if (!['GET', 'HEAD', 'OPTIONS'].includes(method)) {
-    return new Response(null, { status: 405, headers: baseHeaders() });
-  }
+async function handleVirtualStream(event) {
+    const clientId = event.clientId;
+    const client = await self.clients.get(clientId) || (await self.clients.matchAll({type:'window'}))[0];
 
-  if (method === 'OPTIONS') {
-    return new Response(null, { status: 204, headers: { ...baseHeaders(), 'Accept-Ranges': 'bytes' } });
-  }
+    if (!client) return new Response("Service Worker: No Client Active", { status: 503 });
 
-  const meta = await getMetaFromClient(fileId);
-  if (!meta || !meta.size) {
-    return new Response('meta not available', { status: 404, headers: baseHeaders() });
-  }
+    // ✅ 关键修复：兼容 /repo/virtual/file/... 这种带前缀子路径（GitHub Pages/任意 Pages）
+    const pathname = new URL(event.request.url).pathname;
+    const marker = '/virtual/file/';
+    const idx = pathname.indexOf(marker);
+    if (idx === -1) return new Response("Bad Virtual URL", { status: 400 });
 
-  const size = +meta.size;
-  const type = meta.type || guessTypeByName(meta.name) || 'video/mp4';
+    const tail = pathname.slice(idx + marker.length);
+    const segs = tail.split('/').filter(Boolean);
 
-  const r = parseRange(request.headers.get('range'), size);
-  if (r === null) {
-    // 非法范围
-    const h = { ...baseHeaders(), 'Content-Type': type, 'Accept-Ranges': 'bytes', 'Content-Range': `bytes */${size}` };
-    return new Response(null, { status: 416, headers: h });
-  }
+    const fileId = segs[0];
+    if (!fileId) return new Response("Bad Virtual URL (missing fileId)", { status: 400 });
 
-  const common = { ...baseHeaders(), 'Content-Type': type, 'Accept-Ranges': 'bytes', 'Vary': 'Range' };
-
-  // HEAD：仅返回头
-  if (method === 'HEAD') {
-    if (r.partial) {
-      const len = r.end - r.start + 1;
-      return new Response(null, { status: 206, headers: { ...common, 'Content-Range': `bytes ${r.start}-${r.end}/${size}`, 'Content-Length': String(len) } });
-    } else {
-      return new Response(null, { status: 200, headers: { ...common, 'Content-Length': String(size) } });
+    let fileName = 'file';
+    try {
+        // 文件名理论上不会含 '/', 这里做个兼容
+        fileName = decodeURIComponent(segs.slice(1).join('/') || 'file');
+    } catch(e) {
+        fileName = segs.slice(1).join('/') || 'file';
     }
-  }
 
-  // GET：构造流并按精确范围下发
-  const reqId = Math.random().toString(36).slice(2);
-  const body = new ReadableStream({
-    start(controller) {
-      chunkMap.set(reqId, { controller });
-      notifyClient({ type: 'PULL_START', reqId, fileId, start: r.start, end: r.end }); // end 为含端
-    },
-    cancel() {
-      chunkMap.delete(reqId);
-      notifyClient({ type: 'PULL_CANCEL', reqId });
-    }
-  });
+    const range = event.request.headers.get('Range');
+    const requestId = Math.random().toString(36).slice(2) + Date.now();
 
-  if (r.partial) {
-    const len = r.end - r.start + 1;
-    const headers = { ...common, 'Content-Range': `bytes ${r.start}-${r.end}/${size}`, 'Content-Length': String(len) };
-    return new Response(body, { status: 206, headers });
-  } else {
-    const headers = { ...common, 'Content-Length': String(size) };
-    return new Response(body, { status: 200, headers });
-  }
-}
+    const stream = new ReadableStream({
+        start(controller) {
+            streamControllers.set(requestId, controller);
+            client.postMessage({ type: 'STREAM_OPEN', requestId, fileId, range });
+        },
+        cancel() {
+            streamControllers.delete(requestId);
+            client.postMessage({ type: 'STREAM_CANCEL', requestId });
+        }
+    });
 
-function parseRange(header, size) {
-  if (!size || size <= 0) return { start: 0, end: -1, partial: false };
-  if (!header) return { start: 0, end: size - 1, partial: false };
-  const m = /bytes=(\d*)-(\d*)/i.exec(header);
-  if (!m) return null;
-  let [, s, e] = m;
-  if (s === '' && e) { // 后缀范围 -N
-    const len = Math.min(parseInt(e, 10), size);
-    return { start: size - len, end: size - 1, partial: true };
-  }
-  const start = parseInt(s, 10);
-  const end = e ? Math.min(parseInt(e, 10), size - 1) : size - 1;
-  if (Number.isNaN(start) || start < 0 || start > end) return null;
-  return { start, end, partial: true };
-}
+    return new Promise(resolve => {
+        const metaHandler = (e) => {
+            const d = e.data;
+            if (d && d.requestId === requestId) {
+                if (d.type === 'STREAM_META') {
+                    self.removeEventListener('message', metaHandler);
+                    const headers = new Headers();
+                    headers.set('Content-Type', d.fileType || 'video/mp4');
+                    headers.set('Accept-Ranges', 'bytes');
+                    headers.set('Content-Disposition', `inline; filename="${fileName}"`);
 
-function getMetaFromClient(fileId) {
-  return new Promise(resolve => {
-    if (!dataPort) { resolve(null); return; }
-    const ch = new MessageChannel();
-    ch.port1.onmessage = e => resolve(e.data || null);
-    dataPort.postMessage({ type: 'GET_META', fileId }, [ch.port2]);
-  });
-}
+                    const total = d.fileSize;
+                    const start = d.start;
+                    const end = d.end;
+                    headers.set('Content-Length', end - start + 1);
+                    headers.set('Content-Range', `bytes ${start}-${end}/${total}`);
 
-function notifyClient(msg) { if (dataPort) dataPort.postMessage(msg); }
-function baseHeaders() { return { 'Cache-Control': 'no-store' }; }
-function guessTypeByName(name = '') {
-  const n = (name || '').toLowerCase();
-  if (n.endsWith('.mp4') || n.endsWith('.m4v')) return 'video/mp4';
-  if (n.endsWith('.mov')) return 'video/quicktime';
-  if (n.endsWith('.webm')) return 'video/webm';
-  if (n.endsWith('.mkv')) return 'video/x-matroska';
-  if (n.endsWith('.mp3')) return 'audio/mpeg';
-  if (n.endsWith('.m4a') || n.endsWith('.aac')) return 'audio/mp4';
-  return null;
+                    resolve(new Response(stream, { status: 206, headers }));
+                }
+                else if (d.type === 'STREAM_ERROR') {
+                    self.removeEventListener('message', metaHandler);
+                    streamControllers.delete(requestId);
+                    resolve(new Response(d.msg || 'File Not Found', { status: 404 }));
+                }
+            }
+        };
+
+        self.addEventListener('message', metaHandler);
+
+        setTimeout(() => {
+            self.removeEventListener('message', metaHandler);
+            if (streamControllers.has(requestId)) {
+                streamControllers.delete(requestId);
+                resolve(new Response("Gateway Timeout (Metadata Wait)", { status: 504 }));
+            }
+        }, 15000);
+    });
 }

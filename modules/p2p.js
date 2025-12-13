@@ -1,7 +1,8 @@
+
 import { MSG_TYPE, NET_PARAMS } from './constants.js';
 
 export function init() {
-  console.log(' 加载模块: P2P (Debug Trace)');
+  console.log(' 加载模块: P2P (Ordered: False)');
   const CFG = window.config;
 
   window.p2p = {
@@ -86,13 +87,10 @@ export function init() {
              return;    
           }
           
-          // === 修复：通用网络错误重试 ===
-          // 只要不是上述已处理的特定逻辑，遇到网络报错一律重试
           setTimeout(() => this.start(), 3000);
         });
       } catch (err) {
         if(window.monitor) window.monitor.fatal('P2P', `初始化崩溃: ${err.message}`);
-        // === 修复：启动崩溃自动重试 ===
         setTimeout(() => this.start(), 3000);
       }
     },
@@ -135,9 +133,10 @@ export function init() {
             delete window.state.conns[id];
         }
         
-        // === 修复：移除 serialization: 'binary'，使用默认混合模式 ===
+        // === 优化：开启无序传输，提升速度 ===
         const conn = window.state.peer.connect(id, { 
-            reliable: true 
+            reliable: true,
+            ordered: false // 关键优化：消除队头阻塞
         });
         
         conn.created = window.util.now();
@@ -207,19 +206,8 @@ export function init() {
     },
 
     handleData(d, conn) {
-      // === 核心 Debug：P2P 入口探针 ===
-      if (window.monitor && d) {
-          if (d.t === 'SMART_GET' || d.t === 'SMART_GET_CHUNK') {
-               window.monitor.info('P2P', `⚡ 底层收到请求: Offset ${d.offset}`, {from: conn.peer.slice(0,4)});
-          } else if (d.t !== MSG_TYPE.PING && d.t !== MSG_TYPE.PONG) {
-               // 可按需打开更详细的调试
-               // console.log('P2P RX:', d.t, conn.peer);
-          }
-      }
-
       conn.lastPong = Date.now();
       
-      // 1) Blob 兼容
       if (typeof Blob !== 'undefined' && d instanceof Blob) {
           const reader = new FileReader();
           reader.onload = () => {
@@ -231,7 +219,6 @@ export function init() {
           return;
       }
 
-      // 2) 数字键对象 → 二进制回放
       if (d && typeof d === 'object' && !d.t && (0 in d)) {
           try {
               const arr = new Uint8Array(Object.values(d));
@@ -242,7 +229,6 @@ export function init() {
           } catch(e) {}
       }
 
-      // 3) 标准二进制
       if (d instanceof ArrayBuffer || d instanceof Uint8Array || (d && d.buffer instanceof ArrayBuffer)) {
           if (window.smartCore && window.smartCore.handleBinary) {
               window.smartCore.handleBinary(d, conn.peer);
@@ -290,7 +276,6 @@ export function init() {
         if (window.protocol) window.protocol.processIncoming(d, conn.peer);
       }
       
-      // === 关键修复：允许自定义协议穿透 ===
       if (d.t && d.t.startsWith('SMART_')) {
           if (window.protocol) window.protocol.processIncoming(d, conn.peer);
       }

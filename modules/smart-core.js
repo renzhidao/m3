@@ -1,35 +1,84 @@
 import { MSG_TYPE, CHAT } from './constants.js';
 
+// === Smart Core (Final Merged + Debugged Edition) ===
+// 增强：播放问题定位日志（SW/MSE 路径、Range、MSE 缓存/配额）
+// 增强：SMART_META 可靠送达（单聊 + 公共频道）
+// 修复：本地保存逻辑 (字节校验 + 正确 MIME)
+// 修复：手机录屏/大文件无法边下边播 (Probe Tail 扩大)
+// 修复：发送端 FileReader 崩溃保护
+// 修复：老设备 MSE 起播与收尾 (Moov 后置支持 + 滑动窗口清理)
+// 修复：任务清理避免中断 SW 流
+
 function log(msg) {
     console.log(`[Core] ${msg}`);
     if (window.util) window.util.log(msg);
 }
 
-// 简单的日志节流，防止UI卡死
-const STAT = { send:0, recv:0, next:0 };
+const STAT = { send:0, req:0, recv:0, next:0 };
 function statBump(k) {
     STAT[k]++;
-    if (Date.now() > STAT.next) {
-        // log(`📊 传输: send=${STAT.send} recv=${STAT.recv}`);
-        STAT.send = STAT.recv = 0;
-        STAT.next = Date.now() + 1000;
+    const now = Date.now();
+    if (now > STAT.next) {
+        log(`📊 速率: req=${STAT.req} send=${STAT.send} recv=${STAT.recv} (≈0.7s)`);
+        STAT.send = STAT.req = STAT.recv = 0;
+        STAT.next = now + 700;
     }
 }
 
+// === Tunables ===
+// 保持较低的块大小以稳定发送端内存
+const CHUNK_SIZE = 128 * 1024;
+const PARALLEL = 12;
+const PREFETCH_AHEAD = 3 * 1024 * 1024;
+const MAX_BUFFERED = 256 * 1024;
+const SEND_QUEUE = [];
+const USE_SEQUENCE_MODE = false;
+
+// Debug helpers
+function fmtMB(n){ return (n/1024/1024).toFixed(1)+'MB'; }
+function fmtRanges(v) {
+    try {
+        const b = v.buffered;
+        const arr = [];
+        for (let i=0;i<b.length;i++) arr.push(`[${b.start(i).toFixed(2)}, ${b.end(i).toFixed(2)}]`);
+        return arr.join(', ');
+    } catch(e){ return ''; }
+}
+function bindMoreVideoLogs(video, fileId){
+    if (!video || video._moreLogsBound) return;
+    video._moreLogsBound = true;
+    const logBuffered = () => log(`🎞 buffered=${fmtRanges(video)} ct=${(video.currentTime||0).toFixed(2)} rdy=${video.readyState}`);
+    video.addEventListener('progress', logBuffered);
+    video.addEventListener('waiting', () => log('⏳ waiting ' + fmtRanges(video)));
+    video.addEventListener('stalled', () => log('⚠️ stalled ' + fmtRanges(video)));
+    video.addEventListener('seeking', () => log(`⏩ seeking to ${video.currentTime.toFixed(2)}`));
+    video.addEventListener('seeked', () => log(`✅ seeked ${video.currentTime.toFixed(2)} buffered=${fmtRanges(video)}`));
+    video.addEventListener('error', () => log('❌ <video> error: ' + (video.error && video.error.message)));
+    setInterval(() => { if (!video.paused) logBuffered(); }, 4000);
+}
+
+// SMART_META ACK/重试参数
+const META_RETRY_MS = 1500;
+const META_MAX_RETRIES = 6;
+const META_MAX_TTL_MS = 20000; // 公共频道发现新 peer 的窗口
+
 export function init() {
-  window.virtualFiles = new Map(); window.remoteFiles = new Map(); window.smartMetaCache = new Map(); 
+  window.virtualFiles = new Map();
+  window.smartMetaCache = new Map();
+  window.remoteFiles = new Map();
   window.activeTasks = new Map();
-  
-  // 建立与 SW 的通信
-  if ('serviceWorker' in navigator) {
-      navigator.serviceWorker.addEventListener('message', handleSwMessage);
-      // 建立专用通道
-      navigator.serviceWorker.ready.then(reg => {
-          if (!reg.active) return;
-          const ch = new MessageChannel();
-          window.swPort = ch.port1;
-          window.swPort.onmessage = handleSwMessage;
-          reg.active.postMessage({ type: 'INIT_PORT' }, [ch.port2]);
+  window.activePlayer = null;
+
+  // SMART_META pending map
+  window.pendingMeta = new Map(); // id -> { scope, msg, targets: Map<pid,{acked,tries,timer}>, start, discoveryTimer }
+
+  if (navigator.serviceWorker) {
+      navigator.serviceWorker.addEventListener('message', event => {
+          const data = event.data;
+          if (!data) return;
+          if (data.type === 'PING') log('✅ SW 握手成功 (Core)');
+          if (data.type === 'STREAM_OPEN') handleStreamOpen(data, event.source);
+          if (data.type === 'STREAM_CANCEL') handleStreamCancel(data);
       });
   }
 
@@ -40,19 +89,20 @@ export function init() {
               const file = meta.fileObj;
               const fileId = 'f_' + Date.now() + Math.random().toString(36).substr(2,5);
               window.virtualFiles.set(fileId, file);
-              log(`✅ 文件已注册: ${fileId} (${(file.size/1024/1024).toFixed(2)}MB)`);
-              
+              log(`✅ 文件注册: ${file.name} (${fmtMB(file.size)}) type=${file.type}`);
+
               const metaData = { fileId, fileName: file.name, fileSize: file.size, fileType: file.type };
               const msg = {
                   t: 'SMART_META', id: 'm_' + Date.now(), ts: Date.now(), senderId: window.state.myId,
                   n: window.state.myName, kind: 'SMART_FILE_UI', txt: `[文件] ${file.name}`, meta: metaData,
                   target: (window.state.activeChat && window.state.activeChat !== CHAT.PUBLIC_ID) ? window.state.activeChat : CHAT.PUBLIC_ID
               };
-              
+
+              // 本地立即显示
               window.protocol.processIncoming(msg);
-              if (msg.target === CHAT.PUBLIC_ID) Object.values(window.state.conns).forEach(c => c.open && c.send(msg));
-              else { const c = window.state.conns[msg.target]; if(c && c.open) c.send(msg); }
-              log(`📤 Meta已广播`);
+
+              // 可靠发送（单聊 + 公共频道）
+              sendSmartMetaReliable(msg);
               return;
           }
           origSend.apply(this, arguments);
@@ -61,14 +111,30 @@ export function init() {
       const origProc = window.protocol.processIncoming;
       window.protocol.processIncoming = function(pkt, fromPeerId) {
           if (pkt.t === 'SMART_META') {
-              if (window.state.seenMsgs.has(pkt.id)) return;
-              window.state.seenMsgs.add(pkt.id);
-              log(`📥 收到Meta: ${pkt.meta.fileName}`);
-              const meta = { ...pkt.meta, senderId: pkt.senderId };
-              window.smartMetaCache.set(meta.fileId, meta);
-              if(!window.remoteFiles.has(meta.fileId)) window.remoteFiles.set(meta.fileId, new Set());
-              window.remoteFiles.get(meta.fileId).add(pkt.senderId);
-              if (window.ui) window.ui.appendMsg(pkt);
+              // 去重，但仍回 ACK，避免对方持续重试
+              const seen = window.state.seenMsgs.has(pkt.id);
+              if (!seen) {
+                  window.state.seenMsgs.add(pkt.id);
+                  log(`📥 Meta: ${pkt.meta.fileName} (${fmtMB(pkt.meta.fileSize)}) from=${pkt.senderId}`);
+                  const meta = { ...pkt.meta, senderId: pkt.senderId };
+                  window.smartMetaCache.set(meta.fileId, meta);
+                  if(!window.remoteFiles.has(meta.fileId)) window.remoteFiles.set(meta.fileId, new Set());
+                  window.remoteFiles.get(meta.fileId).add(pkt.senderId);
+                  if (window.ui) window.ui.appendMsg(pkt);
+              }
+              // 回 ACK
+              if (fromPeerId) {
+                  const c = window.state.conns[fromPeerId];
+                  if (c && c.open) c.send({ t: 'SMART_META_ACK', refId: pkt.id, from: window.state.myId });
+              } else {
+                  // 尝试直接回给 sender
+                  const c = window.state.conns[pkt.senderId];
+                  if (c && c.open) c.send({ t: 'SMART_META_ACK', refId: pkt.id, from: window.state.myId });
+              }
+              return;
+          }
+          if (pkt.t === 'SMART_META_ACK') {
+              handleMetaAck(pkt, fromPeerId);
               return;
           }
           if (pkt.t === 'SMART_GET_CHUNK') {
@@ -79,137 +145,403 @@ export function init() {
       };
   }
 
-  // 二进制处理
-  if (window.p2p) {
-      const oldHandle = window.p2p.handleData;
-      window.p2p.handleData = function(d, conn) {
-          if (typeof Blob !== 'undefined' && d instanceof Blob) {
-              const reader = new FileReader();
-              reader.onload = () => handleBinaryData(reader.result, conn.peer);
-              reader.readAsArrayBuffer(d);
-              return;
-          }
-          if (d instanceof ArrayBuffer || d instanceof Uint8Array || (d && d.buffer instanceof ArrayBuffer)) {
-              handleBinaryData(d, conn.peer);
-              return;
-          }
-          if (d && typeof d === 'object' && !d.t && d[0] !== undefined) {
-              try {
-                  const arr = new Uint8Array(Object.values(d));
-                  handleBinaryData(arr, conn.peer);
-                  return;
-              } catch(e) {}
-          }
-          oldHandle.call(this, d, conn);
-      };
-  }
-
   window.smartCore = {
-      download: (fileId, name) => {
-          const url = `/stream/${fileId}`;
-          const a = document.createElement('a'); a.href = url; a.download = name; a.click();
+      _videos: {},
+
+      handleBinary: (data, fromId) => handleBinaryData(data, fromId),
+
+      play: (fileId, name) => {
+          const meta = window.smartMetaCache.get(fileId) || {};
+          const fileName = name || meta.fileName || '';
+          const fileType = meta.fileType || '';
+          const fileSize = meta.fileSize || 0;
+
+          // 本地文件直接播放
+          if (window.virtualFiles.has(fileId)) {
+              const url = URL.createObjectURL(window.virtualFiles.get(fileId));
+              log(`▶️ 本地Blob播放 ${fileName} (${fmtMB(fileSize)}) type=${fileType}`);
+              return url;
+          }
+
+          startDownloadTask(fileId);
+
+          const hasSW = navigator.serviceWorker && navigator.serviceWorker.controller;
+          const isMP4 = /\.(mp4|mov|m4v)$/i.test(fileName) || /mp4|quicktime/.test(fileType);
+          const isBig = fileSize > 20 * 1024 * 1024;
+          const forceMSE = !!window.DEBUG_FORCE_MSE || false; // 可调开关：window.DEBUG_FORCE_MSE = true;
+
+          if (hasSW && !(forceMSE && isMP4 && isBig)) {
+              log(`🎥 播放路径 = SW + 原生 <video> (Range) | ${fileName} (${fmtMB(fileSize)}) type=${fileType}`);
+              const vUrl = `./virtual/file/${fileId}/${encodeURIComponent(fileName)}`;
+              setTimeout(() => {
+                  const v = document.querySelector && document.querySelector('video');
+                  if (v) { bindVideoEvents(v, fileId); bindMoreVideoLogs(v, fileId); }
+              }, 300);
+              return vUrl;
+          }
+
+          // 老设备或强制 MSE
+          log(`🎥 播放路径 = MSE + MP4Box | ${fileName} (${fmtMB(fileSize)}) type=${fileType}`);
+          if (fileName.match(/\.(mp4|mov|m4v)$/i)) {
+              if (window.activePlayer) try{window.activePlayer.destroy()}catch(e){}
+              window.activePlayer = new P2PVideoPlayer(fileId);
+
+              const task = window.activeTasks.get(fileId);
+              if (task) {
+                  // 排序投喂，确保 MSE 初始化
+                  const offsets = Array.from(task.parts.keys()).sort((a, b) => a - b);
+                  for (const off of offsets) {
+                      const data = task.parts.get(off);
+                      try { window.activePlayer.appendChunk(data, off); } catch(e){}
+                  }
+              }
+
+              autoBindVideo(fileId);
+              setTimeout(() => {
+                  const v = document.querySelector && document.querySelector('video');
+                  if (v) { bindVideoEvents(v, fileId); bindMoreVideoLogs(v, fileId); }
+              }, 300);
+
+              return window.activePlayer.getUrl();
+          }
+          return '';
       },
-      cacheMeta: (m) => { if(m && m.fileId) window.smartMetaCache.set(m.fileId, m); }
+
+      download: (fileId, name) => {
+          if (window.virtualFiles.has(fileId)) {
+              const a = document.createElement('a'); a.href = URL.createObjectURL(window.virtualFiles.get(fileId));
+              a.download = name; a.click();
+          } else {
+              startDownloadTask(fileId);
+              log('⏳ 后台下载中...');
+          }
+      },
+
+      bindVideo: (video, fileId) => { bindVideoEvents(video, fileId); bindMoreVideoLogs(video, fileId); },
+
+      seek: (fileId, seconds) => {
+           if (window.activePlayer && window.activePlayer.fileId === fileId) {
+               const res = window.activePlayer.seek(seconds);
+               if (res && typeof res.offset === 'number') {
+                   const task = window.activeTasks.get(fileId);
+                   if (task) {
+                       const off = Math.floor(res.offset / CHUNK_SIZE) * CHUNK_SIZE;
+                       log(`⏩ MSE Seek -> ${off}`);
+                       task.nextOffset = off;
+                       task.wantQueue = [];
+                       task.inflight.clear();
+                       task.inflightTimestamps.clear();
+                       task.lastWanted = off - CHUNK_SIZE;
+                       requestNextChunk(task);
+                   }
+               }
+           }
+      },
+
+      runDiag: () => {
+          log(`Tasks: ${window.activeTasks.size}, SendQ: ${SEND_QUEUE.length}`);
+      }
   };
 
-window.smartCore.shareLocalFile = function(file) {
-    try {
-        const fileId = 'f_' + Date.now() + Math.random().toString(36).substr(2,5);
-        window.virtualFiles.set(fileId, file);
-        log(`✅ 文件已注册: ${fileId} (${(file.size/1024/1024).toFixed(2)}MB)`);
-        const metaData = { fileId, fileName: file.name, fileSize: file.size, fileType: file.type };
-        const msg = {
-            t: 'SMART_META',
-            id: 'm_' + Date.now(),
-            ts: Date.now(),
-            senderId: window.state.myId,
-            n: window.state.myName,
-            kind: 'SMART_FILE_UI',
-            txt: `[文件] ${file.name}`,
-            meta: metaData,
-            target: (window.state.activeChat && window.state.activeChat !== CHAT.PUBLIC_ID) ? window.state.activeChat : CHAT.PUBLIC_ID
-        };
-        // 本地缓存 meta，便于后续 GET_META
-        window.smartMetaCache.set(metaData.fileId, { ...metaData, senderId: msg.senderId });
-        // 先本地渲染
-        if (window.protocol && window.protocol.processIncoming) window.protocol.processIncoming(msg);
-        // 再广播到目标
-        if (msg.target === CHAT.PUBLIC_ID) {
-            Object.values(window.state.conns).forEach(c => { try { if (c && c.open) c.send(msg); } catch(e) {} });
-        } else {
-            const c = window.state.conns[msg.target];
-            try { if (c && c.open) c.send(msg); } catch(e) {}
-        }
-        log(`📤 Meta已广播`);
-    } catch (e) {
-        console.warn('shareLocalFile error', e);
-    }
-};
-
+  setInterval(checkTimeouts, 1000);
+  setInterval(flushSendQueue, 100);
 }
 
-const CHUNK_SIZE = 128 * 1024;
-const PARALLEL = 12; // 更激进的并发
+/***********************
+ * SMART_META 可靠送达 *
+ ***********************/
+function sendSmartMetaReliable(msg) {
+    const entry = {
+        scope: (msg.target === CHAT.PUBLIC_ID) ? 'public' : 'direct',
+        msg,
+        targets: new Map(), // pid -> { acked, tries, timer }
+        start: Date.now(),
+        discoveryTimer: null
+    };
+    window.pendingMeta.set(msg.id, entry);
 
-// 响应 SW 请求
-function handleSwMessage(event) {
-    const msg = event && event.data;
-    if (!msg || !msg.type) return;
+    const addTargetIf = (pid) => {
+        if (!pid || pid === window.state.myId) return;
+        if (!window.state.conns[pid]) return;
+        if (!entry.targets.has(pid)) {
+            entry.targets.set(pid, { acked:false, tries:0, timer:null });
+        }
+    };
 
-    if (msg.type === 'GET_META') {
-        const meta = (window.smartMetaCache && window.smartMetaCache.get) ? window.smartMetaCache.get(msg.fileId) : null;
-        if (event.ports && event.ports[0]) {
-            event.ports[0].postMessage(meta ? {
-                size: meta.fileSize,
-                type: (meta.fileType || guessType(meta.fileName)),
-                name: meta.fileName
+    // 初始目标：direct 就是目标，public 就是当前所有 open 的连接
+    if (entry.scope === 'direct') {
+        addTargetIf(msg.target);
+    } else {
+        Object.keys(window.state.conns || {}).forEach(pid => {
+            const c = window.state.conns[pid];
+            if (c && c.open) addTargetIf(pid);
+        });
+    }
+
+    const sendTo = (pid) => {
+        const c = window.state.conns[pid];
+        if (c && c.open) {
+            try { c.send(msg); } catch(e) { /* noop */ }
+        }
+    };
+
+    const armRetry = (pid) => {
+        const target = entry.targets.get(pid);
+        if (!target || target.acked) return;
+        if (target.timer) clearTimeout(target.timer);
+        target.timer = setTimeout(() => {
+            if (target.acked) return;
+            if (Date.now() - entry.start > META_MAX_TTL_MS || target.tries >= META_MAX_RETRIES) {
+                log(`❌ SMART_META ${msg.id} -> ${pid} 超时未确认 (tries=${target.tries})`);
+                clearTimeout(target.timer);
+                target.timer = null;
+                return;
+            }
+            target.tries++;
+            log(`🔁 重新发送 SMART_META #${target.tries} -> ${pid}`);
+            sendTo(pid);
+            armRetry(pid);
+        }, META_RETRY_MS);
+    };
+
+    // 首次发送
+    entry.targets.forEach((_, pid) => {
+        sendTo(pid);
+        armRetry(pid);
+    });
+
+    // 公共频道：在 TTL 窗口内，持续发现新上线 peer 并发送
+    if (entry.scope === 'public') {
+        entry.discoveryTimer = setInterval(() => {
+            if (Date.now() - entry.start > META_MAX_TTL_MS) {
+                clearInterval(entry.discoveryTimer);
+                entry.discoveryTimer = null;
+                return;
+            }
+            Object.keys(window.state.conns || {}).forEach(pid => {
+                const c = window.state.conns[pid];
+                if (c && c.open && !entry.targets.has(pid)) {
+                    log(`🆕 新上线 peer，补发 SMART_META -> ${pid}`);
+                    addTargetIf(pid);
+                    sendTo(pid);
+                    armRetry(pid);
+                }
+            });
+        }, 1000);
+    }
+}
+
+function handleMetaAck(pkt, fromPeerId) {
+    const refId = pkt.refId;
+    const entry = window.pendingMeta.get(refId);
+    if (!entry) return;
+    const pid = fromPeerId || (pkt.from || '');
+    const target = entry.targets.get(pid);
+    if (!target) return;
+    target.acked = true;
+    if (target.timer) clearTimeout(target.timer);
+    target.timer = null;
+    log(`✅ 收到 SMART_META ACK <- ${pid} ref=${refId}`);
+
+    // 如果所有已知目标都 ACK 了，清理
+    const allAcked = Array.from(entry.targets.values()).every(t => t.acked);
+    if (allAcked) {
+        if (entry.discoveryTimer) clearInterval(entry.discoveryTimer);
+        window.pendingMeta.delete(refId);
+    }
+}
+
+/***********************
+ * 下载/播放主逻辑      *
+ ***********************/
+function bindVideoEvents(video, fileId) {
+    if (!video || video._p2pBound) return;
+    try {
+        video.controls = true;
+        video.playsInline = true;
+        video._p2pBound = true;
+        if (window.smartCore) window.smartCore._videos[fileId] = video;
+
+        // 解决 0 秒处非关键帧黑屏
+        video.addEventListener('loadedmetadata', () => {
+            try { if (video.currentTime === 0) video.currentTime = 0.05; } catch(e){}
+        });
+
+        video.addEventListener('seeking', () => {
+            const t = isNaN(video.currentTime) ? 0 : video.currentTime;
+            if (window.smartCore) window.smartCore.seek(fileId, t);
+        });
+    } catch(e) {}
+}
+
+function autoBindVideo(fileId) {
+    setTimeout(() => {
+        const v = document.querySelector && document.querySelector('video');
+        if (v) {
+            if (!v.controls) v.controls = true;
+            bindVideoEvents(v, fileId);
+        }
+    }, 500);
+}
+
+function checkTimeouts() {
+    const now = Date.now();
+    window.activeTasks.forEach(task => {
+        if (task.completed) return;
+        task.inflightTimestamps.forEach((ts, offset) => {
+            if (now - ts > 3000) {
+                task.inflight.delete(offset);
+                task.inflightTimestamps.delete(offset);
+                task.wantQueue.unshift(offset);
+                log(`⏱️ 超时重试 off=${offset}`);
+            }
+        });
+        if (task.inflight.size === 0 && task.wantQueue.length === 0 && !task.completed) {
+            requestNextChunk(task);
+        }
+    });
+}
+
+function handleStreamOpen(data, source) {
+    const { requestId, fileId, range } = data;
+
+    if (window.virtualFiles.has(fileId)) {
+        serveLocalBlob(fileId, requestId, range, source);
+        return;
+    }
+
+    let task = window.activeTasks.get(fileId);
+    if (!task) {
+        startDownloadTask(fileId);
+        task = window.activeTasks.get(fileId);
+    }
+    if (!task) {
+        source.postMessage({ type: 'STREAM_ERROR', requestId, msg: 'Task Start Failed' });
+        return;
+    }
+
+    let start = 0;
+    let end = task.size - 1;
+    if (range && range.startsWith('bytes=')) {
+        const parts = range.replace('bytes=', '').split('-');
+        const s = parseInt(parts[0], 10);
+        const e = parts[1] ? parseInt(parts[1], 10) : end;
+        if (!isNaN(s)) start = s;
+        if (!isNaN(e)) end = Math.min(e, task.size - 1);
+    }
+
+    log(`📡 SW OPEN ${requestId}: range=${start}-${end} (${(end-start+1)} bytes)`);
+
+    source.postMessage({
+        type: 'STREAM_META', requestId, fileId,
+        fileSize: task.size, fileType: task.fileType || 'application/octet-stream',
+        start, end
+    });
+
+    task.swRequests.set(requestId, { start, end, current: start, source });
+
+    const reqChunkIndex = Math.floor(start / CHUNK_SIZE) * CHUNK_SIZE;
+
+    if (Math.abs(task.nextOffset - start) > CHUNK_SIZE * 2) {
+        log(`⏩ SW Seek -> ${start}`);
+        task.nextOffset = reqChunkIndex;
+        task.wantQueue = [];
+        task.inflight.clear();
+        task.inflightTimestamps.clear();
+        task.lastWanted = reqChunkIndex - CHUNK_SIZE;
+    }
+
+    processSwQueue(task);
+    requestNextChunk(task);
+}
+
+function serveLocalBlob(fileId, requestId, range, source) {
+    const blob = window.virtualFiles.get(fileId);
+    if (!blob) return;
+
+    let start = 0; let end = blob.size - 1;
+    if (range && range.startsWith('bytes=')) {
+        const parts = range.replace('bytes=', '').split('-');
+        const s = parseInt(parts[0], 10);
+        const e = parts[1] ? parseInt(parts[1], 10) : end;
+        if (!isNaN(s)) start = s;
+        if (!isNaN(e)) end = Math.min(e, blob.size - 1);
+    }
+
+    source.postMessage({
+        type: 'STREAM_META', requestId, fileId,
+        fileSize: blob.size, fileType: blob.type, start, end
+    });
+
+    const reader = new FileReader();
+    reader.onload = () => {
+        const buffer = reader.result;
+        source.postMessage({ type: 'STREAM_DATA', requestId, chunk: new Uint8Array(buffer) }, [buffer]);
+        source.postMessage({ type: 'STREAM_END', requestId: requestId });
+        log(`📤 SW 本地Blob响应完成 ${requestId} bytes=${end-start+1}`);
+    };
+    reader.readAsArrayBuffer(blob.slice(start, end + 1));
+}
+
+function handleStreamCancel(data) {
+    const { requestId } = data;
+    window.activeTasks.forEach(t => {
+        t.swRequests.delete(requestId);
+        if (t.completed) cleanupTask(t.fileId);
+    });
+}
+
+function processSwQueue(task) {
+    if (task.swRequests.size === 0) return;
+    task.swRequests.forEach((req, reqId) => {
+        let sentBytes = 0;
+        while (req.current <= req.end) {
+            const chunkOffset = Math.floor(req.current / CHUNK_SIZE) * CHUNK_SIZE;
+            const insideOffset = req.current % CHUNK_SIZE;
+            const chunkData = task.parts.get(chunkOffset);
+
+            if (chunkData) {
+                const available = chunkData.byteLength - insideOffset;
+                const needed = req.end - req.current + 1;
+                const sendLen = Math.min(available, needed);
+                const slice = chunkData.slice(insideOffset, insideOffset + sendLen);
+
+                req.source.postMessage({ type: 'STREAM_DATA', requestId: reqId, chunk: slice }, [slice.buffer]);
+                req.current += sendLen;
+                sentBytes += sendLen;
+
+                if (sentBytes >= 2*1024*1024) {
+                    log(`📤 SW ${reqId} -> +${sentBytes} bytes (cur=${req.current})`);
+                    sentBytes = 0;
+                }
+
+                if (req.current > req.end) {
+                    req.source.postMessage({ type: 'STREAM_END', requestId: reqId });
+                    task.swRequests.delete(reqId);
+                    log(`🏁 SW END ${reqId}`);
+                    if (task.completed) cleanupTask(task.fileId);
+                    break;
+                }
+            } else {
+                log(`SW ⏳ WAIT chunk @${chunkOffset} (req.current=${req.current})`);
+                break;
             }
         }
-        return;
-    }
-
-    if (msg.type === 'PULL_START') {
-        log(`⚡ 流请求: ${msg.fileId} start=${msg.start} end=${msg.end}`);
-        startStreamTask(msg.fileId, msg.start, msg.end, msg.reqId);
-        return;
-    }
-
-    if (msg.type === 'PULL_CANCEL') {
-        cancelStreamTask(msg.reqId);
-        return;
-    }
+    });
 }
 
-    }
-    }
-    else if (msg.type === 'PULL_START') {
-        log(`⚡ 流请求: ${msg.fileId} start=${msg.start} end=${msg.end}`);
-        startStreamTask(msg.fileId, msg.start, msg.end, msg.reqId);
-    }
-        
-    }
-    else if (msg.type === 'PULL_CANCEL') {
-        // log(`⛔ 流取消: ${msg.reqId}`);
-        cancelStreamTask(msg.reqId);
-    }
-}
-
-// 这里的任务专为流服务，不再是整文件下载
-function startStreamTask(fileId, startOffset, endIncl, reqId) {
-
+// === 融合修复：Probe Tail 策略（扩大） ===
+function startDownloadTask(fileId) {
+    if (window.activeTasks.has(fileId)) return;
     const meta = window.smartMetaCache.get(fileId);
     if (!meta) return;
 
     const task = {
-        fileId, reqId,
-        size: meta.fileSize,
-        start: startOffset,
-        endIncl: Math.min(typeof endIncl === 'number' ? endIncl : (meta.fileSize - 1), meta.fileSize - 1),
-        currentOffset: startOffset,
-        peers: [],
-        inflight: new Set(),
-        parts: new Map(),
-        active: true
+        fileId, size: meta.fileSize, fileType: meta.fileType,
+        parts: new Map(), swRequests: new Map(), peers: [],
+        peerIndex: 0, nextOffset: 0, lastWanted: -CHUNK_SIZE,
+        wantQueue: [], inflight: new Set(), inflightTimestamps: new Map(),
+        completed: false
     };
 
     if (meta.senderId && window.state.conns[meta.senderId]) task.peers.push(meta.senderId);
@@ -219,193 +551,447 @@ function startStreamTask(fileId, startOffset, endIncl, reqId) {
         });
     }
 
-    if (task.peers.length === 0) { log('❌ 无节点可用'); return; }
+    log(`🚀 任务开始: ${fileId} (${fmtMB(task.size)}) peers=${task.peers.length}`);
+    window.activeTasks.set(fileId, task);
 
-    window.activeTasks.set(reqId, task);
-    pumpStream(task);
+    // 尾部优先：拉最后 6 块，帮助尽早拿到 moov
+    if (task.size > CHUNK_SIZE) {
+        const lastChunk = Math.floor((task.size - 1) / CHUNK_SIZE) * CHUNK_SIZE;
+        for (let i = 0; i < 6; i++) {
+            const off = lastChunk - i * CHUNK_SIZE;
+            if (off >= 0 && !task.wantQueue.includes(off)) task.wantQueue.unshift(off);
+        }
+    }
+    // 头部也拉
+    if (!task.wantQueue.includes(0)) task.wantQueue.push(0);
+
+    requestNextChunk(task);
 }
 
-function cancelStreamTask(reqId) {
-    const task = window.activeTasks.get(reqId);
-    if (task) {
-        task.active = false;
-        window.activeTasks.delete(reqId);
+function requestNextChunk(task) {
+    if (task.completed) return;
+    const desired = PARALLEL;
+
+    task.swRequests.forEach(req => {
+        let cursor = Math.floor(req.current / CHUNK_SIZE) * CHUNK_SIZE;
+        const limit = cursor + PREFETCH_AHEAD;
+        while (task.wantQueue.length < desired && cursor < limit && cursor < task.size) {
+            if (!task.parts.has(cursor) && !task.inflight.has(cursor) && !task.wantQueue.includes(cursor)) {
+                task.wantQueue.push(cursor);
+            }
+            cursor += CHUNK_SIZE;
+        }
+    });
+
+    while (task.wantQueue.length < desired) {
+        const off = Math.max(task.nextOffset, task.lastWanted + CHUNK_SIZE);
+        if (off >= task.size) break;
+        if (task.parts.has(off)) {
+            task.nextOffset = off; task.lastWanted = off; continue;
+        }
+        if (!task.inflight.has(off) && !task.wantQueue.includes(off)) {
+            task.wantQueue.push(off); task.lastWanted = off;
+        } else {
+             task.lastWanted += CHUNK_SIZE;
+        }
+    }
+    dispatchRequests(task);
+}
+
+function dispatchRequests(task) {
+    while (task.inflight.size < PARALLEL && task.wantQueue.length > 0) {
+        const off = task.wantQueue.shift();
+        const conn = pickConn(task);
+        if (!conn) { task.wantQueue.unshift(off); break; }
+
+        try {
+            conn.send({ t: 'SMART_GET_CHUNK', fileId: task.fileId, offset: off, size: CHUNK_SIZE });
+            task.inflight.add(off);
+            task.inflightTimestamps.set(off, Date.now());
+            log(`REQ → off=${off} peer=${conn.peerId || 'n/a'}`);
+            statBump('req');
+        } catch(e) {
+            task.wantQueue.unshift(off); break;
+        }
     }
 }
 
-function pumpStream(task) {
-    if (!task.active) return;
+function pickConn(task) {
+    if (!task.peers.length) return null;
+    for (let i=0; i<task.peers.length; i++) {
+        const idx = (task.peerIndex + i) % task.peers.length;
+        const pid = task.peers[idx];
+        const c = window.state.conns[pid];
+        if (c && c.open) {
+            task.peerIndex = (idx + 1) % task.peers.length;
+            return c;
+        }
+    }
+    return null;
+}
 
-    // 1) 推送缓存中的连续块（不越界）
-    while (task.parts.has(task.currentOffset)) {
-        const chunk = task.parts.get(task.currentOffset);
-        task.parts.delete(task.currentOffset);
+// === 融合修复：本地保存校验 + SW 流清理 ===
+function handleBinaryData(buffer, fromId) {
+    try {
+        let u8;
+        if (buffer instanceof ArrayBuffer) u8 = new Uint8Array(buffer);
+        else if (buffer instanceof Uint8Array) u8 = buffer;
+        else return;
 
-        const remain = task.endIncl - task.currentOffset + 1;
-        const out = (chunk.byteLength <= remain) ? chunk : chunk.slice(0, remain);
+        const len = u8[0];
+        const headerStr = new TextDecoder().decode(u8.slice(1, 1 + len));
+        const header = JSON.parse(headerStr);
+        const body = u8.slice(1 + len);
+        const safeBody = new Uint8Array(body);
 
-        if (window.swPort) {
-            window.swPort.postMessage({ type: 'STREAM_DATA', reqId: task.reqId, chunk: out.buffer }, [out.buffer]);
+        const task = window.activeTasks.get(header.fileId);
+        if (!task) return;
+
+        task.inflight.delete(header.offset);
+        task.inflightTimestamps.delete(header.offset);
+
+        if (!task.parts.has(header.offset)) {
+            task.parts.set(header.offset, safeBody);
+            log(`RECV ← off=${header.offset} size=${safeBody.byteLength}`);
+            statBump('recv');
         }
 
-        task.currentOffset += out.byteLength;
-        if (task.currentOffset > task.endIncl) {
-            if (window.swPort) window.swPort.postMessage({ type: 'STREAM_DATA', reqId: task.reqId, done: true });
-            task.active = false;
-            window.activeTasks.delete(task.reqId);
+        processSwQueue(task);
+
+        if (window.activePlayer && window.activePlayer.fileId === header.fileId) {
+            try { window.activePlayer.appendChunk(safeBody, header.offset); } catch(e){}
+        }
+
+        const expectedChunks = Math.ceil(task.size / CHUNK_SIZE);
+        if (task.parts.size >= expectedChunks && !task.completed) {
+            task.completed = true;
+
+            // 字节完整性校验
+            const chunks = [];
+            let totalBytes = 0;
+            for(let i=0; i<expectedChunks; i++) {
+                const off = i * CHUNK_SIZE;
+                const d = task.parts.get(off);
+                if (d) { chunks.push(d); totalBytes += d.byteLength; }
+            }
+
+            if (totalBytes !== task.size) {
+                log(`⚠️ 字节不匹配: got=${totalBytes} expected=${task.size}`);
+            } else {
+                log('✅ 下载完成 (字节校验通过)');
+            }
+
+            // 合成 Blob
+            const blob = new Blob(chunks, { type: task.fileType || 'application/octet-stream' });
+            window.virtualFiles.set(task.fileId, blob);
+
+            if (window.activePlayer && window.activePlayer.fileId === task.fileId) {
+                try { window.activePlayer.flush(); } catch(e){}
+            }
+
+            // 暂不立即清理 parts：可能还有 SW 流在读
+            if (task.swRequests.size > 0) {
+                log(`🟡 下载已完成，但仍有 ${task.swRequests.size} 个 SW 流未结束，继续供流后再清理`);
+            } else {
+                cleanupTask(task.fileId);
+            }
             return;
         }
-    }
+        requestNextChunk(task);
+    } catch(e) {}
+}
 
-    // 2) 补货（限制在 endIncl 之内）
-    const desired = PARALLEL;
-    let nextReq = task.currentOffset;
-
-    if (task.inflight.size > 0) {
-        const maxInflight = Math.max(...task.inflight);
-        nextReq = Math.max(nextReq, maxInflight + CHUNK_SIZE);
-    }
-
-    while (task.inflight.size < desired && nextReq <= task.endIncl) {
-        if (!task.inflight.has(nextReq) && !task.parts.has(nextReq)) {
-            const remain = task.endIncl - nextReq + 1;
-            const size = Math.min(CHUNK_SIZE, remain);
-            sendRequest(task, nextReq, size);
-        }
-        nextReq += CHUNK_SIZE;
+function cleanupTask(fileId) {
+    const task = window.activeTasks.get(fileId);
+    if (!task) return;
+    if (task.swRequests.size === 0) {
+        try { task.parts.clear(); } catch(e){}
+        window.activeTasks.delete(fileId);
+        log(`🧽 任务清理完成: ${fileId}`);
+    } else {
+        setTimeout(() => cleanupTask(fileId), 1000);
     }
 }
 
-function sendRequest(task, offset, size) {
-    const peer = task.peers[Math.floor(Math.random() * task.peers.length)];
-    const conn = window.state.conns[peer];
-    if (conn && conn.open) {
-        conn.send({ t: 'SMART_GET_CHUNK', fileId: task.fileId, offset, size, reqId: task.reqId });
-        task.inflight.add(offset);
-    }
-}
-
+// === 融合修复：发送端防崩溃 ===
 function handleGetChunk(pkt, fromId) {
-    // 发送端逻辑：收到请求，读取文件发送
-    // log(`📩 请求: ${pkt.offset}`);
+    // 1. 确认文件是否存在
     const file = window.virtualFiles.get(pkt.fileId);
     if (!file) return;
-    
-    const blob = file.slice(pkt.offset, pkt.offset + pkt.size);
+
+    // 2. 校验 Offset
+    if (pkt.offset >= file.size) return;
+
     const reader = new FileReader();
+
     reader.onload = () => {
+        if (!reader.result) return;
         try {
             const buffer = reader.result;
-            // 响应头需带回 reqId 以便接收端区分是哪个流请求的
-            const header = JSON.stringify({ fileId: pkt.fileId, offset: pkt.offset, reqId: pkt.reqId });
+            const header = JSON.stringify({ fileId: pkt.fileId, offset: pkt.offset });
             const headerBytes = new TextEncoder().encode(header);
+
             const packet = new Uint8Array(1 + headerBytes.byteLength + buffer.byteLength);
             packet[0] = headerBytes.byteLength;
             packet.set(headerBytes, 1);
             packet.set(new Uint8Array(buffer), 1 + headerBytes.byteLength);
-            
+
             const conn = window.state.conns[fromId];
-            if (conn && conn.open) conn.send(packet); 
-        } catch(e) {}
+            if (conn && conn.open) sendSafe(conn, packet);
+        } catch(e) {
+            log('❌ 发送组包异常: ' + e);
+        }
     };
-    reader.readAsArrayBuffer(blob);
-}
 
-function handleBinaryData(buffer, fromId) {
+    reader.onerror = () => {
+        log(`❌ 发送端读取失败 (Offset ${pkt.offset}): ${reader.error}`);
+    };
+
     try {
-        let u8 = new Uint8Array(buffer); // 统一转视图
-        const len = u8[0];
-        const headerStr = new TextDecoder().decode(u8.slice(1, 1 + len));
-        const header = JSON.parse(headerStr);
-        const body = u8.slice(1 + len); // 这里其实是拷贝了，为了 detached buffer 传给 SW，拷贝是必须的
-        
-        // 只有带着 reqId 的包我们才能精确对应到某个流任务
-        // 但如果旧版本客户端没发 reqId，我们只能尝试广播给所有同 fileId 的任务
-        
-        const tasks = Array.from(window.activeTasks.values()).filter(t => t.fileId === header.fileId);
-        if (tasks.length === 0) return;
-
-        statBump('recv');
-
-        tasks.forEach(task => {
-            // 如果这个包是这个任务请求的范围
-            if (header.reqId && header.reqId !== task.reqId) return; // 精确匹配
-
-            if (task.inflight.has(header.offset)) {
-                task.inflight.delete(header.offset);
-                task.parts.set(header.offset, body);
-                // 驱动流推送
-                pumpStream(task);
-            }
-        });
-
-    } catch(e) { console.error('Bin err', e); }
-}
-
-function guessType(name='') {
-    const n = (name || '').toLowerCase();
-    if (n.endsWith('.mp4') || n.endsWith('.m4v')) return 'video/mp4';
-    if (n.endsWith('.mov')) return 'video/quicktime';
-    if (n.endsWith('.webm')) return 'video/webm';
-    if (n.endsWith('.mkv')) return 'video/x-matroska';
-    if (n.endsWith('.mp3')) return 'audio/mpeg';
-    if (n.endsWith('.m4a') || n.endsWith('.aac')) return 'audio/mp4';
-    return 'application/octet-stream';
-}
-
-
-// === Ensure shareLocalFile exists even before init timing ===
-(function() {
-  try {
-    if (!window.smartCore) window.smartCore = {};
-    if (typeof window.smartCore.shareLocalFile !== 'function') {
-      window.smartCore.shareLocalFile = function(file) {
-        try {
-          if (!file) return;
-          if (!window.virtualFiles) window.virtualFiles = new Map();
-          if (!window.remoteFiles) window.remoteFiles = new Map();
-          if (!window.smartMetaCache) window.smartMetaCache = new Map();
-          if (!window.activeTasks) window.activeTasks = new Map();
-
-          const fileId = 'f_' + Date.now() + Math.random().toString(36).substr(2,5);
-          window.virtualFiles.set(fileId, file);
-          const metaData = { fileId, fileName: file.name, fileSize: file.size, fileType: file.type };
-
-          const target = (window.state && window.state.activeChat && window.state.activeChat !== CHAT.PUBLIC_ID)
-              ? window.state.activeChat
-              : (typeof CHAT !== 'undefined' ? CHAT.PUBLIC_ID : 'all');
-
-          const msg = {
-            t: 'SMART_META',
-            id: 'm_' + Date.now(),
-            ts: Date.now(),
-            senderId: window.state && window.state.myId,
-            n: window.state && window.state.myName,
-            kind: 'SMART_FILE_UI',
-            txt: `[文件] ${file.name}`,
-            meta: metaData,
-            target
-          };
-
-          // 缓存 meta，便于 SW GET_META
-          window.smartMetaCache.set(metaData.fileId, { ...metaData, senderId: msg.senderId });
-
-          // 本地渲染
-          if (window.protocol && window.protocol.processIncoming) window.protocol.processIncoming(msg);
-
-          // 广播
-          if (target === (typeof CHAT !== 'undefined' ? CHAT.PUBLIC_ID : 'all')) {
-            const conns = (window.state && window.state.conns) ? Object.values(window.state.conns) : [];
-            conns.forEach(c => { try { if (c && c.open) c.send(msg); } catch(e) {} });
-          } else {
-            const c = (window.state && window.state.conns) ? window.state.conns[target] : null;
-            try { if (c && c.open) c.send(msg); } catch(e) {}
-          }
-
-          console.log('[Core] shareLocalFile: sent SMART_META for', file.name);
-        } catch (e) { console.warn('shareLocalFile(ensure) error', e); }
-      };
+        const blob = file.slice(pkt.offset, pkt.offset + pkt.size);
+        reader.readAsArrayBuffer(blob);
+    } catch(e) {
+        log('❌ 发送端 Slice 异常: ' + e);
     }
-  } catch(e) {}
-})();
+}
 
+function sendSafe(conn, packet) {
+    const dc = conn.dataChannel || conn._dc || (conn.peerConnection && conn.peerConnection.createDataChannel ? null : null);
+    // 保护：如果队列过长，丢弃旧包（避免堆爆）
+    if (SEND_QUEUE.length > 200) {
+        log('⚠️ 发送队列过载，丢弃包');
+        SEND_QUEUE.shift();
+    }
+
+    if (dc && dc.bufferedAmount > MAX_BUFFERED) {
+        SEND_QUEUE.push({ conn, packet });
+        return;
+    }
+    try {
+        conn.send(packet);
+        statBump('send');
+    } catch(e) {
+        SEND_QUEUE.push({ conn, packet });
+    }
+}
+
+function flushSendQueue() {
+    if (SEND_QUEUE.length === 0) return;
+    let processCount = 8;
+    const fails = [];
+    while (SEND_QUEUE.length > 0 && processCount > 0) {
+        const item = SEND_QUEUE.shift();
+        if (!item.conn || item.conn.readyState === 'closed' || !item.conn.open) continue;
+
+        const dc = item.conn.dataChannel || item.conn._dc;
+        if (dc && dc.bufferedAmount > MAX_BUFFERED) {
+            fails.push(item);
+        } else {
+            try {
+                item.conn.send(item.packet);
+                statBump('send');
+                processCount--;
+            } catch(e) {
+                fails.push(item);
+            }
+        }
+    }
+    if (fails.length > 0) SEND_QUEUE.unshift(...fails);
+}
+
+// === P2PVideoPlayer (老设备收尾与稳定性增强版 + 日志 + 缓存滑窗) ===
+class P2PVideoPlayer {
+    constructor(fileId) {
+        this.fileId = fileId;
+        this.mediaSource = new MediaSource();
+        this.url = URL.createObjectURL(this.mediaSource);
+
+        if (typeof MP4Box === 'undefined') return;
+
+        this.mp4box = MP4Box.createFile();
+        this.sourceBuffers = {};
+        this.queues = {};
+        this.info = null;
+
+        this.wantEOS = false;
+        this.ended = false;
+        this.trackLast = {};
+
+        this.mp4box.onReady = (info) => {
+            try {
+                this.info = info;
+                const vts = info.videoTracks || [];
+                const ats = info.audioTracks || [];
+                const tracks = [...vts, ...ats];
+                if (!tracks.length) return;
+
+                if (info.duration && info.timescale) {
+                    try { this.mediaSource.duration = info.duration / info.timescale; } catch(e) {}
+                }
+
+                log(`🧠 MP4Ready: dur=${(info.duration/info.timescale).toFixed(2)}s v=${vts.length} a=${ats.length}`);
+                vts.forEach(t => log(`  🎬 vtrack id=${t.id} codec=${t.codec} kbps=${(t.bitrate/1000|0)}`));
+                ats.forEach(t => log(`  🎧 atrack id=${t.id} codec=${t.codec} kbps=${(t.bitrate/1000|0)}`));
+
+                tracks.forEach(t => {
+                    this.mp4box.setSegmentOptions(t.id, null, { nbSamples: 20, rapAlignment: true });
+                });
+
+                const inits = this.mp4box.initializeSegmentation();
+                if (inits && inits.length) {
+                    inits.forEach(seg => {
+                        if (!this.queues[seg.id]) this.queues[seg.id] = [];
+                        this.queues[seg.id].push(seg.buffer);
+                    });
+                }
+
+                this.mp4box.start();
+
+                if (this.mediaSource.readyState === 'open') this.ensureSourceBuffers(tracks);
+                this.drain();
+                this.logBuffered();
+                this.maybeCloseIfDone();
+            } catch(e) { log('❌ onReady异常: ' + e.message); }
+        };
+
+        this.mp4box.onSegment = (id, user, buf, sampleNum, last) => {
+            if (!this.queues[id]) this.queues[id] = [];
+            this.queues[id].push(buf);
+            if (last) this.trackLast[id] = true;
+            this.drain();
+            this.logBuffered();
+            this.maybeCloseIfDone();
+        };
+
+        this.mediaSource.addEventListener('sourceopen', () => {
+            const tracks = (this.info ? [...(this.info.videoTracks||[]), ...(this.info.audioTracks||[])] : []);
+            this.ensureSourceBuffers(tracks);
+            this.drain();
+            this.logBuffered();
+            this.maybeCloseIfDone();
+        });
+    }
+
+    ensureSourceBuffers(tracks) {
+        if (!tracks || !tracks.length) return;
+        tracks.forEach(t => {
+            if (this.sourceBuffers[t.id]) return;
+            const isVideo = (this.info.videoTracks || []).some(v => v.id === t.id);
+            const mime = (isVideo ? 'video/mp4' : 'audio/mp4') + `; codecs="${t.codec}"`;
+            if (window.MediaSource && MediaSource.isTypeSupported && !MediaSource.isTypeSupported(mime)) return;
+
+            const sb = this.mediaSource.addSourceBuffer(mime);
+            if (USE_SEQUENCE_MODE) {
+                try { sb.mode = 'sequence'; sb.timestampOffset = 0; } catch(_) {}
+            }
+            sb.addEventListener('updateend', () => { this.drain(); this.logBuffered(); this.maybeCloseIfDone(); });
+            this.sourceBuffers[t.id] = sb;
+            if (!this.queues[t.id]) this.queues[t.id] = [];
+        });
+    }
+
+    drain() {
+        try {
+            Object.keys(this.sourceBuffers).forEach(id => {
+                const sb = this.sourceBuffers[id];
+                const q = this.queues[id];
+                while (sb && !sb.updating && q && q.length) {
+                    const seg = q.shift();
+                    try {
+                        sb.appendBuffer(seg);
+                    } catch (e) {
+                        if (e && e.name === 'QuotaExceededError') {
+                            log('🧱 MSE QuotaExceededError，开始清理旧缓冲区...');
+                            this.evictOldBuffered(); // 清理所有 SB 的旧缓冲
+                            q.unshift(seg);
+                        } else {
+                            log('❌ appendBuffer error: ' + e);
+                            q.unshift(seg);
+                        }
+                        return;
+                    }
+                }
+            });
+        } catch(e) { log('❌ drain异常: ' + e); }
+    }
+
+    evictOldBuffered() {
+        const video = window.smartCore && window.smartCore._videos[this.fileId];
+        const cur = video ? (video.currentTime || 0) : 0;
+        const KEEP_BACK = 30;   // 当前时间之前至少保留 30s
+        const KEEP_AHEAD = 120; // 当前时间之后至少保留 120s
+
+        Object.values(this.sourceBuffers).forEach(sb => {
+            try {
+                if (!sb || !sb.buffered || sb.buffered.length === 0 || sb.updating) return;
+                const start = sb.buffered.start(0);
+                const end   = sb.buffered.end(sb.buffered.length - 1);
+                const removeEnd = Math.min(cur - KEEP_BACK, end - KEEP_AHEAD);
+                if (removeEnd > start + 1) {
+                    sb.remove(start, removeEnd);
+                    log(`🧹 已清理缓冲: [${start.toFixed(1)}, ${removeEnd.toFixed(1)}]`);
+                } else {
+                    log('ℹ️ 无需清理，窗口太小');
+                }
+            } catch(e) {}
+        });
+    }
+
+    logBuffered() {
+        const video = window.smartCore && window.smartCore._videos[this.fileId];
+        const t = video ? video.currentTime : 0;
+        Object.values(this.sourceBuffers).forEach((sb, i) => {
+            try {
+                let ranges = [];
+                for (let k=0; k<sb.buffered.length; k++) {
+                    ranges.push(`[${sb.buffered.start(k).toFixed(1)}, ${sb.buffered.end(k).toFixed(1)}]`);
+                }
+                log(`MSE buffered #${i} @${t.toFixed(1)}s: ${ranges.join(' ') || '∅'}`);
+            } catch(_) {}
+        });
+    }
+
+    maybeCloseIfDone() {
+        if (this.ended || !this.wantEOS) return;
+        if (this.mediaSource.readyState !== 'open') return;
+
+        if (Object.values(this.sourceBuffers).some(sb => sb.updating)) return;
+        if (!Object.values(this.queues).every(q => !q || q.length === 0)) return;
+
+        let allLast = true;
+        if (this.info) {
+            const ids = [...(this.info.videoTracks||[]), ...(this.info.audioTracks||[])].map(t => t.id);
+            if (ids.length) allLast = ids.every(id => this.trackLast[id]);
+        }
+
+        if (!allLast) {
+            setTimeout(() => this.maybeCloseIfDone(), 50);
+            return;
+        }
+
+        try { this.mediaSource.endOfStream(); } catch(e) {}
+        this.ended = true;
+        log('🎬 MSE EndOfStream called');
+    }
+
+    getUrl() { return this.url; }
+
+    appendChunk(buf, offset) {
+        const u8 = buf instanceof Uint8Array ? buf : new Uint8Array(buf);
+        const ab = u8.buffer.slice(u8.byteOffset, u8.byteOffset + u8.byteLength);
+        try { Object.defineProperty(ab, 'fileStart', { value: offset }); } catch(_) { ab.fileStart = offset; }
+        try { this.mp4box.appendBuffer(ab); } catch(e) {}
+    }
+
+    flush() {
+        this.wantEOS = true;
+        try { this.mp4box.flush(); } catch(e) {}
+        setTimeout(() => this.maybeCloseIfDone(), 0);
+    }
+
+    seek(seconds) {
+        try { return this.mp4box.seek(seconds, true); } catch(e) { return null; }
+    }
+
+    destroy() { try{URL.revokeObjectURL(this.url);}catch(e){} }
+}
