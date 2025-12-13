@@ -444,14 +444,32 @@ function handleStreamOpen(data, source) {
 
     let start = 0;
     let end = task.size - 1;
-    if (range && range.startsWith('bytes=')) {
-        const parts = range.replace('bytes=', '').split('-');
-        const s = parseInt(parts[0], 10);
-        const e = parts[1] ? parseInt(parts[1], 10) : end;
-        if (!isNaN(s)) start = s;
-        if (!isNaN(e)) end = Math.min(e, task.size - 1);
+    
+    // Range 解析（兼容 bytes=start-end / bytes=start- / bytes=-suffix）
+    if (range && /^bytes=/.test(range)) {
+        const mm = range.match(/^bytes=(\d*)-(\d*)$/);
+        if (mm) {
+            const a = mm[1];
+            const b = mm[2];
+            if (a === '' && b !== '') {
+                const suffix = parseInt(b, 10);
+                if (!isNaN(suffix) && suffix > 0) {
+                    start = Math.max(0, task.size - suffix);
+                    end = task.size - 1;
+                }
+            } else {
+                const ss = parseInt(a, 10);
+                if (!isNaN(ss)) start = ss;
+                if (b !== '') {
+                    const ee = parseInt(b, 10);
+                    if (!isNaN(ee)) end = Math.min(ee, task.size - 1);
+                }
+            }
+        }
     }
-
+    if (start < 0) start = 0;
+    if (end >= task.size) end = task.size - 1;
+    if (end < start) end = start;
     log(`📡 SW OPEN ${requestId}: range=${start}-${end} (${(end-start+1)} bytes)`);
 
     source.postMessage({
@@ -492,14 +510,32 @@ function serveLocalBlob(fileId, requestId, range, source) {
     if (!blob) return;
 
     let start = 0; let end = blob.size - 1;
-    if (range && range.startsWith('bytes=')) {
-        const parts = range.replace('bytes=', '').split('-');
-        const s = parseInt(parts[0], 10);
-        const e = parts[1] ? parseInt(parts[1], 10) : end;
-        if (!isNaN(s)) start = s;
-        if (!isNaN(e)) end = Math.min(e, blob.size - 1);
+    
+    // Range 解析（兼容 bytes=start-end / bytes=start- / bytes=-suffix）
+    if (range && /^bytes=/.test(range)) {
+        const mm = range.match(/^bytes=(\d*)-(\d*)$/);
+        if (mm) {
+            const a = mm[1];
+            const b = mm[2];
+            if (a === '' && b !== '') {
+                const suffix = parseInt(b, 10);
+                if (!isNaN(suffix) && suffix > 0) {
+                    start = Math.max(0, blob.size - suffix);
+                    end = blob.size - 1;
+                }
+            } else {
+                const ss = parseInt(a, 10);
+                if (!isNaN(ss)) start = ss;
+                if (b !== '') {
+                    const ee = parseInt(b, 10);
+                    if (!isNaN(ee)) end = Math.min(ee, blob.size - 1);
+                }
+            }
+        }
     }
-
+    if (start < 0) start = 0;
+    if (end >= blob.size) end = blob.size - 1;
+    if (end < start) end = start;
     source.postMessage({
         type: 'STREAM_META', requestId, fileId,
         fileSize: blob.size, fileType: blob.type, start, end
