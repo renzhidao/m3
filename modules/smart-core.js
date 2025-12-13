@@ -259,14 +259,35 @@ export function init() {
       },
 
       download: (fileId, name) => {
-          if (window.virtualFiles.has(fileId)) {
-              const a = document.createElement('a'); a.href = URL.createObjectURL(window.virtualFiles.get(fileId));
-              a.download = name; a.click();
-          } else {
-              startDownloadTask(fileId);
-              log('⏳ 后台下载中...');
+          const meta = (window.smartMetaCache && window.smartMetaCache.get(fileId)) || {};
+          const fileName = name || meta.fileName || 'file';
+
+          // 本地已持有 Blob/File：直接保存
+          if (window.virtualFiles && window.virtualFiles.has(fileId)) {
+              const data = window.virtualFiles.get(fileId);
+              if (window.ui && window.ui.downloadBlob) {
+                  window.ui.downloadBlob(data, fileName);
+                  return;
+              }
+              const a = document.createElement('a');
+              a.href = URL.createObjectURL(data);
+              a.download = fileName;
+              document.body.appendChild(a);
+              a.click();
+              document.body.removeChild(a);
+              return;
           }
-      },
+
+          // 远端：强制走 SW 虚拟文件直链下载（即使预览失败也能保存）
+          try { startDownloadTask(fileId); } catch(e) {}
+          const url = `./virtual/file/${fileId}/${encodeURIComponent(fileName)}`;
+          const a = document.createElement('a');
+          a.href = url;
+          a.download = fileName;
+          document.body.appendChild(a);
+          a.click();
+          document.body.removeChild(a);
+      },},
 
       bindVideo: (video, fileId) => { bindVideoEvents(video, fileId); bindMoreVideoLogs(video, fileId); },
 
