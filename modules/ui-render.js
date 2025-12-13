@@ -1,7 +1,7 @@
 import { CHAT, UI_CONFIG } from './constants.js';
 
 export function init() {
-  console.log('📦 加载模块: UI Render (Auto-Refresh + Audio Fix)');
+  console.log('📦 加载模块: UI Render (Full Diagnostic + Env Check)');
   window.ui = window.ui || {};
   
   const style = document.createElement('style');
@@ -111,6 +111,9 @@ export function init() {
       el.dataset.errHandled = 'true';
       el.classList.add('error');
       
+      if (el.dataset.errHandled) return;
+      el.dataset.errHandled = 'true';
+      el.classList.add('error');
       const parent = el.parentElement;
       if (parent) {
           const div = document.createElement('div');
@@ -321,48 +324,6 @@ export function init() {
       box.scrollTop = box.scrollHeight;
       
       if (window.uiEvents && window.uiEvents.bindMsgEvents) window.uiEvents.bindMsgEvents();
-    },
-    
-    // === 核心修复：文件下载完成后自动刷新 UI 引用 ===
-    onFileComplete(fileId, blob) {
-        if (!blob) return;
-        const url = URL.createObjectURL(blob);
-        const safeUrl = url;
-        console.log(`UI: 文件 ${fileId} 已就绪，正在热刷新 DOM...`);
-
-        // 1. 修复图片
-        const imgs = document.querySelectorAll(`img[src*="${fileId}"]`);
-        imgs.forEach(el => {
-            el.src = safeUrl;
-            el.classList.remove('error');
-            el.dataset.errHandled = ''; 
-            const p = el.parentElement;
-            if(p) {
-                const errBox = p.querySelector('.img-error-box');
-                if(errBox) errBox.remove();
-            }
-        });
-
-        // 2. 修复音频/视频 (SW 流式转本地 Blob)
-        const medias = document.querySelectorAll(`video, audio`);
-        medias.forEach(el => {
-             // 仅替换 SW 流 (virtual/file)
-             if (el.src && el.src.includes(fileId) && el.src.includes('/virtual/file/')) {
-                 const wasPlaying = !el.paused;
-                 console.log(`UI: 替换媒体源 -> ${fileId}`);
-                 el.src = safeUrl;
-                 el.load(); // 必须重新 load
-                 if(wasPlaying) {
-                     const p = el.play();
-                     if(p && p.catch) p.catch(e => console.log('自动播放被阻拦:', e));
-                 }
-                 const p = el.parentElement;
-                 if(p) {
-                     const err = p.querySelector('.video-error');
-                     if(err) err.style.display = 'none';
-                 }
-             }
-        });
     },
     
     downloadBlob(data, name) {
