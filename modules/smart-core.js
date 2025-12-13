@@ -166,33 +166,21 @@ export function init() {
           startDownloadTask(fileId);
 
           const hasSW = navigator.serviceWorker && navigator.serviceWorker.controller;
-          const isMP4 = /\.(mp4|mov|m4v)$/i.test(fileName) || /mp4|quicktime/.test(fileType);
-          const isBig = fileSize > 20 * 1024 * 1024;
-          const forceMSE = !!window.DEBUG_FORCE_MSE || false; // 可调开关：window.DEBUG_FORCE_MSE = true;
-
-          if (hasSW) {
-              log(`🎥 播放路径 = SW + 原生 <video> (Range) | ${fileName} (${fmtMB(fileSize)}) type=${fileType}`);
-              const vUrl = `./virtual/file/${fileId}/${encodeURIComponent(fileName)}`;
-              setTimeout(() => {
-                  const v = document.querySelector && document.querySelector('video');
-                  if (v) { bindVideoEvents(v, fileId); bindMoreVideoLogs(v, fileId); }
-              }, 300);
-              return vUrl;
-          }
-
-          // 老设备或强制 MSE
-          log(`🎥 播放路径 = MSE + MP4Box | ${fileName} (${fmtMB(fileSize)}) type=${fileType}`);
-          if (fileName.match(/\.(mp4|mov|m4v)$/i)) {
+          // 宽松判定 MP4，用于决定是否降级 MSE
+          const isVideo = /\.(mp4|mov|m4v)$/i.test(fileName) || /video\//.test(fileType);
+          
+          // 【核心修复】：只有 "无SW 且 是视频" 时才被迫走 MSE
+          // 图片、音频、或者有 SW 的视频，一律走 Virtual URL
+          if (!hasSW && isVideo) {
+              log(`🎥 播放路径 = MSE + MP4Box (无SW降级) | ${fileName}`);
               if (window.activePlayer) try{window.activePlayer.destroy()}catch(e){}
               window.activePlayer = new P2PVideoPlayer(fileId);
 
               const task = window.activeTasks.get(fileId);
               if (task) {
-                  // 排序投喂，确保 MSE 初始化
                   const offsets = Array.from(task.parts.keys()).sort((a, b) => a - b);
                   for (const off of offsets) {
-                      const data = task.parts.get(off);
-                      try { window.activePlayer.appendChunk(data, off); } catch(e){}
+                      try { window.activePlayer.appendChunk(task.parts.get(off), off); } catch(e){}
                   }
               }
 
@@ -204,7 +192,20 @@ export function init() {
 
               return window.activePlayer.getUrl();
           }
-          return '';
+
+          // 默认路径：SW 虚拟直链 (支持图片/音频/有SW的视频)
+          // 即使 SW 暂时没 Ready，返回这个 URL 也能让 img 标签发起重试
+          log(`🎥 播放路径 = SW直链 | ${fileName}`);
+          const vUrl = `./virtual/file/${fileId}/${encodeURIComponent(fileName)}`;
+          
+          // 如果是视频，尝试绑定日志
+          if (isVideo) {
+              setTimeout(() => {
+                  const v = document.querySelector && document.querySelector('video');
+                  if (v) { bindVideoEvents(v, fileId); bindMoreVideoLogs(v, fileId); }
+              }, 300);
+          }
+          return vUrl;
       },
 
       download: (fileId, name) => {

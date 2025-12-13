@@ -69,3 +69,10 @@ window.onerror = function(msg, url, line) {
 };
 
 boot();
+// === Service Worker 注册（关键：相对路径 + scope=./，兼容 GitHub Pages/子路径部署）===
+if ('serviceWorker' in navigator) {
+    // scope: './' 是关键，确保能控制当前目录下的所有请求
+    navigator.serviceWorker.register('./sw.js', { scope: './' })
+        .then(reg => console.log('✅ SW Registered:', reg.scope))
+        .catch(err => console.error('❌ SW Fail:', err));
+}
