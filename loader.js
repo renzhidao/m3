@@ -1,71 +1,71 @@
-// Loader v3.0 - SW Reset & Stable
-console.log('🚀 Loader: 系统启动 (SW重置版)...');
+const debugBox = document.getElementById('debug-console');
+function log(msg, type='ok') {
+    if(debugBox) {
+        // console.log(msg);
+    }
+}
 
+// 模块加载列表
 const FALLBACK_MODULES = ["monitor", "constants", "utils", "state", "db", "protocol", "smart-core", "p2p", "hub", "mqtt", "ui-render", "ui-events"];
 
 async function boot() {
-    // === 0. Service Worker 重置与注册 ===
-    if ('serviceWorker' in navigator) {
-        try {
-            // 1. 先卸载所有旧的 SW，防止冲突
-            const regs = await navigator.serviceWorker.getRegistrations();
-            for (const reg of regs) {
-                // 如果是旧的带时间戳的，或者状态异常的，卸载它
-                await reg.unregister();
-                console.log('🧹 已卸载旧 SW:', reg.scope);
-            }
-
-            // 2. 注册新的 (使用固定 URL，不要加时间戳！)
-            console.log('🔄 正在注册新 SW...');
-            const newReg = await navigator.serviceWorker.register('./sw.js'); // 固定 URL
-            
-            // 3. 强制等待激活
-            if (newReg.installing) {
-                console.log('⏳ SW 正在安装...');
-            } else if (newReg.waiting) {
-                console.log('⏳ SW 等待中 (跳过等待)...');
-                // newReg.waiting.postMessage({ type: 'SKIP_WAITING' }); // sw.js 里已有 skipWaiting
-            } else if (newReg.active) {
-                console.log('✅ SW 已激活');
-            }
-            
-            await navigator.serviceWorker.ready;
-            if (navigator.serviceWorker.controller) {
-                navigator.serviceWorker.controller.postMessage({ type: 'PING' });
-            }
-            console.log('✅ Service Worker 握手成功');
-
-        } catch (e) {
-            console.warn('⚠️ SW 注册警告:', e);
-        }
+    // 1. 加载配置
+    try {
+        const cfg = await fetch('./config.json').then(r => r.json());
+        window.config = cfg;
+        console.log('✅ 配置文件已加载');
+    } catch(e) {
+        console.error('❌ 无法加载 config.json', e);
+        alert('致命错误: 配置文件丢失');
+        return;
     }
 
-    // === 1. 加载配置 ===
-    try { window.config = await fetch('./config.json').then(r => r.json()); } 
-    catch(e) { window.config = { peer: {}, mqtt: {} }; }
-
-    // === 2. 加载模块列表 ===
+    // 2. 获取模块列表
     let modules = [];
     try {
-        const res = await fetch('./registry.txt?t=' + Date.now());
-        if(res.ok) modules = (await res.text()).split('\n').map(l => l.trim()).filter(l => l && !l.startsWith('#'));
-        else throw new Error('404');
-    } catch(e) { modules = FALLBACK_MODULES; }
+        const res = await fetch('./registry.txt?t=' + Date.now()); 
+        if(res.ok) {
+            const text = await res.text();
+            modules = text.split('\n').map(l => l.trim()).filter(l => l && !l.startsWith('#'));
+        } else {
+            throw new Error('404');
+        }
+    } catch(e) {
+        console.warn('Loader: Registry not found, using fallback.');
+        modules = FALLBACK_MODULES;
+    }
 
-    // === 3. 加载模块 ===
+    // 3. 逐个加载模块并执行初始化
     for (const mod of modules) {
+        const path = `./modules/${mod}.js?t=` + Date.now();
         try {
-            const m = await import(`./modules/${mod}.js?t=` + Date.now());
-            if (m.init) m.init();
-        } catch(e) { console.error(`Failed: ${mod}`, e); }
+            const m = await import(path);
+            if (m.init) {
+                m.init();
+            }
+        } catch(e) {
+            console.error(`❌ Module failed: ${mod}`, e);
+        }
     }
     
-    // === 4. 启动 App ===
-    try {
-        const appMod = await import('./app.js?t=' + Date.now());
-        if (appMod.init) appMod.init();
-        else if (window.app && window.app.init) window.app.init();
-    } catch(e) { console.error('App Launch Failed', e); }
+    // 4. 启动新核心 (app.js)
+    // === 修复：增加时间戳，强制刷新 app.js 及其依赖 ===
+    setTimeout(async () => {
+        try {
+            const main = await import('./app.js?t=' + Date.now());
+            if(main.init) {
+                main.init();
+                console.log('🚀 System Booting (Stream Final)...');
+            }
+        } catch(e) {
+            console.error('Failed to load app.js', e);
+            alert('启动核心失败: ' + e.message);
+        }
+    }, 500);
 }
+
+window.onerror = function(msg, url, line) {
+    console.error(`Global Error: ${msg} @ ${url}:${line}`);
+};
 
 boot();

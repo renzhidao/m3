@@ -141,7 +141,7 @@ async function handleVirtualStream(event) {
                     headers.set('Content-Range', `bytes ${start}-${end}/${total}`);
 
                     resolve(new Response(stream, { status: 206, headers }));
-                }
+                } 
                 else if (d.type === 'STREAM_ERROR') {
                     self.removeEventListener('message', metaHandler);
                     streamControllers.delete(requestId);
@@ -158,6 +158,6 @@ async function handleVirtualStream(event) {
                 streamControllers.delete(requestId);
                 resolve(new Response("Gateway Timeout (Metadata Wait)", { status: 504 }));
             }
-        }, 15000);
+        }, 15000); 
     });
 }
